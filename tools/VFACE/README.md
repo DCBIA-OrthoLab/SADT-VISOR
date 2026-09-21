@@ -124,7 +124,7 @@ answer where "deploy a tool" is not.
 
 | | |
 |---|---|
-| Inputs | `t1`: a folder of CBCT volumes. `t2` for a longitudinal study only. `measurements`: one measurement list per region. `feature_template`: the features the classifier was trained on. |
+| Inputs | `t1`: a folder of CBCT volumes. `t2` for a longitudinal study only. `measurements`: one measurement list per region. `feature_template`: the features the classifier was trained on. `registration_transforms` for `File already Registered`. |
 | Outputs | `Measurements/Measurements_{CB,MAND,MAX}.xlsx`, `Measurements/PostProcess_Measurements.xlsx`, `Classification/Classification.xlsx`, `Heat maps/<region>/`, plus `VFACE_report.json`. |
 | Model files | `segmentation_model` (AMASSS), `landmark_model` (ALI_CBCT), `surface_model` (Batch_Dental_Seg), `classifier_model` (the three asymmetry models), `cranial_base_reference` / `maxilla_reference` (orientation), `mirror_reference` (the reflection). All named so the server publishes them as hosted names rather than uploads. |
 | GPU | None of its own. Every network it needs belongs to another tool. |
@@ -146,6 +146,11 @@ Four things worth knowing before reading a result:
   run.** A template alone gives the feature table, which is what somebody
   training a model would ask for; the verdict on top of it needs the models to
   find the columns they name.
+- **`File already Registered` takes the registration it is going to measure.**
+  The transforms beside an oriented scan are the ORIENTATION's, not a
+  registration's, so reading them as one would move the landmarks by the wrong
+  matrix while the run reported success. The mode refuses without
+  `registration_transforms`.
 
 ## Versions
 
@@ -175,7 +180,7 @@ pytorch3d: VFACE runs no network of its own.
   exists, every landmark asked for is one ALI catalogs, every region one AREG
   has and every structure one AMASSS offers. It skips per tool when that tool
   is not built.
-- **Tests**: 170 passing, 1 skipped.
+- **Tests**: 174 passing, 1 skipped.
 - **NOT run against another tool for real.** No supervised chain has been
   executed with the six; the calls are covered by a fake supervisor asserting
   the parameters, and the schemas by the test above.
@@ -192,7 +197,7 @@ pytorch3d: VFACE runs no network of its own.
 ```bash
 cd tools/VFACE
 uv sync                     # no CUDA wheels; a minute
-uv run pytest               # 170 tests, no GPU, no weights
+uv run pytest               # 174 tests, no GPU, no weights
 ```
 
 ```bash

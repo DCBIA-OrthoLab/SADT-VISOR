@@ -226,18 +226,29 @@ def _landmarks(sup, oriented: dict, registered: dict, measurements: dict,
     # they are the follow-up's, predicted on it.
     if study == catalogs.STUDY_ASYMMETRY:
         compared = {
-            frame: tools.mirror(sup, folder, mirror_reference, content="Scan",
+            # "Automatic", not "Scan": `content` chooses how VOXELS are
+            # resampled, and these folders hold markups. AutoMatrix reads it per
+            # FILE, which is what a folder of landmarks needs.
+            frame: tools.mirror(sup, folder, mirror_reference, content="Automatic",
                                 label=f"landmarks-{frame}")
             for frame, folder in baseline.items()
         }
     else:
+        # Padded too, and for the same reason. Searching the baseline with room
+        # around it and the follow-up without would place the border landmarks
+        # of one timepoint and not the other -- and every measurement between
+        # them is a difference, so a systematic gap on one side IS the answer.
         compared = {
-            frame: tools.predict_landmarks(sup, folder, wanted, landmark_model,
-                                           label=f"t2-{frame}")
+            frame: tools.predict_landmarks(
+                sup,
+                landmark_files.pad_scans(
+                    folder, _folder(work_dir, "padded_t2", frame), report=report
+                ),
+                wanted, landmark_model, label=f"t2-{frame}",
+            )
             for frame, folder in second.items()
         }
 
-    # And then moved by the registration, so both sets sit in one frame.
     # And then moved by the registration, so both sets sit in one frame. One
     # call per region: AutoMatrix pairs each matrix with its patient by name
     # when it is handed a folder, and the registration writes one matrix per
@@ -287,6 +298,7 @@ def _short(region: str) -> str:
 
 def main(t1, output_dir, mode=None, study=None, outputs=None, regions=None,
          t2=None, measurements=None, feature_template=None,
+         registration_transforms=None,
          cranial_base_reference=None, maxilla_reference=None,
          mirror_reference=None, segmentation_model=None, landmark_model=None,
          classifier_model=None, surface_model=None, sup=None):
@@ -325,6 +337,9 @@ def main(t1, output_dir, mode=None, study=None, outputs=None, regions=None,
              t2=str(t2) if t2 else "",
              measurements=str(measurements) if measurements else "",
              feature_template=str(feature_template) if feature_template else "",
+             registration_transforms=(
+                 str(registration_transforms) if registration_transforms else ""
+             ),
              reference_of={
                  catalogs.FRAME_CRANIAL_BASE: str(cranial_base_reference or ""),
                  catalogs.FRAME_MAXILLA: str(maxilla_reference or ""),
@@ -346,7 +361,8 @@ def main(t1, output_dir, mode=None, study=None, outputs=None, regions=None,
 
 
 def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
-         measurements, feature_template, reference_of, mirror_reference,
+         measurements, feature_template, registration_transforms, reference_of,
+         mirror_reference,
          segmentation_model, landmark_model, classifier_model, surface_model,
          report, sup):
     """The chain proper, once the arguments are known to be usable."""
@@ -420,8 +436,25 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
         _stage(sup, "register", "registering each region")
         registered = _register(sup, regions, oriented, second, masks)
     else:
+        # The caller registered already, so the transforms are theirs to supply.
+        # Taking them from `t1` would have read the ORIENTATION transforms
+        # sitting beside the scans as though they were registrations -- the
+        # landmarks would have been moved by the wrong matrix, and every
+        # measurement would have come out of a run that reported success.
+        if not registration_transforms:
+            raise ToolInputError(
+                f"'{catalogs.MODE_REGISTERED}' measures a registration somebody "
+                "else made, so it needs it: 'registration_transforms' is the folder "
+                "of per-patient transforms that registration produced, one subfolder "
+                f"per region ({', '.join(catalogs.REGIONS)})."
+            )
         second = dict(oriented)
-        registered = {region: t1 for region in regions}
+        registered = {
+            region: os.path.join(registration_transforms, region)
+            if os.path.isdir(os.path.join(registration_transforms, region))
+            else registration_transforms
+            for region in regions
+        }
 
     if not catalogs.wants_measurements(outputs):
         report["measurements"] = "not asked for"

@@ -41,6 +41,10 @@ LAYOUT = {
         "section": _LISTS, "label": "Feature list the classifier was trained on",
         "visible_when": _MEASURES,
     },
+    "registration_transforms": {
+        "section": _INPUTS, "label": "Transforms from a registration you already made",
+        "visible_when": {"mode": catalogs.MODE_REGISTERED},
+    },
 
     "cranial_base_reference": {
         "section": _REFERENCES, "label": "Cranial base orientation reference",

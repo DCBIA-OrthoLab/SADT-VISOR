@@ -198,7 +198,8 @@ def test_every_argument_naming_a_hosted_file_is_named_so_the_server_knows():
     hosted = {"segmentation_model", "landmark_model", "classifier_model",
               "surface_model", "cranial_base_reference", "maxilla_reference",
               "mirror_reference"}
-    uploaded = {"t1", "t2", "output_dir", "measurements", "feature_template"}
+    uploaded = {"t1", "t2", "output_dir", "measurements", "feature_template",
+                "registration_transforms"}
 
     paths = {name for name, spec in schema["arguments"].items() if spec["type"] == "path"}
     assert paths == hosted | uploaded

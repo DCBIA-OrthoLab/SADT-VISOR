@@ -35,6 +35,7 @@ def run(
     t2: Path = "",
     measurements: Path = "",
     feature_template: Path = "",
+    registration_transforms: Path = "",
     cranial_base_reference: Path = "",
     maxilla_reference: Path = "",
     mirror_reference: Path = "",
@@ -74,8 +75,13 @@ def run(
             on. Matched to its region by the file's name.
         feature_template: The workbook whose columns name the features the
             classifier was trained on. It comes from the same training run as
-            `classifier_model`, and without both the run stops after the
-            measurements.
+            `classifier_model`; a template alone gives the feature table, and
+            the verdict on top of it needs the bundle too.
+        registration_transforms: The transforms a registration you already made
+            produced, one subfolder per region. What `File already Registered`
+            measures, and what it refuses without -- the orientation transforms
+            beside the scans are a different matrix, and using them would move
+            the landmarks wrongly while the run reported success.
         cranial_base_reference: The already-oriented case defining the
             Frankfort horizontal and mid-sagittal frame.
         maxilla_reference: The already-oriented case defining the occlusal and
@@ -103,6 +109,7 @@ def run(
         t1=t1, output_dir=output_dir, mode=mode, study=study, outputs=outputs,
         regions=regions, t2=t2, measurements=measurements,
         feature_template=feature_template,
+        registration_transforms=registration_transforms,
         cranial_base_reference=cranial_base_reference,
         maxilla_reference=maxilla_reference, mirror_reference=mirror_reference,
         segmentation_model=segmentation_model, landmark_model=landmark_model,

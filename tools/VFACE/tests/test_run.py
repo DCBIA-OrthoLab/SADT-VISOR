@@ -425,3 +425,37 @@ def test_asking_for_both_produces_both(tmp_path):
     written = tree_of(tmp_path / "out")
     assert any(name.startswith("Heat maps") for name in written)
     assert any(name.startswith("Measurements") for name in written)
+
+
+def test_measuring_someone_elses_registration_needs_it_to_be_supplied(tmp_path):
+    """Taking the transforms from `t1` would have read the ORIENTATION matrices
+    sitting beside the scans as though they were registrations: the landmarks
+    would have been moved by the wrong one, and every measurement would have
+    come out of a run that reported success."""
+    sup = PipelineSup(tmp_path)
+    with pytest.raises(ToolInputError) as raised:
+        run(sup=sup, **request(tmp_path, mode=catalogs.MODE_REGISTERED,
+                               t1=_oriented_cohort(tmp_path)))
+    assert "registration_transforms" in str(raised.value)
+    assert sup.calls == []
+
+
+def test_a_supplied_registration_is_measured_without_registering_again(tmp_path):
+    from conftest import write_transform
+
+    oriented = _oriented_cohort(tmp_path)
+    for region in catalogs.REGIONS:
+        for patient in PATIENTS:
+            write_transform(tmp_path / "registrations" / region /
+                            f"{patient}_{region}_Reg_transform.tfm")
+
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(
+        tmp_path, mode=catalogs.MODE_REGISTERED, t1=oriented,
+        registration_transforms=str(tmp_path / "registrations"),
+    ))
+
+    assert sup.asked("ASO") == []
+    assert sup.asked("AMASSS") == []
+    assert sup.asked("AREG_CBCT") == []
+    assert os.path.join("Measurements", "Measurements_CB.xlsx") in tree_of(tmp_path / "out")
