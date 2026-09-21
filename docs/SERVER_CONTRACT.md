@@ -364,7 +364,7 @@ asked:
 - **The callee is selected by VENV.** `sup.run` looks up
   `<TOOLS_DIR>/<name>/.venv/bin/python` and execs it, so the callee gets its own
   interpreter and its own dependency set. Nesting is the same recursion:
-  `AREG → ASO → ALI_CBCT` needs no special case.
+  `VFACE → AREG_CBCT → ASO → ALI_CBCT` needs no special case.
 - **Absolute paths and a neutral working directory.** Each nested call gets its
   own job directory under `<job>/sup/NN_<tool>/`, and runs with that as `cwd`.
 - **The scratch is `sup.tmp`**, a sibling of `output/` inside the job directory,
@@ -385,6 +385,13 @@ errors a tool author will read:
   for one that is already above it fails immediately, naming the chain, rather
   than after starting four processes. `MAX_SUPERVISOR_DEPTH` (5) is only the
   backstop for a chain that grows without repeating.
+
+  **It has one level of headroom left, and it used to have three.** `VFACE`
+  drives six tools and two of them are supervised in their own right, so
+  `VFACE → AREG_CBCT → ASO → ALI_CBCT` is four deep. A tool added above VFACE,
+  or a fifth level inside any of those, hits the cap -- and hits it as a refusal
+  partway through a run rather than at admission. Worth raising deliberately if
+  another orchestrating tool arrives, rather than discovering it on a cohort.
 - **A failing child carries its reason up.** The parent reads the child's
   `result.json` and raises with the child's own `type` and `message`, because
   "see the output above" is a promise a nested process cannot keep.
