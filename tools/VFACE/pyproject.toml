@@ -18,6 +18,13 @@ dependencies = [
     "openpyxl==3.1.5",
     "lightgbm==4.6.0",
     "joblib==1.5.2",
+    # Not optional, and upstream does not install it. The three classifier
+    # models are LightGBM's SKLEARN-API wrappers -- they answer to
+    # `feature_name_`, which a plain `lgb.Booster` does not have -- so
+    # unpickling one pulls `lightgbm.sklearn`, which refuses to import without
+    # scikit-learn. Upstream's Slicer happens to have it from another
+    # extension; a tool here has only what it declares.
+    "scikit-learn==1.7.2",
 ]
 
 [tool.sadt]

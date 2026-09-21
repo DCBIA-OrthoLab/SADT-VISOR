@@ -45,6 +45,11 @@ DEFAULT_MARGIN_MM = 30
 DECORATION_TOKENS = (
     "scan", "or", "mand", "md", "max", "mx", "cb", "lm", "t1", "t2", "cl",
     "pred", "seg", "reg", "mir", "derived",
+    # AREG names its outputs after the region it registered on, and it uses the
+    # DISPLAY names -- `P1_Cranial base_Reg.nii.gz`, with a space in it. Left
+    # out, everything downstream of a registration reads that patient as
+    # "P1_Cranial base" and stops pairing with anything the steps before wrote.
+    "cranial base", "mandible", "maxilla",
 )
 
 # ALI's landmark groups, as it names the files it writes. Carried here rather

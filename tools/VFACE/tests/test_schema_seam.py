@@ -171,3 +171,38 @@ def test_the_modes_it_asks_for_are_modes_those_tools_have():
 
     automatrix = schema_of("AutoMatrix")
     assert "Segmentation" in automatrix["arguments"]["content"]["choices"]
+
+
+def test_every_tool_it_names_is_declared_in_its_own_published_calls():
+    """`describe.py` reads `tools.py` to publish the `calls` list the server
+    checks at startup. A tool called but not published is a chain the server
+    cannot validate -- and VFACE has the longest one here."""
+    schema = schema_of("VFACE")
+    assert set(schema["calls"]) == {
+        "ASO", "AMASSS", "AutoMatrix", "AREG_CBCT", "ALI_CBCT", "Batch_Dental_Seg",
+    }
+    assert schema["supervisor"] is True
+
+
+def test_every_argument_naming_a_hosted_file_is_named_so_the_server_knows():
+    """The server decides from an argument's NAME whether a `Path` is something
+    it already holds or something the caller uploads: `model`, `*_model` and
+    `*_reference` are picked from the weights it hosts, everything else gets a
+    file picker.
+
+    That is a safety property -- a clinician must not be able to send model
+    weights from a laptop -- and it is one letter wide. `ASO`'s `landmark_models`
+    missed it by that letter and would have asked for a 4.7 GB bundle.
+    """
+    schema = schema_of("VFACE")
+    hosted = {"segmentation_model", "landmark_model", "classifier_model",
+              "surface_model", "cranial_base_reference", "maxilla_reference",
+              "mirror_reference"}
+    uploaded = {"t1", "t2", "output_dir", "measurements", "feature_template"}
+
+    paths = {name for name, spec in schema["arguments"].items() if spec["type"] == "path"}
+    assert paths == hosted | uploaded
+    for name in hosted:
+        assert name.endswith(("_model", "_reference")), name
+    for name in uploaded:
+        assert not name.endswith(("_model", "_reference")), name

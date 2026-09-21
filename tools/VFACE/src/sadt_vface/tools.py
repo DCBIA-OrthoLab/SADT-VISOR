@@ -187,6 +187,31 @@ def mirror(sup, files: str, transform: str, content: str = "Automatic",
     ))
 
 
+def apply_transforms(sup, files: str, transforms: str, label: str = "") -> str:
+    """Move each patient's files by that patient's OWN transform.
+
+    The other AutoMatrix call. `mirror` applies one transform to everybody --
+    a reflection of the frame is the same for every patient -- and this one
+    pairs a folder of transforms to a folder of files by patient name, which is
+    what the registration produces: one matrix per patient per region.
+
+    Sending a folder of transforms with `same_transform_for_every_patient` set
+    would apply whichever one sorted first to the whole cohort, and the constant
+    suffix would make each patient overwrite the last.
+    """
+    logger.info("VFACE: asking 'AutoMatrix' to move the %s by the registration",
+                label or "landmarks")
+    return _returned(sup.run(
+        "AutoMatrix",
+        files=files,
+        transforms=transforms,
+        output_dir=_output(sup, "AutoMatrix", label),
+        same_transform_for_every_patient=False,
+        output_suffix="reg",
+        content="Automatic",
+    ))
+
+
 def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "") -> str:
     """Register `t2` onto `t1` on one region's bone.
 
