@@ -89,10 +89,24 @@ REGIONS = (REGION_CRANIAL_BASE, REGION_MANDIBLE, REGION_MAXILLA)
 # that is the point: a mandible is measured by how it sits relative to the
 # skull, so the frame has to be the one the skull defines. Only the maxilla
 # gets the occlusal frame.
+#
+# **The structure codes are the MASK variants, and the difference is not
+# cosmetic.** AMASSS publishes `CB`/`MAND`/`MAX` -- the anatomical
+# segmentations, which follow the bone -- and `CBMASK`/`MANDMASK`/`MAXMASK`,
+# which are the regions a registration is confined to. Upstream asks for the
+# second set (`TranslateModels(..., mask=True)`), and so does AREG. Sending the
+# first would hand the registration a segmentation where it expects a mask: it
+# would run, produce a transform, and report success on the wrong anatomy.
 REGION_TABLE = {
-    REGION_CRANIAL_BASE: {"frame": FRAME_CRANIAL_BASE, "structure": "CB", "areg": "Cranial base"},
-    REGION_MANDIBLE: {"frame": FRAME_CRANIAL_BASE, "structure": "MAND", "areg": "Mandible"},
-    REGION_MAXILLA: {"frame": FRAME_MAXILLA, "structure": "MAX", "areg": "Maxilla"},
+    REGION_CRANIAL_BASE: {
+        "frame": FRAME_CRANIAL_BASE, "structure": "CBMASK", "areg": "Cranial base",
+    },
+    REGION_MANDIBLE: {
+        "frame": FRAME_CRANIAL_BASE, "structure": "MANDMASK", "areg": "Mandible",
+    },
+    REGION_MAXILLA: {
+        "frame": FRAME_MAXILLA, "structure": "MAXMASK", "areg": "Maxilla",
+    },
 }
 
 

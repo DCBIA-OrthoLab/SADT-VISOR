@@ -130,10 +130,10 @@ def test_the_masks_are_asked_for_one_file_per_structure(sup, tmp_path):
     """A region's mask is looked up by name. A merged multi-label volume makes
     every region resolve to the same file."""
     tools.segment_masks(sup, str(tmp_path / "oriented"), str(tmp_path / "bundle"),
-                        ["CB", "MAND"], label="CB")
+                        ["CBMASK", "MANDMASK"], label="CB")
     asked = sup.asked("AMASSS")
     assert asked["merge"] == ["SEPARATE"]
-    assert asked["structures"] == ["CB", "MAND"]
+    assert asked["structures"] == ["CBMASK", "MANDMASK"]
     assert asked["generate_surface"] is False
 
 
@@ -144,7 +144,18 @@ def test_the_structures_of_a_frame_are_asked_for_in_one_call(sup, tmp_path):
     structures = catalogs.structures_for(catalogs.FRAME_CRANIAL_BASE, catalogs.REGIONS)
     tools.segment_masks(sup, str(tmp_path / "oriented"), str(tmp_path / "bundle"),
                         structures, label="CB")
-    assert sup.asked("AMASSS")["structures"] == ["CB", "MAND"]
+    assert sup.asked("AMASSS")["structures"] == ["CBMASK", "MANDMASK"]
+
+
+def test_the_structures_asked_for_are_masks_not_segmentations():
+    """AMASSS publishes both, and they are different volumes. `CB` is the
+    anatomical segmentation, which follows the bone; `CBMASK` is the region a
+    registration is confined to. Sending the first would hand AREG a
+    segmentation where it expects a mask -- it would run, produce a transform,
+    and report success on the wrong anatomy."""
+    asked = {entry["structure"] for entry in catalogs.REGION_TABLE.values()}
+    assert asked == {"CBMASK", "MANDMASK", "MAXMASK"}
+    assert not asked & {"CB", "MAND", "MAX"}
 
 
 # ---------------------------------------------------------------------------
