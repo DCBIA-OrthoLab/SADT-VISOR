@@ -266,7 +266,7 @@ class PipelineSup:
 
 
 def _scans_under(root):
-    from sadt_vface.scans import find_scans
+    from sadt_vface.discovery import find_scans
 
     return find_scans(str(root))
 

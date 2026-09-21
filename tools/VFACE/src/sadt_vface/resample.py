@@ -37,7 +37,7 @@ import logging
 import os
 
 from .errors import ToolInputError
-from .scans import find_scans
+from .discovery import find_scans
 
 logger = logging.getLogger(__name__)
 

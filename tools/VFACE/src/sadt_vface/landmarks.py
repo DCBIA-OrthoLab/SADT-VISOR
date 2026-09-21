@@ -24,7 +24,8 @@ import logging
 import os
 
 from .errors import ToolInputError
-from .scans import find_scans, split_scan_extension
+from .discovery import find_scans
+from .scans import split_scan_extension
 
 logger = logging.getLogger(__name__)
 

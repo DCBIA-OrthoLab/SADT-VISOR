@@ -31,7 +31,7 @@ import shutil
 import time
 
 from . import aq3dc, catalogs, classify, features, landmarks as landmark_files
-from . import progress, resample, scans, tools
+from . import discovery, progress, resample, tools
 from .errors import ToolInputError
 
 logger = logging.getLogger(__name__)
@@ -99,12 +99,9 @@ def _split_by_frame(scans_dir: str, work_dir: str) -> dict:
     # landmarks be expressed in the other's, so a mode that took the scans and
     # left the `.tfm` files behind could orient nothing and derive nothing --
     # and would say so three steps later, about the wrong step.
-    everything = scans.find_scans(scans_dir) + [
-        os.path.join(directory, name)
-        for directory, _subdirectories, names in os.walk(scans_dir)
-        for name in sorted(names) if name.lower().endswith(".tfm")
-    ]
-
+    everything = discovery.find_scans(scans_dir) + discovery.find_by_extension(
+        scans_dir, (".tfm",)
+    )
     for path in sorted(everything):
         name = os.path.basename(path)
         frames = [frame for frame, entry in catalogs.FRAMES.items()
