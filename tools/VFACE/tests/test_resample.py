@@ -72,18 +72,53 @@ def test_centring_can_be_switched_off_and_then_the_origin_does_not_move(tmp_path
 
 def test_the_padding_value_is_the_volumes_own_minimum(tmp_path):
     """Not 0. CBCT air sits well below zero, so padding with 0 writes a shell
-    of soft-tissue intensity around the head that every later threshold sees."""
+    of soft-tissue intensity around the head that every later threshold sees.
+
+    Padding only happens when the output's field of view is the LARGER of the
+    two, which -- the grid size being kept -- means a target spacing coarser
+    than the volume's own. The source here is at 0.1 mm against a 0.3 mm
+    target, so the output covers three times the extent and the border really
+    is filled in. See the test below for the ordinary case, where the field of
+    view shrinks instead and the default pixel value is never reached.
+    """
     import SimpleITK as sitk
 
-    # A volume whose field of view shrinks, so the corners really are padded.
-    write_volume(tmp_path / "in" / "P001_T1.nii.gz", size=(16, 16, 16), spacing=(1.0, 1.0, 1.0))
-    source = sitk.GetArrayViewFromImage(read_volume(tmp_path / "in" / "P001_T1.nii.gz"))
+    write_volume(tmp_path / "in" / "P001_T1.nii.gz", size=(16, 16, 16), spacing=(0.1, 0.1, 0.1))
+    # GetArrayFromImage, not GetArrayViewFromImage: a VIEW borrows the image's
+    # buffer, so `GetArrayViewFromImage(read_volume(...))` reads freed memory
+    # the moment the temporary image is collected. It returns nan when it does,
+    # and nan compares unequal to everything -- including to itself -- so the
+    # test failed claiming the padding was wrong.
+    source = sitk.GetArrayFromImage(read_volume(tmp_path / "in" / "P001_T1.nii.gz"))
 
     resample.resample_cohort(str(tmp_path / "in"), str(tmp_path / "out"))
-    resampled = sitk.GetArrayViewFromImage(read_volume(tmp_path / "out" / "P001_T1.nii.gz"))
+    resampled = sitk.GetArrayFromImage(read_volume(tmp_path / "out" / "P001_T1.nii.gz"))
 
     assert float(resampled.min()) == pytest.approx(float(source.min()), abs=1e-3)
     assert float(resampled.min()) < 0.0
+
+
+def test_a_finer_target_spacing_narrows_the_field_of_view_around_the_centre(tmp_path):
+    """The ordinary case, and the reason centring is not optional.
+
+    The grid size is kept, so a target spacing finer than the volume's own
+    covers LESS of the patient, not more -- 0.3 mm over a 24-voxel axis is
+    7.2 mm where a 0.6 mm acquisition covered 14.4 mm. Nothing is padded; what
+    the output holds is the middle of the input, and it is the middle only
+    because the origin was moved to keep the two centres together.
+    """
+    import SimpleITK as sitk
+
+    write_volume(tmp_path / "in" / "P001_T1.nii.gz", size=(24, 24, 24), spacing=(0.6, 0.6, 0.6))
+    source = sitk.GetArrayFromImage(read_volume(tmp_path / "in" / "P001_T1.nii.gz"))
+
+    resample.resample_cohort(str(tmp_path / "in"), str(tmp_path / "out"))
+    resampled = sitk.GetArrayFromImage(read_volume(tmp_path / "out" / "P001_T1.nii.gz"))
+
+    # Strictly inside the source's own range: every output voxel is an
+    # interpolation of interior values, so neither extreme survives.
+    assert float(resampled.min()) > float(source.min())
+    assert float(resampled.max()) < float(source.max())
 
 
 def test_the_interpolation_is_linear_rather_than_nearest_neighbour(tmp_path):
@@ -93,12 +128,12 @@ def test_the_interpolation_is_linear_rather_than_nearest_neighbour(tmp_path):
 
     write_volume(tmp_path / "in" / "P001_T1.nii.gz", size=(16, 16, 16), spacing=(1.2, 1.2, 1.2))
     source = set(np.unique(
-        sitk.GetArrayViewFromImage(read_volume(tmp_path / "in" / "P001_T1.nii.gz"))
+        sitk.GetArrayFromImage(read_volume(tmp_path / "in" / "P001_T1.nii.gz"))
     ).tolist())
 
     resample.resample_cohort(str(tmp_path / "in"), str(tmp_path / "out"))
     resampled = np.unique(
-        sitk.GetArrayViewFromImage(read_volume(tmp_path / "out" / "P001_T1.nii.gz"))
+        sitk.GetArrayFromImage(read_volume(tmp_path / "out" / "P001_T1.nii.gz"))
     )
     assert any(float(value) not in source for value in resampled)
 

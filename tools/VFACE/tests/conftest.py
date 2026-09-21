@@ -10,7 +10,6 @@ mirroring, the measurements and the classifier all run for real, on volumes
 written to disk by SimpleITK.
 """
 
-import json
 import os
 from pathlib import Path
 
