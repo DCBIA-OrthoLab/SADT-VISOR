@@ -15,6 +15,15 @@ _PREDICTED = {"automation": [catalogs.AUTOMATION_SEMI, catalogs.AUTOMATION_FULLY
 _ORIENTED = {"automation": catalogs.AUTOMATION_FULLY}
 
 LAYOUT = {
+    # Injected by the server for every tool that calls another (see
+    # describe.INJECTED_ARGUMENTS), and unnamed it arrives with a generic label
+    # in a section of its own -- an "Intermediate results" box in a panel that
+    # never asked for one. Hidden rather than renamed: what this chain leaves
+    # behind on the way is not something a clinician is being offered yet, and
+    # a check box that promises files nobody has decided to return is worse
+    # than no check box.
+    "keep_intermediate": {"hidden": True},
+
     "ios": {"section": _INPUTS, "label": "Intraoral scans"},
     "cbct": {"section": _INPUTS, "label": "CBCT volumes"},
     "automation": {"section": _INPUTS, "label": "Mode"},

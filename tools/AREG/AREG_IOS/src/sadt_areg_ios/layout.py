@@ -23,6 +23,15 @@ _PREDICTED = {"patch": [p for p in catalogs.PATCH_CHOICES if p != catalogs.PATCH
 _FULLY = {"automation": catalogs.AUTOMATION_FULLY}
 
 LAYOUT = {
+    # Injected by the server for every tool that calls another (see
+    # describe.INJECTED_ARGUMENTS), and unnamed it arrives with a generic label
+    # in a section of its own -- an "Intermediate results" box in a panel that
+    # never asked for one. Hidden rather than renamed: what this chain leaves
+    # behind on the way is not something a clinician is being offered yet, and
+    # a check box that promises files nobody has decided to return is worse
+    # than no check box.
+    "keep_intermediate": {"hidden": True},
+
     "t1": {"section": _INPUTS, "label": "T1 (baseline)"},
     "t2": {"section": _INPUTS, "label": "T2 (follow-up)"},
     "automation": {"section": _INPUTS, "label": "Mode"},
