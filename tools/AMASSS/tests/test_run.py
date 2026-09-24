@@ -883,3 +883,205 @@ def test_a_missing_prediction_is_logged_by_case_id(tmp_path, monkeypatch, caplog
     assert "No MAND prediction for p_001" in messages, messages
     assert "Failed to assemble outputs for scan 2 of 2" in messages, messages
     assert not any("Zulu_Zoe" in m or "Adams_Ann" in m for m in messages), messages
+
+
+# ---------------------------------------------------------------------------
+# Structures side by side
+#
+# One nnUNet call is a third inference and two thirds preprocessing, so a run
+# left the card idle 78 % of its own length. Structures are the honest axis for
+# that: separate models over the same read-only input folder, each writing to a
+# directory of its own.
+# ---------------------------------------------------------------------------
+
+class _Supervisor:
+    """The one member of the supervisor this tool uses."""
+
+    def __init__(self, grant):
+        self.grant = grant
+        self.asked = []
+
+    def channels(self, wanted=0):
+        self.asked.append(wanted)
+        return self.grant
+
+
+def test_it_asks_for_one_channel_per_structure_it_was_told_to_produce():
+    sup = _Supervisor(grant=5)
+    assert pipeline._channels_for(sup, 5) == 5
+    assert sup.asked == [5]
+
+
+def test_a_narrower_grant_is_what_it_takes():
+    """The whole bargain: a busy server narrows the run instead of refusing
+    it."""
+    assert pipeline._channels_for(_Supervisor(grant=2), 5) == 2
+
+
+def test_a_grant_wider_than_the_work_is_capped_at_the_work():
+    assert pipeline._channels_for(_Supervisor(grant=8), 3) == 3
+
+
+def test_without_a_supervisor_it_predicts_one_at_a_time():
+    """Which is how this tool is run from a CLI and from its own tests --
+    nothing has reserved anything, and opening five nnUNet predictors on an
+    unknown card is a way to be killed rather than a way to be fast."""
+    assert pipeline._channels_for(None, 5) == 1
+
+
+def test_a_supervisor_that_raises_costs_the_width_and_not_the_run():
+    class _Broken:
+        def channels(self, wanted=0):
+            raise RuntimeError("no budget service")
+
+    assert pipeline._channels_for(_Broken(), 5) == 1
+
+
+def _overlap_recording_predictor(monkeypatch, stub_predictor_fn):
+    """Wrap the stub so it records how many predictions were ever in flight."""
+    import threading
+
+    state = {"running": 0, "peak": 0}
+    lock = threading.Lock()
+    started = threading.Barrier(2, timeout=5)
+
+    def recording(model_folder, input_dir, output_dir, device, **kwargs):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        try:
+            # Both structures have to be inside at once for the barrier to
+            # clear, so this FAILS rather than passing by luck on a machine
+            # that happened to schedule them one after the other.
+            started.wait()
+        except threading.BrokenBarrierError:
+            pass
+        stub_predictor_fn(model_folder, input_dir, output_dir, device, **kwargs)
+        with lock:
+            state["running"] -= 1
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", recording)
+    return state
+
+
+def test_two_structures_are_predicted_at_once_when_the_machine_pays_for_two(
+    tmp_path, stub_predictor, monkeypatch
+):
+    state = _overlap_recording_predictor(
+        monkeypatch, nnunet_runner.predict_folder)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    assert state["peak"] == 2, "the structures ran one after the other"
+
+
+def test_with_no_supervisor_they_do_not_overlap(tmp_path, stub_predictor, monkeypatch):
+    """The floor is one, so the CLI and the tests behave exactly as before."""
+    import threading
+
+    state = {"running": 0, "peak": 0}
+    lock = threading.Lock()
+    inner = nnunet_runner.predict_folder
+
+    def recording(model_folder, input_dir, output_dir, device, **kwargs):
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+        inner(model_folder, input_dir, output_dir, device, **kwargs)
+        with lock:
+            state["running"] -= 1
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", recording)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+    )
+
+    assert state["peak"] == 1
+
+
+def test_one_structure_failing_still_loses_only_that_one_in_a_pool(
+    tmp_path, stub_predictor, monkeypatch
+):
+    inner = nnunet_runner.predict_folder
+
+    def fail_MAX(model_folder, input_dir, output_dir, device, **kwargs):
+        if os.path.basename(os.path.normpath(model_folder)) == "MAX" or "MAX" in model_folder:
+            raise RuntimeError("no model")
+        inner(model_folder, input_dir, output_dir, device, **kwargs)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", fail_MAX)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    report = pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    assert any("MAND" in path for path in segmentation_files(report))
+    assert not any("MAX" in path for path in segmentation_files(report))
+
+
+def test_the_bar_counts_finished_structures_not_started_ones(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """With a pool every structure starts at once, so a bar driven off starts
+    jumps to full and then sits there for the length of the run."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    messages = [json.loads(line)["message"] for line in
+                events_file.read_text().splitlines()]
+    structures = [m for m in messages if "structure" in m]
+    assert structures == ["structure 1 of 2", "structure 2 of 2"], structures
+
+
+def test_cudnn_autotuning_is_turned_back_off_after_the_predictor_is_built():
+    """`nnUNetPredictor.__init__` turns it ON, and autotuning picks a
+    convolution by TIMING candidates -- so the algorithm, and with it the
+    rounding, depends on how busy the card was. Seven runs of one untouched
+    scan produced three different masks, 205-265 voxels apart. With structures
+    now predicted side by side that stops being a rare coincidence.
+    """
+    import torch
+
+    torch.backends.cudnn.benchmark = True
+
+    nnunet_runner._build_predictor("cpu", tile_step_size=0.5)
+
+    assert torch.backends.cudnn.benchmark is False

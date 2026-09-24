@@ -36,6 +36,8 @@ def run(
     device: Literal["cuda", "cpu"] = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
+    *,
+    sup=None,
 ) -> Path:
     """Segment craniofacial structures on a CBCT scan.
 
@@ -94,5 +96,6 @@ def run(
         device=device,
         tile_step_size=tile_step_size,
         gpu_resampling=gpu_resampling,
+        sup=sup,
     )
     return output_dir

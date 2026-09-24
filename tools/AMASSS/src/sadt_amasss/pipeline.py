@@ -19,6 +19,7 @@ What the move out of the server changed, beyond dropping `base`/`config`/
 See the comments marked "FIX:" for the original CLI's defects corrected here.
 """
 
+from concurrent import futures
 import json
 import logging
 import os
@@ -231,6 +232,31 @@ def _write_segmentation(array, reference, output_path: str) -> str:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _channels_for(sup, wanted: int) -> int:
+    """How many structures to predict at once: what the machine will pay for.
+
+    The tool asks for its own count -- the structures it was told to produce --
+    and the supervisor answers with what this run's reserved share can afford,
+    floor one. So a busy server narrows the run instead of refusing it, and a
+    machine with room runs the whole selection side by side.
+
+    One without a supervisor, and deliberately not "as many as there are": this
+    is also how the tool is run from a CLI and from its own tests, where
+    nothing has reserved anything and opening five nnUNet predictors on an
+    unknown card is a way to be killed rather than a way to be fast.
+    """
+    wanted = max(1, int(wanted))
+    ask = getattr(sup, "channels", None)
+    if ask is None:
+        return 1
+    try:
+        return max(1, min(wanted, int(ask(wanted))))
+    except Exception:  # noqa: BLE001 - a grant must never fail a run
+        logger.warning("Could not ask for channels; predicting one at a time",
+                       exc_info=True)
+        return 1
+
+
 def segment(
     input_path: str,
     model_path: str,
@@ -244,6 +270,7 @@ def segment(
     device: str = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
+    sup=None,
 ) -> dict:
     """Segment one scan or a batch under `output_dir`, and return the report."""
     started_at = time.monotonic()
@@ -308,6 +335,7 @@ def segment(
             tile_step_size=tile_step_size,
             gpu_resampling=gpu_resampling,
             started_at=started_at,
+            sup=sup,
         )
     finally:
         # The intermediates are large -- one predicted volume per scan and per
@@ -328,7 +356,7 @@ def segment(
 
 def _run(scans, models, missing_structures, output_dir, work_dir, structures, merge,
          prediction_ID, generate_surface, surface_smoothing, surface_decimation,
-         device, tile_step_size, gpu_resampling, started_at) -> dict:
+         device, tile_step_size, gpu_resampling, started_at, sup=None) -> dict:
     """Everything between the argument checks and the report."""
     # Convert every scan once into the single folder nnUNet reads. Predicting
     # per structure over the whole folder loads each checkpoint once, instead
@@ -373,25 +401,51 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
         raise ToolInputError("None of the input scans could be read as a medical volume.")
 
     # --- Inference: one model load per structure --------------------------
+    #
+    # **The structures overlap, and that is where the time was.** One nnUNet
+    # call is a third inference and two thirds preprocessing: measured on this
+    # pipeline, `preprocess` is 29.2 s of a 62.8 s loop at 1.8 % of the card
+    # and exactly one core, so a run left the GPU idle 78 % of its own length.
+    # Structures are the honest axis for that: each is a separate model over
+    # the same read-only input folder, writing to a directory of its own, and
+    # nothing they share is mutable.
+    #
+    # THREADS, not processes. The work is torch, which releases the GIL inside
+    # its kernels, and `predict_from_files_sequential` runs in this process on
+    # purpose (see nnunet_runner) -- a process pool would need a CUDA context
+    # each and would lose the model sharing that pool exists for.
     predictions = {}
     failed_structures = {}
-    for structure_index, (code, model_folder) in enumerate(models.items(), start=1):
-        # Per STRUCTURE, which is the honest unit here: one nnUNet call covers
-        # the whole cohort, so there is no per-scan position to report inside
-        # it and interpolating one would invent a number the tool cannot know.
-        progress.report(structure_index, len(models), "structure", start=0.1, end=0.9)
+    width = _channels_for(sup, len(models))
+    logger.info("Predicting %d structure(s) %d at a time on %s",
+                len(models), width, device)
+
+    def predict(item):
+        code, model_folder = item
         structure_output = os.path.join(work_dir, f"pred_{code}")
-        try:
-            logger.info("Predicting %s on %s", code, device)
-            nnunet_runner.predict_folder(
-                model_folder, nnunet_input, structure_output, device,
-                tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
-            )
-            predictions[code] = structure_output
-        except Exception as exc:
-            # One structure failing must not lose the others.
-            logger.exception("Prediction failed for structure %s", code)
-            failed_structures[code] = str(exc)
+        nnunet_runner.predict_folder(
+            model_folder, nnunet_input, structure_output, device,
+            tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
+        )
+        return code, structure_output
+
+    done = 0
+    with futures.ThreadPoolExecutor(max_workers=width) as pool:
+        running = {pool.submit(predict, item): item[0] for item in models.items()}
+        for future in futures.as_completed(running):
+            code = running[future]
+            done += 1
+            # Reported on COMPLETION, not on submission: with a pool every
+            # structure starts at once, so a bar driven off starts would jump
+            # to full and then sit there for the length of the run.
+            progress.report(done, len(models), "structure", start=0.1, end=0.9)
+            try:
+                _code, structure_output = future.result()
+                predictions[code] = structure_output
+            except Exception as exc:
+                # One structure failing must not lose the others.
+                logger.exception("Prediction failed for structure %s", code)
+                failed_structures[code] = str(exc)
 
     if not predictions:
         raise RuntimeError(
