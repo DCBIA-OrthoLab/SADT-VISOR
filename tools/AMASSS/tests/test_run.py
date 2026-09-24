@@ -1085,3 +1085,20 @@ def test_cudnn_autotuning_is_turned_back_off_after_the_predictor_is_built():
     nnunet_runner._build_predictor("cpu", tile_step_size=0.5)
 
     assert torch.backends.cudnn.benchmark is False
+
+
+def test_a_caller_named_number_is_a_ceiling_on_the_ask_not_a_floor_over_it():
+    """Admission reserved against what it granted, so a tool spreading wider
+    than its own share would spend memory nobody set aside."""
+    sup = _Supervisor(grant=8)
+
+    assert pipeline._channels_for(sup, 5, declared=2) == 2
+    assert sup.asked == [2], "it asked for more than the caller allowed"
+
+
+def test_without_a_supervisor_a_named_number_is_the_one_that_decides():
+    """A CLI, a test: nothing has reserved anything, so the only number left
+    is the one the caller typed."""
+    assert pipeline._channels_for(None, 5, declared=3) == 3
+    assert pipeline._channels_for(None, 2, declared=9) == 2
+    assert pipeline._channels_for(None, 5, declared=0) == 1

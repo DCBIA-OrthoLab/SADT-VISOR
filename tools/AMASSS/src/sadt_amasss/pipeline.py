@@ -232,7 +232,7 @@ def _write_segmentation(array, reference, output_path: str) -> str:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def _channels_for(sup, wanted: int) -> int:
+def _channels_for(sup, wanted: int, declared: int = 0) -> int:
     """How many structures to predict at once: what the machine will pay for.
 
     The tool asks for its own count -- the structures it was told to produce --
@@ -240,15 +240,35 @@ def _channels_for(sup, wanted: int) -> int:
     floor one. So a busy server narrows the run instead of refusing it, and a
     machine with room runs the whole selection side by side.
 
-    One without a supervisor, and deliberately not "as many as there are": this
-    is also how the tool is run from a CLI and from its own tests, where
-    nothing has reserved anything and opening five nnUNet predictors on an
+    **`declared` is `num_workers`, and declaring it is what turns any of this
+    on.** The server's `execution/concurrency` is inert for a tool whose schema
+    names neither `num_workers` nor `batch_size`: it reserves no room, sets no
+    `SADT_CHANNEL_BUDGET`, and `sup.channels()` then answers 1 before doing any
+    arithmetic at all. This tool asked for five structures and was answered one
+    every time for exactly that reason -- the parallel loop was right and never
+    got a width to use. The argument is in the server's `TECHNICAL` table, so
+    it is filled in for the clinician and never rendered on a panel.
+
+    A number the CALLER named is a ceiling on the ask, never a floor over it:
+    admission reserved against what it granted, and a tool that spread wider
+    than its own share would be spending memory nobody set aside.
+
+    One without a supervisor -- a CLI, a test -- unless the caller named a
+    number there, which is the only place a bare `num_workers` still decides:
+    nothing has reserved anything, and opening five nnUNet predictors on an
     unknown card is a way to be killed rather than a way to be fast.
     """
     wanted = max(1, int(wanted))
+    try:
+        declared = int(declared or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > 0:
+        wanted = min(wanted, declared)
+
     ask = getattr(sup, "channels", None)
     if ask is None:
-        return 1
+        return max(1, wanted) if declared > 0 else 1
     try:
         return max(1, min(wanted, int(ask(wanted))))
     except Exception:  # noqa: BLE001 - a grant must never fail a run
@@ -270,6 +290,7 @@ def segment(
     device: str = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
+    num_workers: int = 0,
     sup=None,
 ) -> dict:
     """Segment one scan or a batch under `output_dir`, and return the report."""
@@ -335,6 +356,7 @@ def segment(
             tile_step_size=tile_step_size,
             gpu_resampling=gpu_resampling,
             started_at=started_at,
+            num_workers=num_workers,
             sup=sup,
         )
     finally:
@@ -356,7 +378,8 @@ def segment(
 
 def _run(scans, models, missing_structures, output_dir, work_dir, structures, merge,
          prediction_ID, generate_surface, surface_smoothing, surface_decimation,
-         device, tile_step_size, gpu_resampling, started_at, sup=None) -> dict:
+         device, tile_step_size, gpu_resampling, started_at, num_workers=0,
+         sup=None) -> dict:
     """Everything between the argument checks and the report."""
     # Convert every scan once into the single folder nnUNet reads. Predicting
     # per structure over the whole folder loads each checkpoint once, instead
@@ -416,7 +439,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
     # each and would lose the model sharing that pool exists for.
     predictions = {}
     failed_structures = {}
-    width = _channels_for(sup, len(models))
+    width = _channels_for(sup, len(models), num_workers)
     logger.info("Predicting %d structure(s) %d at a time on %s",
                 len(models), width, device)
 
