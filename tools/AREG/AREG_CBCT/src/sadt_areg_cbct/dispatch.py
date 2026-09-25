@@ -212,6 +212,13 @@ def _run_cbct(
         t1_root = dicom.convert_tree(t1_root, os.path.join(work_dir, "dicom_t1"))
         t2_root = dicom.convert_tree(t2_root, os.path.join(work_dir, "dicom_t2"))
 
+    # Descended ONCE, here, before anything reads either folder: a hosted test
+    # entry is a whole cohort (`<name>/{T1,T2}/`) because that is all a picker
+    # can offer, and every step below -- the segmentation, the pairing, the
+    # output names -- has to be looking at the same directory.
+    t1_root = pairing.timepoint_root(t1_root, "T1")
+    t2_root = pairing.timepoint_root(t2_root, "T2")
+
     codes = [catalogs.region_code(name) for name in regions]
     report["regions"] = list(regions)
     report["segmentation_label"] = segmentation_label or None
