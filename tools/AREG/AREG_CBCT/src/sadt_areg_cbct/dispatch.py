@@ -158,10 +158,52 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
         )
 
 
+
+# Where the anatomical segmentations land in the caller's output. A folder of
+# their own: the registration writes one tree per region, and a mandible
+# segmentation belongs to neither of them.
+SEGMENTATION_DIRNAME = "Segmentations"
+
+
+def _collect_segmentations(amasss_dir, codes, output_dir, report) -> None:
+    """Copy the requested anatomy out of AMASSS's folder into the caller's.
+
+    AMASSS runs here as a STEP of the chain, so its output sits in the
+    supervisor's scratch and comes back only to someone who ticked
+    `keep_intermediate`. The original module writes these segmentations into
+    the user's own output folder, and a check box that produces files nobody
+    receives would be worse than no check box -- so what was asked for is
+    copied out, and only that.
+
+    The names are AMASSS's own and deterministic:
+    `<base>_<ID>_SegOut/<base>_<ID>_<CODE><extension>` (see its
+    `_assemble_scan_outputs`), which is what makes picking the requested
+    structures out of a folder holding the masks too a match rather than a
+    guess.
+    """
+    if not codes or not amasss_dir or not os.path.isdir(amasss_dir):
+        return
+    wanted = set(codes)
+    destination = os.path.join(output_dir, SEGMENTATION_DIRNAME)
+    collected = []
+    for root, _dirs, files in os.walk(amasss_dir):
+        for name in sorted(files):
+            stem = name.split(".")[0]
+            code = stem.rsplit("_", 1)[-1] if "_" in stem else ""
+            if code not in wanted:
+                continue
+            target_dir = os.path.join(destination, os.path.basename(root))
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(os.path.join(root, name), os.path.join(target_dir, name))
+            collected.append(os.path.join(SEGMENTATION_DIRNAME,
+                                          os.path.basename(root), name))
+    report["segmentations"] = sorted(collected)
+
+
 def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
-    suffix, report, sup=None, landmark_model=None,
+    suffix, report, sup=None, landmark_model=None, segmentations=None,
 ) -> None:
     # Imported here rather than at module level: the CBCT engine pulls in
     # SimpleITK and itk-elastix, and AREG must load on a server without them so
@@ -199,11 +241,17 @@ def _run_cbct(
         # Where the original looked when no mask folder was given.
         mask_roots.append(t1_root)
     else:
-        structures = [catalogs.REGION_MASK_STRUCTURES[code] for code in codes]
-        mask_roots.append(
-            tools.segment_masks(sup, t1_root, segmentation_model, structures)
-        )
+        masks = [catalogs.REGION_MASK_STRUCTURES[code] for code in codes]
+        # One AMASSS call for both: the masks the registration consumes and the
+        # anatomy the caller ticked. Asking twice would segment the same scan
+        # twice, and the card is serialised.
+        wanted = [catalogs.SEGMENTATION_CODES[name]
+                  for name in _selected(segmentations, catalogs.SEGMENTATION_CHOICES)]
+        structures = masks + [code for code in wanted if code not in masks]
+        amasss_dir = tools.segment_masks(sup, t1_root, segmentation_model, structures)
+        mask_roots.append(amasss_dir)
         report["segmented_t1"] = sorted(structures)
+        _collect_segmentations(amasss_dir, wanted, output_dir, report)
 
     # Step 3 -- pair the timepoints, then register once per region.
     matched = pairing.pair(t1_root, t2_root, suffix)
@@ -358,6 +406,7 @@ def register(
     output_suffix: str = "Reg",
     output_dir: str = None,
     sup=None,
+    segmentations=None,
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
@@ -395,6 +444,7 @@ def register(
         report=report,
         sup=sup,
         landmark_model=landmark_model,
+        segmentations=segmentations,
     )
 
     # Extracted inputs, converted DICOM, the oriented copies and whatever the
@@ -414,6 +464,7 @@ def main(
     t2,
     t1_masks=None,
     cbct_regions=None,
+    segmentations=None,
     segmentation_label=0,
     segmentation_model=None,
     cbct_reference=None,
@@ -469,6 +520,7 @@ def main(
         output_suffix=suffix,
         output_dir=output_dir,
         sup=sup,
+        segmentations=segmentations,
     )
 
     return run.output_dir

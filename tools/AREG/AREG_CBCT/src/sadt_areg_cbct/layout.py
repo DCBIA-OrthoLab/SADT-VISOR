@@ -50,6 +50,12 @@ LAYOUT = {
         "ui": "inline",
     },
     "t1_masks": {"section": _REGISTRATION, "label": "T1 masks", "visible_when": _SEMI},
+    # The original's second group, under its own name. Inline like `regions`:
+    # six short labels, and a clinician compares them by reading across.
+    "segmentations": {
+        "section": _REGISTRATION, "label": "AMASSS segmentation",
+        "visible_when": _SEGMENTED, "ui": "inline",
+    },
     # Not offered: the modes that segment segment with AMASSS, and the bundle
     # is the one the deployment already publishes (see dispatch._own_segmentation).
     # The argument stays, so a caller with a reason can still name another one.

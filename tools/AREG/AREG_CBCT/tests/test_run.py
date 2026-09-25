@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import pathlib
 import pytest
 import SimpleITK as sitk
 
@@ -324,6 +325,67 @@ def test_the_mask_request_names_amasss_arguments(tmp_path):
     assert params["merge"] == ["SEPARATE"]
     assert params["generate_surface"] is False
     assert set(params) >= {"scans", "model", "output_dir"}
+
+
+# ---------------------------------------------------------------------------
+# The second group of check boxes: what comes back, not what is registered on
+# ---------------------------------------------------------------------------
+def _seg_out(root, base, codes, prediction_id="Seg"):
+    """AMASSS's own output layout, which is what `_collect_segmentations`
+    matches on: `<base>_<ID>_SegOut/<base>_<ID>_<CODE>.nii.gz`."""
+    folder = pathlib.Path(root) / f"{base}_{prediction_id}_SegOut"
+    folder.mkdir(parents=True, exist_ok=True)
+    for code in codes:
+        (folder / f"{base}_{prediction_id}_{code}.nii.gz").write_bytes(b"x")
+    return folder
+
+
+def test_ticked_anatomy_is_copied_into_the_output_the_caller_receives(tmp_path):
+    """AMASSS runs as a STEP here, so its folder comes back only to someone who
+    ticked `keep_intermediate`. A check box that produced files nobody receives
+    would be worse than no check box."""
+    amasss = tmp_path / "amasss"
+    _seg_out(amasss, "P1_T1", ["CBMASK", "MAND", "SKIN"])
+    output = tmp_path / "out"
+    output.mkdir()
+    report = {}
+
+    dispatch._collect_segmentations(str(amasss), ["MAND", "SKIN"], str(output), report)
+
+    got = sorted(pathlib.Path(p).name for p in report["segmentations"])
+    assert got == ["P1_T1_Seg_MAND.nii.gz", "P1_T1_Seg_SKIN.nii.gz"]
+    assert (output / dispatch.SEGMENTATION_DIRNAME / "P1_T1_Seg_SegOut"
+            / "P1_T1_Seg_MAND.nii.gz").is_file()
+    # The mask the registration consumed is NOT a deliverable: it was not asked
+    # for, and returning it would make the two groups indistinguishable.
+    assert not (output / dispatch.SEGMENTATION_DIRNAME / "P1_T1_Seg_SegOut"
+                / "P1_T1_Seg_CBMASK.nii.gz").exists()
+
+
+def test_nothing_ticked_copies_nothing_and_writes_no_folder(tmp_path):
+    """A registration run returns a registration."""
+    amasss = tmp_path / "amasss"
+    _seg_out(amasss, "P1_T1", ["CBMASK"])
+    output = tmp_path / "out"
+    output.mkdir()
+    report = {}
+
+    dispatch._collect_segmentations(str(amasss), [], str(output), report)
+
+    assert "segmentations" not in report
+    assert not (output / dispatch.SEGMENTATION_DIRNAME).exists()
+
+
+def test_the_two_groups_are_independent_and_asked_for_in_one_call():
+    """Registering on the cranial base while returning skin is one AMASSS run,
+    not two: the same scan would be segmented twice and the card is
+    serialised. And a structure in both groups is asked for once."""
+    codes = ["CB"]
+    masks = [catalogs.REGION_MASK_STRUCTURES[c] for c in codes]
+    wanted = [catalogs.SEGMENTATION_CODES[n] for n in ["Skin", "Cranial base"]]
+    structures = masks + [c for c in wanted if c not in masks]
+    assert structures == ["CBMASK", "SKIN", "CB"]
+
 
 def test_the_orientation_request_is_the_nested_one(tmp_path):
     """ASO is itself supervised for CBCT, so this is AREG -> ASO -> ALI:

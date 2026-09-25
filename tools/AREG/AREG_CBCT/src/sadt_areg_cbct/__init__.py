@@ -36,6 +36,16 @@ def run(
         Literal["Cranial base", "Mandible", "Maxilla"]
     ] = ["Cranial base"],
     t1_masks: Path = "",
+    # The second group of boxes the original module shows, and it is NOT the
+    # regions above: those decide what the registration is masked to, these
+    # decide what comes back to look at. Spelled out for the same reason
+    # `regions` is -- `Literal` cannot be built from the catalog.
+    segmentations: list[
+        Literal[
+            "Cranial base", "Cervical vertebra", "Mandible", "Maxilla",
+            "Skin", "Upper airway",
+        ]
+    ] = [],
     segmentation_model: Path = "",
     segmentation_label: int = 0,
     reference: Path = "",
@@ -61,6 +71,11 @@ def run(
             timepoints. The one argument a clinician must actually think about.
         t1_masks: Your own T1 segmentation masks, instead of having them
             segmented for you.
+        segmentations: Anatomy to segment and return beside the registration,
+            for the modes that segment. Independent of `regions`: ticking the
+            skin does not register on it, and registering on the mandible does
+            not return a mandible you can open. None by default -- a
+            registration run returns a registration.
         segmentation_model: The mask model bundle, for the modes that segment.
             Left empty -- which is what a panel sends -- the AMASSS bundle this
             deployment publishes for AREG is used, there being no second answer
@@ -84,6 +99,7 @@ def run(
         automation=automation,
         cbct_regions=regions,
         t1_masks=t1_masks,
+        segmentations=segmentations,
         segmentation_model=segmentation_model,
         segmentation_label=segmentation_label,
         cbct_reference=reference,
