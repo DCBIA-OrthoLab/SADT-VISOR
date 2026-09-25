@@ -18,24 +18,17 @@ come from other tools reached through the supervisor; see the CBCT half of
 from pathlib import Path
 from typing import Literal
 
-from sadt_areg_common import pairing
-
 from .dispatch import main
 
 
-# What each path argument can read: the client's file dialog and the server's
-# upload check both narrow from here. DERIVED from the table the pairing
-# registers against, never retyped.
-#
-# `t1_masks` takes volumes too -- a mask IS a volume, one label per voxel --
-# and DICOM is deliberately absent: a series is a folder of `.dcm`, which the
-# `dicom_input` switch handles rather than an extension filter.
-ACCEPTS = {
-    "t1": pairing.SCAN_EXTENSIONS,
-    "t2": pairing.SCAN_EXTENSIONS,
-    "t1_masks": pairing.SCAN_EXTENSIONS,
-}
-
+# `t1`, `t2` and `t1_masks` deliberately declare NO extensions, and it is not
+# an omission. The AREG facade composes this engine with the intraoral one, and
+# `t1` there is a SURFACE: declaring volumes here made the two disagree about
+# what one name means, and the facade -- rightly -- refused to publish at all
+# ("'AREG' cannot publish 't1'"). Saying what this engine reads needs an
+# `accepts` the facade can vary per MODE, the same capability its file pickers
+# need to be scoped per mode. Until then the engine's own panel filters
+# nothing, and `pairing.is_scan_file` is what actually decides.
 
 def run(
     t1: Path,
