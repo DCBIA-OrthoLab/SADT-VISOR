@@ -41,7 +41,15 @@ LAYOUT = {
 
     "t1": {"section": _INPUTS, "label": "T1 (baseline)"},
     "t2": {"section": _INPUTS, "label": "T2 (follow-up)"},
-    "automation": {"section": _INPUTS, "label": "Mode"},
+    # NOT "Mode". The facade publishes its own `mode` -- the modality -- and
+    # labels it "Mode" too, so a panel reached through AREG shows two dropdowns
+    # side by side under the same word: one saying CBCT, the next saying
+    # Semi-Automated. A user who read the first as "the mode" then hunted for
+    # check boxes that only exist in another value of the SECOND one, and had
+    # no way to tell which was which. The engines keep this label when opened
+    # directly, where there is only one dropdown and no ambiguity, so the word
+    # has to carry its own meaning either way.
+    "automation": {"section": _INPUTS, "label": "Automation"},
 
     "patch": {"section": _REGISTRATION, "label": "Registration patch"},
     "reference": {
