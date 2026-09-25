@@ -37,6 +37,7 @@ def run(
     output_suffix: str = "Reg",
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Register an intraoral scan onto a CBCT of the same patient.
 
@@ -75,5 +76,6 @@ def run(
         cbct_reference=cbct_reference, landmark_model=landmark_model,
         ios_landmark_model=ios_landmark_model, crown_model=crown_model,
         max_dist=max_dist, output_suffix=output_suffix, sup=sup,
+        data_root=data_root,
     )
     return output_dir

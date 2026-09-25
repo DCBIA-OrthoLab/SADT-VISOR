@@ -50,19 +50,34 @@ LAYOUT = {
         "section": _LANDMARKS, "label": "CBCT landmarks", "visible_when": _SUPPLIED,
     },
 
+    # Not offered: Crown_Seg finds its own weights, so there is nothing here for a
+    # clinician to decide and a wrong pick is a chain that predicts with the
+    # wrong weights.
     "crown_model": {
-        "section": _MODELS, "label": "Crown segmentation model", "visible_when": _PREDICTED,
+        "hidden": True, "section": _MODELS, "label": "Crown segmentation model", "visible_when": _PREDICTED,
     },
+    # Not offered: ALI_IOS finds its own, so there is nothing here for a
+    # clinician to decide and a wrong pick is a chain that predicts with the
+    # wrong weights.
     "ios_landmark_model": {
-        "section": _MODELS, "label": "Intraoral landmark bundle", "visible_when": _PREDICTED,
+        "hidden": True, "section": _MODELS, "label": "Intraoral landmark bundle", "visible_when": _PREDICTED,
     },
+    # Not offered: ALI_CBCT finds its own, so there is nothing here for a
+    # clinician to decide and a wrong pick is a chain that predicts with the
+    # wrong weights.
     "landmark_model": {
-        "section": _MODELS, "label": "CBCT landmark bundle", "visible_when": _PREDICTED,
+        "hidden": True, "section": _MODELS, "label": "CBCT landmark bundle", "visible_when": _PREDICTED,
     },
+    # Not offered: one frame the chain expects (dispatch._own_reference), so there is nothing here for a
+    # clinician to decide and a wrong pick is a chain that predicts with the
+    # wrong weights.
     "cbct_reference": {
-        "section": _MODELS, "label": "Orientation reference", "visible_when": _ORIENTED,
+        "hidden": True, "section": _MODELS, "label": "Orientation reference", "visible_when": _ORIENTED,
     },
 
-    "max_dist": {"section": _OUTPUTS, "label": "ICP match distance (mm)"},
+    # The ICP refinement it tunes never runs: `pipeline.register_one` refines
+    # only when handed points sampled from the CBCT, and the one production
+    # call site passes none. A knob wired to nothing is worse than no knob.
+    "max_dist": {"section": _OUTPUTS, "label": "ICP match distance (mm)", "hidden": True},
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
 }

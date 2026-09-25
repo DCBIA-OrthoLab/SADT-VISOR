@@ -382,7 +382,10 @@ def test_every_published_argument_has_a_label(tmp_path):
     above a file picker."""
     published = [
         name for name in inspect.signature(run).parameters
-        if name not in ("output_dir", "sup")
+        # `sup` and `data_root` are INJECTED by the server (describe.INJECTED),
+        # never published and never laid out: a panel cannot offer a supervisor
+        # or the server's own data folder.
+        if name not in ("output_dir", "sup", "data_root")
     ]
     # The injected ones are not published by this tool and carry no label: they
     # are named here only to be hidden, which is presentation and not an
