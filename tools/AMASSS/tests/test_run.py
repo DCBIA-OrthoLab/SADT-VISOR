@@ -615,7 +615,7 @@ def test_surfaces_are_written_as_binary_vtk(tmp_path):
     reference.SetSpacing((0.4, 0.4, 0.4))
 
     output = str(tmp_path / "surface.vtk")
-    mesh = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (216, 101, 79))
+    mesh = vtk_export._mesh_from_mask(volume, reference, 5, (216, 101, 79))
     vtk_export._write(mesh, output)
 
     with open(output, "rb") as handle:
@@ -637,15 +637,58 @@ def test_surfaces_are_written_as_binary_vtk(tmp_path):
     )
 
 
-def test_mesh_temp_file_does_not_outlive_the_call(tmp_path):
-    """The scratch .nrrd used to have a fixed name and was never removed."""
+def test_the_mask_reaches_vtk_without_touching_the_disk(tmp_path):
+    """It used to be written out as a `.nrrd` and read back by vtkNrrdReader:
+    96 MB out and 96 MB in per mask, eighteen masks per scan on a full run, to
+    move a buffer that was already in memory. The scratch file also had a fixed
+    name once, and was never removed."""
     volume = np.zeros((20, 20, 20), dtype=np.uint8)
     volume[5:15, 5:15, 5:15] = 1
     reference = sitk.GetImageFromArray(volume)
 
-    vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 3, (1, 2, 3))
+    mesh = vtk_export._mesh_from_mask(volume, reference, 3, (1, 2, 3))
 
-    assert list(tmp_path.glob("*.nrrd")) == []
+    assert mesh.GetNumberOfCells() > 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_contour_is_the_same_surface_the_discrete_filter_gave(tmp_path):
+    """`vtkFlyingEdges3D` at 0.5 replaced `vtkDiscreteMarchingCubes`, and the
+    brief was that no clinical output moves. On a 0/1 mask the 0.5 isosurface
+    crosses every edge at its midpoint, which is where the discrete filter put
+    its vertices -- so the two are equal, not merely close. Verified on a real
+    mandible of 589 934 triangles; pinned here on something a test can afford.
+    """
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    volume = np.zeros((30, 30, 30), dtype=np.uint8)
+    zz, yy, xx = np.ogrid[:30, :30, :30]
+    volume[((zz - 15) ** 2 + (yy - 15) ** 2 + (xx - 15) ** 2) < 100] = 1
+    reference = sitk.GetImageFromArray(volume)
+    reference.SetSpacing((0.4, 0.4, 0.4))
+    image = vtk_export._image_from_mask(volume, reference)
+
+    discrete = vtk.vtkDiscreteMarchingCubes()
+    discrete.SetInputData(image)
+    discrete.GenerateValues(1, 1, 1)
+    discrete.Update()
+    flying = vtk.vtkFlyingEdges3D()
+    flying.SetInputData(image)
+    flying.SetValue(0, 0.5)
+    flying.Update()
+
+    def triangles(poly):
+        points = vtk_to_numpy(poly.GetPoints().GetData())
+        cells = vtk_to_numpy(poly.GetPolys().GetData()).reshape(-1, 4)[:, 1:]
+        # Vertices sorted inside each triangle and triangles sorted between
+        # them: the same surface emitted in a different order is the same
+        # surface, and that is what has to hold.
+        flat = np.sort(points[cells].round(6), axis=1).reshape(-1, 9)
+        return flat[np.lexsort(flat.T[::-1])]
+
+    assert discrete.GetOutput().GetNumberOfCells() == flying.GetOutput().GetNumberOfCells()
+    assert np.array_equal(triangles(discrete.GetOutput()), triangles(flying.GetOutput()))
 
 
 def test_decimation_reduces_triangles_and_zero_disables_it(tmp_path):
@@ -658,8 +701,8 @@ def test_decimation_reduces_triangles_and_zero_disables_it(tmp_path):
     reference = sitk.GetImageFromArray(volume)
     reference.SetSpacing((0.4, 0.4, 0.4))
 
-    raw = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (1, 2, 3), 0)
-    reduced = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (1, 2, 3), 90)
+    raw = vtk_export._mesh_from_mask(volume, reference, 5, (1, 2, 3), 0)
+    reduced = vtk_export._mesh_from_mask(volume, reference, 5, (1, 2, 3), 90)
 
     assert raw.GetNumberOfCells() > 0
     assert reduced.GetNumberOfCells() < raw.GetNumberOfCells() / 2
@@ -1163,3 +1206,47 @@ def test_a_serial_run_declares_one_and_not_nothing(
     records = [json.loads(line) for line in events_file.read_text().splitlines()]
     declared = [r["width"] for r in records if "width" in r]
     assert declared and min(declared) == 1, records
+
+
+def test_meshes_built_side_by_side_come_back_in_the_order_they_were_asked_for():
+    """The threads finish in whatever order the machine gives them; the file a
+    clinician opens must not. `_meshes_in_parallel` is what the merged surface
+    appends from and what names the separate ones, so its order IS the output's
+    order."""
+    volume = np.zeros((24, 24, 24), dtype=np.uint8)
+    reference = sitk.GetImageFromArray(volume)
+    jobs = []
+    for index, size in enumerate((4, 6, 8, 10)):
+        mask = np.zeros((24, 24, 24), dtype=np.uint8)
+        mask[2:2 + size, 2:2 + size, 2:2 + size] = 1
+        jobs.append((mask, reference, 1, (index, index, index), 0))
+
+    serial = vtk_export._meshes_in_parallel(jobs, workers=1)
+    threaded = vtk_export._meshes_in_parallel(jobs, workers=4)
+
+    assert [m.GetNumberOfCells() for m in serial] == [m.GetNumberOfCells() for m in threaded]
+    assert [m.GetNumberOfCells() for m in serial] == sorted(
+        m.GetNumberOfCells() for m in serial), "the fixture should grow monotonically"
+
+
+def test_the_separate_surfaces_are_named_after_their_own_structure(tmp_path):
+    """Built in a pool, written in the mapping's order -- so a surface cannot
+    end up carrying another structure's name because its thread came back
+    first."""
+    reference = sitk.GetImageFromArray(np.zeros((20, 20, 20), dtype=np.uint8))
+    masks = {}
+    for index, code in enumerate(("MAND", "MAX", "CB")):
+        mask = np.zeros((20, 20, 20), dtype=np.uint8)
+        mask[2:2 + 4 + index * 3, 2:2 + 4 + index * 3, 2:2 + 4 + index * 3] = 1
+        masks[code] = mask
+
+    from sadt_amasss.catalog import LABEL_COLORS, LABELS
+
+    written = vtk_export.write_separate_surfaces(
+        masks=masks, reference=reference, label_colors=LABEL_COLORS, labels=LABELS,
+        smoothing=1, decimation=0, output_dir=str(tmp_path),
+        name_of=lambda code: f"p_{code}.vtk", workers=3,
+    )
+
+    assert [os.path.basename(p) for p in written] == ["p_MAND.vtk", "p_MAX.vtk", "p_CB.vtk"]
+    assert all(os.path.isfile(p) for p in written)

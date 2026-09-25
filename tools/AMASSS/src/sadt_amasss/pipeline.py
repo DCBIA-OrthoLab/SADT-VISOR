@@ -502,6 +502,11 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
                 generate_surface=generate_surface,
                 surface_smoothing=surface_smoothing,
                 surface_decimation=surface_decimation,
+                # The same share the structures were spread over. A run holds
+                # what admission reserved for it for its whole life, so using
+                # it again here spends nothing that was not already set aside
+                # -- and the card is idle throughout this phase.
+                workers=width,
             )
             record["status"] = "ok"
         except Exception as exc:
@@ -555,7 +560,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
 
 def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction_ID,
                            merge, generate_surface, surface_smoothing,
-                           surface_decimation) -> None:
+                           surface_decimation, workers: int = 1) -> None:
     """Turn one scan's per-structure nnUNet masks into its final files."""
     import numpy as np
     import SimpleITK as sitk
@@ -591,9 +596,6 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
 
     scan_dir = os.path.join(output_dir, f"{base}_{prediction_ID}_SegOut")
     os.makedirs(scan_dir, exist_ok=True)
-    surface_temp = os.path.join(work_dir, "surface_tmp")
-    os.makedirs(surface_temp, exist_ok=True)
-
     # Separate files: requested, or unavoidable when there is only one
     # structure (a "merged" volume of one structure is just that structure).
     if "SEPARATE" in merge or len(masks) == 1:
@@ -602,24 +604,23 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
             record["segmentations"].append(
                 _write_segmentation(mask, reference, output_path)
             )
-            if generate_surface:
-                record["surfaces"].append(
-                    vtk_export.write_separate_surface(
-                        mask=mask,
-                        reference=reference,
-                        # FIX: the code is passed explicitly instead of being
-                        # parsed back out of the file name (original KeyError).
-                        structure_code=code,
-                        label_colors=LABEL_COLORS,
-                        labels=LABELS,
-                        temp_dir=surface_temp,
-                        smoothing=surface_smoothing,
-                        decimation=surface_decimation,
-                        output_path=os.path.join(
-                            scan_dir, f"{base}_{prediction_ID}_{code}.vtk"
-                        ),
-                    )
+        if generate_surface:
+            # Every structure's mesh at once, and written out in the order
+            # `masks` holds them -- the run's own, so the file names and the
+            # report do not depend on which thread finished first.
+            record["surfaces"].extend(
+                vtk_export.write_separate_surfaces(
+                    masks=masks,
+                    reference=reference,
+                    label_colors=LABEL_COLORS,
+                    labels=LABELS,
+                    smoothing=surface_smoothing,
+                    decimation=surface_decimation,
+                    output_dir=scan_dir,
+                    name_of=lambda code: f"{base}_{prediction_ID}_{code}.vtk",
+                    workers=workers,
                 )
+            )
 
     if "MERGED" in merge and len(masks) > 1:
         shape = next(iter(masks.values())).shape
@@ -636,10 +637,10 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
                 reference=reference,
                 names_from_labels=NAMES_FROM_LABELS,
                 label_colors=LABEL_COLORS,
-                temp_dir=surface_temp,
                 smoothing=surface_smoothing,
                 decimation=surface_decimation,
                 output_path=os.path.join(scan_dir, f"{base}_{prediction_ID}_MERGED.vtk"),
+                workers=workers,
             )
             if surface:
                 record["surfaces"].append(surface)
