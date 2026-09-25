@@ -426,6 +426,45 @@ def test_fully_automated_without_segmentation_weights_is_refused_up_front():
         )
 
 
+def test_the_segmentation_bundle_is_found_without_anybody_naming_it(tmp_path):
+    """The modes that segment segment with AMASSS, and one bundle answers.
+
+    Asking a clinician which folder to use was asking a question with a single
+    possible answer, in a panel where getting it wrong surfaces fifteen seconds
+    into a child process. So the tool looks where the deployment puts it.
+    """
+    bundle = tmp_path / "AREG" / "models" / "AMASSS_Models"
+    (bundle / "MAND").mkdir(parents=True)
+    assert dispatch._own_segmentation(tmp_path) == str(bundle)
+
+
+def test_a_data_root_without_the_bundle_resolves_to_nothing(tmp_path):
+    """Not an exception: the ONE refusal below is what tells the caller what is
+    missing, and two places saying it is two places to keep in step."""
+    (tmp_path / "AREG" / "models").mkdir(parents=True)
+    assert dispatch._own_segmentation(tmp_path) == ""
+
+
+def test_no_data_root_resolves_to_nothing_rather_than_guessing():
+    """A tool run from a checkout has no data root at all; it must not turn
+    that into a path relative to the working directory."""
+    assert dispatch._own_segmentation(None) == ""
+
+
+def test_the_refusal_says_which_bundle_is_missing_and_where():
+    """"Name a bundle" is unactionable when the panel no longer offers the
+    field: what the operator needs is the folder to populate."""
+    with pytest.raises(ToolInputError, match="AMASSS_Models"):
+        dispatch._check_cbct(
+            automation=catalogs.AUTOMATION_FULLY,
+            regions=["Cranial base"],
+            t1_masks=None,
+            reference=None,
+            segmentation_model=None,
+            sup=FakeSup("/tmp/areg-rules"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Progress -- one region at a time over the whole cohort
 # ---------------------------------------------------------------------------

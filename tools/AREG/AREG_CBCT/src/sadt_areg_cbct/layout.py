@@ -50,8 +50,12 @@ LAYOUT = {
         "ui": "inline",
     },
     "t1_masks": {"section": _REGISTRATION, "label": "T1 masks", "visible_when": _SEMI},
+    # Not offered: the modes that segment segment with AMASSS, and the bundle
+    # is the one the deployment already publishes (see dispatch._own_segmentation).
+    # The argument stays, so a caller with a reason can still name another one.
     "segmentation_model": {
-        "section": _REGISTRATION, "label": "Segmentation model", "visible_when": _SEGMENTED,
+        "section": _REGISTRATION, "label": "Segmentation model",
+        "visible_when": _SEGMENTED, "hidden": True,
     },
     "segmentation_label": {
         "section": _REGISTRATION, "label": "Mask label value", "visible_when": _SEGMENTED,

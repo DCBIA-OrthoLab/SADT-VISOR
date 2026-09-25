@@ -71,6 +71,37 @@ class RegistrationRun:
 
 
 
+# The DATA folder this tool's bundles live in, and the segmentation bundle
+# inside it. Written rather than derived, for the reason ALI_CBCT gives about
+# its own: which folder serves which engine is a DEPLOYMENT fact (AREG_CBCT,
+# AREG_IOS and AREG_IOSCBCT share `DATA/AREG/`), and a wrong guess is a folder
+# that is simply not there.
+#
+# The bundle name is the one `scripts/data-manifest.yml` unpacks AMASSS's
+# archive to for AREG, so an installation set up by `setup-models.sh` has it
+# without anybody choosing anything.
+_DATA_NAME = "AREG"
+_SEGMENTATION_BUNDLE = "AMASSS_Models"
+
+
+def _own_segmentation(data_root):
+    """The AMASSS bundle this deployment publishes for AREG, or "".
+
+    There is nothing for a clinician to decide here: the modes that segment
+    segment with AMASSS, and the only bundle that answers is the one the
+    deployment already holds. Asking which folder to use was asking a question
+    with one possible answer -- and one that a caller could get wrong in ways
+    that only surface fifteen seconds into a child process.
+
+    Returns "" rather than raising, so the single refusal below keeps saying
+    what is missing, now including where this looked.
+    """
+    if not data_root:
+        return ""
+    candidate = os.path.join(str(data_root), _DATA_NAME, "models", _SEGMENTATION_BUNDLE)
+    return candidate if os.path.isdir(candidate) else ""
+
+
 def _check_cbct(automation: str, regions: list, t1_masks, reference,
                 segmentation_model=None, sup=None, landmark_model=None) -> None:
     if not regions:
@@ -120,7 +151,9 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
         # weights it should load.
         raise ToolInputError(
             f"{automation} CBCT segments the T1 scans before registering, which "
-            f"needs the segmentation weights: name a bundle in "
+            f"needs the segmentation weights. This deployment publishes none: "
+            f"no '{_SEGMENTATION_BUNDLE}' under DATA/{_DATA_NAME}/models/. Add it "
+            f"(scripts/setup-models.sh --tool AREG), or name another bundle in "
             f"'segmentation_model' (see GET /tools/AREG_CBCT/data)."
         )
 
@@ -389,6 +422,7 @@ def main(
     output_suffix="Reg",
     output_dir=None,
     sup=None,
+    data_root=None,
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -412,6 +446,10 @@ def main(
 
     regions = _selected(cbct_regions, catalogs.REGION_CHOICES)
     reference = cbct_reference
+    # Resolved BEFORE the checks, so the refusal below judges what will
+    # actually be loaded rather than what the caller happened to name.
+    if not segmentation_model:
+        segmentation_model = _own_segmentation(data_root)
     _check_cbct(
         automation, regions, t1_masks, reference, segmentation_model, sup,
         landmark_model,

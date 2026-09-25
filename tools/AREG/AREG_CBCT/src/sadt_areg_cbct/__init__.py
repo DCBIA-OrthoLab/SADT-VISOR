@@ -44,6 +44,7 @@ def run(
     output_suffix: str = "Reg",
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Register a follow-up CBCT onto its baseline, so the two can be compared.
 
@@ -61,6 +62,9 @@ def run(
         t1_masks: Your own T1 segmentation masks, instead of having them
             segmented for you.
         segmentation_model: The mask model bundle, for the modes that segment.
+            Left empty -- which is what a panel sends -- the AMASSS bundle this
+            deployment publishes for AREG is used, there being no second answer
+            to the question.
         segmentation_label: Which label value in the masks to register on.
         reference: The frame the scans are oriented onto before registering.
         landmark_model: The landmark bundle that orientation step predicts
@@ -87,4 +91,5 @@ def run(
         dicom_input=dicom_input,
         output_suffix=output_suffix,
         sup=sup,
+        data_root=data_root,
     )
