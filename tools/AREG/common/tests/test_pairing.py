@@ -1,5 +1,7 @@
 """The patient key, which is the one thing AREG's engines must agree on."""
 
+import os
+
 import pytest
 
 from sadt_areg_common import catalogs, pairing
@@ -71,17 +73,49 @@ def test_a_mask_beside_a_scan_is_not_a_second_subject(tmp_path):
     assert sorted(pairing.discover(str(tmp_path), "Reg")) == ["C_0001"]
 
 
-def test_a_whole_cohort_given_as_one_timepoint_is_refused(tmp_path):
-    """Every shipped cohort is `<name>/{T1,T2}/`. Handed one as T1 and another
-    as T2, pairing matched `T1/C_0001` with `T1/C_0001` and `T2/C_0001` with
-    `T2/C_0001` -- a baseline registered onto a baseline, reported as a
-    success. The names line up perfectly, so nothing downstream can notice."""
+def test_a_whole_cohort_is_read_from_its_own_timepoint_subfolder(tmp_path):
+    """Every shipped cohort is `<name>/{T1,T2}/`, and a hosted-file picker can
+    only offer the cohort. Paired as given, this matched `T1/C_0001` with
+    `T1/C_0001` -- a baseline registered onto a baseline, reported as a
+    success, the names lining up perfectly. Refusing it was right and left the
+    shipped data unusable from the panel: no entry in the list was valid.
+    """
     for cohort in ("first", "second"):
         _scan(tmp_path / cohort / "T1" / "C_0001_T1_Or.nii.gz")
         _scan(tmp_path / cohort / "T2" / "C_0001_T2_Or.nii.gz")
 
+    matched = pairing.pair(str(tmp_path / "first"), str(tmp_path / "second"), "Reg")
+
+    assert sorted(matched.matched) == ["C_0001"], "one subject, not two"
+    assert matched.matched["C_0001"]["t1"].endswith(
+        os.path.join("first", "T1", "C_0001_T1_Or.nii.gz")), "the BASELINE side"
+    assert matched.matched["C_0001"]["t2"].endswith(
+        os.path.join("second", "T2", "C_0001_T2_Or.nii.gz")), "the FOLLOW-UP side"
+
+
+def test_both_timepoints_mixed_in_one_directory_is_still_refused(tmp_path):
+    """No subfolder to descend into, and no rule can say which scan is which
+    side of the registration. The one case that has to come back to the user."""
+    _scan(tmp_path / "flat" / "C_0001_T1_Or.nii.gz")
+    _scan(tmp_path / "flat" / "C_0001_T2_Or.nii.gz")
+    _scan(tmp_path / "other" / "C_0001_T2_Or.nii.gz")
+
     with pytest.raises(ToolInputError, match="more than one timepoint"):
-        pairing.pair(str(tmp_path / "first"), str(tmp_path / "second"), "Reg")
+        pairing.pair(str(tmp_path / "flat"), str(tmp_path / "other"), "Reg")
+
+
+def test_an_ordinary_folder_is_never_descended_into(tmp_path):
+    """The descent fires only for a folder holding several timepoints, so a
+    clinician whose T1 folder happens to have a `T1` subdirectory of its own
+    keeps the scans at the top."""
+    _scan(tmp_path / "t1" / "C_0001_T1.nii.gz")
+    _scan(tmp_path / "t1" / "T1" / "C_0002_T1.nii.gz")
+    _scan(tmp_path / "t2" / "C_0001_T2.nii.gz")
+    _scan(tmp_path / "t2" / "C_0002_T2.nii.gz")
+
+    matched = pairing.pair(str(tmp_path / "t1"), str(tmp_path / "t2"), "Reg")
+
+    assert "C_0001" in matched.matched, "the top-level scan still pairs"
 
 
 def test_pointing_at_the_timepoint_subfolders_works(tmp_path):

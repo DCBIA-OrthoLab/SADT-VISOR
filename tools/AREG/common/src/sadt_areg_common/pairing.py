@@ -310,6 +310,29 @@ def timepoints_in(root: str, accept=is_scan_file) -> set:
     return seen
 
 
+def timepoint_root(root: str, label: str, accept=is_scan_file) -> str:
+    """`<root>/<label>` when a cohort keeps that timepoint in its own subfolder.
+
+    Every cohort this family ships is `<name>/{T1,T2}/`, and a hosted-file
+    picker offers the COHORT -- there is nothing else to offer. Pointing T1 at
+    it paired timepoint against timepoint, so refusing it was right and left
+    the shipped data unusable from the panel: no choice in the list was valid.
+
+    Descending is not a guess. The subfolder is named after the timepoint being
+    asked for, and it is only looked for when the folder given holds more than
+    one timepoint -- an ordinary single-timepoint folder is never touched.
+    """
+    if not os.path.isdir(root):
+        return root
+    for entry in sorted(os.listdir(root)):
+        if entry.lower() != label.lower():
+            continue
+        candidate = os.path.join(root, entry)
+        if os.path.isdir(candidate) and discover(candidate, "", accept):
+            return candidate
+    return root
+
+
 def pair(t1_root: str, t2_root: str, suffix: str, accept=is_scan_file) -> Pairing:
     """Match the subjects of two timepoint folders by name.
 
@@ -320,7 +343,15 @@ def pair(t1_root: str, t2_root: str, suffix: str, accept=is_scan_file) -> Pairin
     a baseline onto a baseline and reporting a success. Nothing downstream can
     notice that; the names line up perfectly.
     """
+    roots = {}
     for label, root in (("T1", t1_root), ("T2", t2_root)):
+        # Only a folder that holds several timepoints is descended into, and
+        # only into the one asked for. Checked again afterwards: a folder
+        # mixing both in ONE directory has no subfolder to descend to, and
+        # that is the case no rule can resolve.
+        if len(timepoints_in(root, accept)) > 1:
+            root = timepoint_root(root, label, accept)
+        roots[label] = root
         found = timepoints_in(root, accept)
         if len(found) > 1:
             raise ToolInputError(
@@ -332,8 +363,8 @@ def pair(t1_root: str, t2_root: str, suffix: str, accept=is_scan_file) -> Pairin
                 f"look like it worked."
             )
 
-    t1 = discover(t1_root, suffix, accept)
-    t2 = discover(t2_root, suffix, accept)
+    t1 = discover(roots["T1"], suffix, accept)
+    t2 = discover(roots["T2"], suffix, accept)
 
     matched = {
         key: {"t1": t1[key], "t2": t2[key]} for key in sorted(set(t1) & set(t2))
