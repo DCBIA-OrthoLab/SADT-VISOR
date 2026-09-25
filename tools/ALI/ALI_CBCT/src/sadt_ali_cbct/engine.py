@@ -389,6 +389,20 @@ def _worker_setup(device, padding, weights, budget, seed) -> None:
     # be the single hardest thing to notice if that ever stopped being true.
     seed_everything(seed)
 
+    # **One CPU thread per worker, and this is what makes the width pay.**
+    # The volume lives in host memory, so every step crops and rescales it on
+    # the CPU -- 0.9 ms of arithmetic that enters torch's intra-op pool and
+    # occupies about ten cores while it does. Multiplied by the width that is
+    # more threads than the machine has cores, and the workers spend their
+    # time taking the card away from each other: measured on the full 119
+    # landmarks, width 8 came out at 425 s against 359 s for width 1.
+    #
+    # Only on the card. A CPU deployment does its FORWARD pass in this pool
+    # too -- 31.6 ms on 28 threads against 143.9 ms on one -- so capping it
+    # there would cost such a run 4.6x for nothing.
+    if device.startswith("cuda"):
+        import_torch().set_num_threads(1)
+
 
 def _worker_environment(images, key):
     """This process's volumes for one scan, loaded once and then reused.
