@@ -129,6 +129,11 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
         # One binary file per structure: `find_masks` looks each region's mask
         # up by name, and a merged multi-label volume would make every region
         # resolve to the same file.
+        #
+        # Which is why the original module's "Merge Segmentations" box is not
+        # offered here: honouring it would mean a SECOND pass over the same
+        # scan, the registration needing the separate masks either way, and
+        # the card is serialised. Decided 2026-09-25, not overlooked.
         merge=["SEPARATE"],
         prediction_ID="seg",
         generate_surface=False,
