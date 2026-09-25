@@ -32,6 +32,13 @@ LAYOUT = {
     # than no check box.
     "keep_intermediate": {"hidden": True},
 
+    # Injected by the server too, from the checkpoints this chain offers, and
+    # it lands in a "Quality control" section of its own. Not offered yet:
+    # stopping a run for review is a workflow this deployment has not decided
+    # on, and a box that stops a cohort halfway is not one to leave lying
+    # around until it has.
+    "stop_after": {"hidden": True},
+
     "t1": {"section": _INPUTS, "label": "T1 (baseline)"},
     "t2": {"section": _INPUTS, "label": "T2 (follow-up)"},
     "automation": {"section": _INPUTS, "label": "Mode"},

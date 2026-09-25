@@ -83,12 +83,15 @@ INJECTED = (SUPERVISOR, DATA_ROOT)
 # Arguments a tool never declares and the SERVER adds for it. `keep_intermediate`
 # appears on any tool that calls another (see `supervised_calls`): collecting what
 # a chain produced is the same operation every time, so it is done once in the
-# runner rather than written into each orchestrating tool.
+# runner rather than written into each orchestrating tool. `stop_after` is the
+# same shape -- the server builds it from the checkpoints a chain offers, and
+# reads a layout for it out of `injected_layout` exactly as it does for the
+# other, so a tool that has no business offering the section can say so.
 #
 # A layout may still name one. That is the whole point of publishing it here: the
 # argument is generic, but "Keep the predicted landmarks" and "Keep the labelled
 # meshes" are not, and only the tool knows which it produces.
-INJECTED_ARGUMENTS = ("keep_intermediate",)
+INJECTED_ARGUMENTS = ("keep_intermediate", "stop_after")
 
 # The docstring section that explains the arguments, in the Google style the
 # whole repository already writes. It is the ONLY place that text lives: the

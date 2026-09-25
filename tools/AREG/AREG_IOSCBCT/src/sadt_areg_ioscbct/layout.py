@@ -24,6 +24,13 @@ LAYOUT = {
     # than no check box.
     "keep_intermediate": {"hidden": True},
 
+    # Injected by the server too, from the checkpoints this chain offers, and
+    # it lands in a "Quality control" section of its own. Not offered yet:
+    # stopping a run for review is a workflow this deployment has not decided
+    # on, and a box that stops a cohort halfway is not one to leave lying
+    # around until it has.
+    "stop_after": {"hidden": True},
+
     "ios": {"section": _INPUTS, "label": "Intraoral scans"},
     "cbct": {"section": _INPUTS, "label": "CBCT volumes"},
     "automation": {"section": _INPUTS, "label": "Mode"},
