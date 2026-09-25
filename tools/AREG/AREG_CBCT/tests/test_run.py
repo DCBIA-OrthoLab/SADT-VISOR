@@ -324,7 +324,10 @@ def test_the_mask_request_names_amasss_arguments(tmp_path):
     # the same file.
     assert params["merge"] == ["SEPARATE"]
     assert params["generate_surface"] is False
-    assert set(params) >= {"scans", "model", "output_dir"}
+    assert set(params) >= {"scans", "model"}
+    # NOT output_dir: the supervisor places each call's output in its own slot,
+    # and naming one here is what stopped `keep_intermediate` from finding it.
+    assert "output_dir" not in params
 
 
 # ---------------------------------------------------------------------------
