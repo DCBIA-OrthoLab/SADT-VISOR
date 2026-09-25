@@ -54,6 +54,27 @@ logger = logging.getLogger(__name__)
 # SEARCH; seconds were a property of the machine, and of how busy it was.
 _DEFAULT_SEARCH_STEPS = 900
 
+# The widest a run asks for, however much the machine could afford.
+#
+# Measured on the reference scan's 119 landmarks, card otherwise idle, every
+# width placing the same 114 points at the same coordinates:
+#
+#   width 1   358.7 s      width 8   128.0 s   (x2.80)
+#   width 4   141.3 s      width 12  127.3 s   (x2.82)
+#
+# **Eight is where the gain stops, not where the tool breaks.** Twelve buys
+# 0.7 s for three more gigabytes of card, and a run RESERVES what it is
+# granted -- so asking wider takes room from other runs and gives this one
+# nothing. Past twelve nothing is measured at all.
+#
+# It is a ceiling on the ASK, never a floor: the supervisor still answers with
+# less whenever the machine is busy, and one landmark still opens one channel.
+# A number inside a tool cannot see the machine, which is why this is the
+# largest width MEASURED to be worth having rather than a guess at what the
+# hardware can take -- the distinction this repository already draws after
+# CLIC opened thirty-three channels for a cohort of six.
+MAX_AGENT_CHANNELS = 8
+
 COMPOUND_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz")
 
 
@@ -298,7 +319,7 @@ def _channels_for(sup, wanted: int, declared: int = 0) -> int:
     anything, and opening a hundred networks on an unknown card is a way to be
     killed rather than a way to be fast.
     """
-    wanted = max(1, int(wanted))
+    wanted = max(1, min(int(wanted), MAX_AGENT_CHANNELS))
     try:
         declared = int(declared or 0)
     except (TypeError, ValueError):

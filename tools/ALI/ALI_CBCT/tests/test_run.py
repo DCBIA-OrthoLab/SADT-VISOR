@@ -1313,3 +1313,45 @@ def test_the_frankfort_horizontal_points_are_named():
         assert label in catalog.DESCRIPTIONS, label
     assert "porion" in catalog.DESCRIPTIONS["RPo"].lower()
     assert "orbitale" in catalog.DESCRIPTIONS["LOr"].lower()
+
+
+# ---------------------------------------------------------------------------
+# How many agents walk at once
+# ---------------------------------------------------------------------------
+
+def test_the_ask_is_capped_at_the_widest_width_worth_having():
+    """A run RESERVES what it is granted, so asking wider than the measured
+    knee takes room from other runs and gives this one nothing.
+
+    Measured on 119 landmarks: width 8 is 128.0 s and width 12 is 127.3 s, for
+    three more gigabytes of card. The cap is on the ASK -- the supervisor still
+    answers with less on a busy machine, and a request holding fewer landmarks
+    than the cap still asks only for those.
+    """
+    from sadt_ali_cbct import engine as cbct_engine
+
+    asked = []
+
+    class _Generous:
+        """A supervisor that grants whatever it is asked for."""
+
+        def channels(self, wanted):
+            asked.append(wanted)
+            return wanted
+
+    # 119 landmarks on a machine that would pay for all of them: still 8.
+    assert cbct_engine._channels_for(_Generous(), 119) == cbct_engine.MAX_AGENT_CHANNELS
+    assert asked == [cbct_engine.MAX_AGENT_CHANNELS], (
+        "the cap must narrow the ASK, not just the answer -- admission reserves "
+        "against what the tool asked for"
+    )
+
+    # Fewer landmarks than the cap: the count still decides.
+    assert cbct_engine._channels_for(_Generous(), 3) == 3
+
+    class _Stingy:
+        def channels(self, wanted):
+            return 2
+
+    # A busy machine still narrows it further; the cap is not a floor.
+    assert cbct_engine._channels_for(_Stingy(), 119) == 2
