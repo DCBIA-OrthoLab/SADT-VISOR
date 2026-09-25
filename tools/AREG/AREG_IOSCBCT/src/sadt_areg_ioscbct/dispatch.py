@@ -195,6 +195,20 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
     """
     paired, unpaired = pipeline.discover(ios_dir, cbct_dir)
     report["unpaired"] = unpaired
+    if not paired:
+        # Nothing to register, and before this the loop below simply did not
+        # run: the request came back 200 with an empty archive and an
+        # `unpaired` list nobody reads. A folder of volumes handed to
+        # `ios` is the ordinary way to get here -- the picker cannot yet say
+        # which extensions an argument takes -- and "it worked, here is
+        # nothing" is the worst answer available.
+        raise ToolInputError(
+            "No patient has both an intraoral surface and a CBCT. Intraoral "
+            f"scans are read from 'ios' as {', '.join(pipeline.SURFACE_EXTENSIONS)} "
+            "and the volumes from 'cbct'; a folder of volumes in 'ios' matches "
+            f"nothing. Found {len(unpaired)} unpaired subject(s): "
+            f"{', '.join(f'{key} ({why})' for key, why in sorted(unpaired.items())[:4]) or 'none'}."
+        )
 
     ios_landmarks = _landmarks_by_jaw(ios_landmark_dir)
     cbct_landmarks = _landmarks_by_jaw(cbct_landmark_dir)

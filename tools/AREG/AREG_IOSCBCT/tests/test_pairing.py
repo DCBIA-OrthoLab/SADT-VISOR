@@ -15,7 +15,7 @@ import os
 import pytest
 
 from conftest import write_mesh, write_volume
-from sadt_areg_ioscbct import pipeline
+from sadt_areg_ioscbct import dispatch, pipeline
 from sadt_areg_common.errors import ToolInputError
 
 
@@ -206,3 +206,21 @@ def test_the_patients_come_back_in_a_stable_order(tmp_path):
 
     paired, _unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     assert list(paired) == ["1", "2", "3"]
+
+
+def test_a_folder_of_volumes_as_intraoral_scans_is_refused(tmp_path):
+    """The picker cannot yet say which extensions an argument takes, so handing
+    `ios` a folder of NIfTI is the ordinary way to get here. Before this the
+    loop simply did not run: 200, an empty archive, and an `unpaired` list
+    nobody reads -- "it worked, here is nothing"."""
+    ios = tmp_path / "ios"
+    cbct = tmp_path / "cbct"
+    for folder in (ios, cbct):
+        folder.mkdir()
+    (ios / "P1_T1.nii.gz").write_bytes(b"x")
+    (cbct / "P1_T1.nii.gz").write_bytes(b"x")
+
+    with pytest.raises(ToolInputError, match="intraoral surface"):
+        dispatch.register(str(ios), str(cbct), "", "",
+                          output_dir=str(tmp_path / "out"), suffix="Reg",
+                          report={}, max_dist=0.0)
