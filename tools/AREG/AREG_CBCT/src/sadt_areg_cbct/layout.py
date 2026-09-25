@@ -65,11 +65,14 @@ LAYOUT = {
         "ui": "inline",
     },
     "t1_masks": {"section": _REGISTRATION, "label": "T1 masks", "visible_when": _SEMI},
-    # The original's second group, under its own name. Inline like `regions`:
-    # six short labels, and a clinician compares them by reading across.
+    # The original's second group, under its own name. Stacked -- the default
+    # layout -- and NOT inline like `regions` right above it: three short
+    # labels fit across a panel that is 425 px wide, six of "Cervical
+    # vertebra" length do not, and they pushed the section wider than the
+    # module panel. Read down, one per line.
     "segmentations": {
         "section": _REGISTRATION, "label": "AMASSS segmentation",
-        "visible_when": _SEGMENTED, "ui": "inline",
+        "visible_when": _SEGMENTED,
     },
     # Not offered: the modes that segment segment with AMASSS, and the bundle
     # is the one the deployment already publishes (see dispatch._own_segmentation).
