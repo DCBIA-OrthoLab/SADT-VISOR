@@ -842,6 +842,62 @@ def argument_docs(doc, arguments):
     return entries
 
 
+# What a `Path` argument accepts, declared beside the layout: `ACCEPTS = {"ios":
+# SURFACE_EXTENSIONS, "cbct": catalogs.SCAN_EXTENSIONS}`.
+#
+# Not presentation, which is why it is NOT a LAYOUT key: the server carries it
+# to `ArgSpec.accepts` and refuses an upload that contradicts it. It is the
+# tool saying what it can read, in one place, and the client narrowing its file
+# dialog and its scene entries from the same sentence -- until this existed,
+# `ios` offered a folder of CBCT volumes as intraoral surfaces and the mistake
+# only surfaced as a refusal a minute into the run.
+#
+# DERIVED, never retyped: the tables already exist (`pipeline.SURFACE_EXTENSIONS`,
+# `catalogs.SCAN_EXTENSIONS`), and a second spelling of them is a second thing
+# to keep in step.
+ACCEPTS_NAME = "ACCEPTS"
+
+
+def accepts_for(module, arguments):
+    """`{argument: [".vtk", ".stl"]}` from the tool's own `ACCEPTS`, checked.
+
+    Absent is the ordinary case. Present, an argument that does not exist or is
+    not a path is a hard error: a filter naming the wrong argument narrows
+    nothing and nobody would notice.
+    """
+    declared = getattr(module, ACCEPTS_NAME, None)
+    if declared is None:
+        return {}
+    if not isinstance(declared, dict):
+        raise SchemaError("{} must be a dict of argument -> extensions.".format(ACCEPTS_NAME))
+
+    checked = {}
+    for name, extensions in declared.items():
+        where = "{}['{}']".format(ACCEPTS_NAME, name)
+        if name not in arguments:
+            raise SchemaError("{}: run() has no argument '{}'.".format(where, name))
+        if arguments[name].get("type") != "path":
+            raise SchemaError(
+                "{}: only a path argument accepts extensions; '{}' is declared as "
+                "{!r}.".format(where, name, arguments[name].get("type"))
+            )
+        if isinstance(extensions, str) or not extensions:
+            raise SchemaError(
+                "{}: expected a non-empty sequence of extensions, got {!r}.".format(
+                    where, extensions)
+            )
+        cleaned = []
+        for extension in extensions:
+            if not isinstance(extension, str) or not extension.startswith("."):
+                raise SchemaError(
+                    "{}: '{}' is not an extension -- they start with a dot.".format(
+                        where, extension)
+                )
+            cleaned.append(extension.lower())
+        checked[name] = sorted(set(cleaned))
+    return checked
+
+
 def layout_for(package, arguments):
     """The tool's optional panel layout, checked against what it publishes.
 
@@ -997,6 +1053,11 @@ def describe_run(run, package=None):
     # second place to look is a second place to forget.
     for name, text in argument_docs(doc, arguments).items():
         arguments[name]["description"] = text
+    # The module `run` was defined in -- `describe_run` is handed the function,
+    # not the package, and `ACCEPTS` sits beside it.
+    for name, extensions in accepts_for(inspect.getmodule(run), arguments).items():
+        arguments[name]["extensions"] = extensions
+
     injected_layout = {}
     for name, hints in (layout_for(package, arguments).items() if package else []):
         if name in arguments:

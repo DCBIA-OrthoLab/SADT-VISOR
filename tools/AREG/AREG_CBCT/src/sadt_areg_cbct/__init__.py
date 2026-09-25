@@ -18,7 +18,23 @@ come from other tools reached through the supervisor; see the CBCT half of
 from pathlib import Path
 from typing import Literal
 
+from sadt_areg_common import pairing
+
 from .dispatch import main
+
+
+# What each path argument can read: the client's file dialog and the server's
+# upload check both narrow from here. DERIVED from the table the pairing
+# registers against, never retyped.
+#
+# `t1_masks` takes volumes too -- a mask IS a volume, one label per voxel --
+# and DICOM is deliberately absent: a series is a folder of `.dcm`, which the
+# `dicom_input` switch handles rather than an extension filter.
+ACCEPTS = {
+    "t1": pairing.SCAN_EXTENSIONS,
+    "t2": pairing.SCAN_EXTENSIONS,
+    "t1_masks": pairing.SCAN_EXTENSIONS,
+}
 
 
 def run(

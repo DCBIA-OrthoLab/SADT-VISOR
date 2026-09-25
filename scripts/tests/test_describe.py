@@ -966,3 +966,68 @@ def test_a_three_number_tuple_is_refused_rather_than_published(tmp_path):
 
     assert result.returncode != 0
     assert "tuple[float, float]" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# ACCEPTS: what a path argument can read
+# ---------------------------------------------------------------------------
+ACCEPTS_BODY = """
+    ACCEPTS = {"ios": (".VTK", ".stl", ".vtk")}
+
+
+    def run(ios: Path, output_dir: Path) -> Path:
+        \"\"\"One line.
+
+        Args:
+            ios: The surfaces.
+            output_dir: Where to write.
+
+        Returns:
+            The output directory.
+        \"\"\"
+        return output_dir
+"""
+
+
+def test_a_tool_says_what_each_path_argument_accepts(tmp_path):
+    """Until this existed, the intraoral picker offered a folder of CBCT
+    volumes: the tool knew what it could read and had no way to publish it."""
+    tool = make_tool(tmp_path, ACCEPTS_BODY)
+
+    result = describe(tool)
+
+    assert result.returncode == 0, result.stderr
+    # Normalised: lowercased, de-duplicated, sorted -- a filter is compared
+    # against a file name, not read aloud.
+    assert json.loads(result.stdout)["arguments"]["ios"]["extensions"] == [".stl", ".vtk"]
+
+
+def test_an_accepts_naming_an_unknown_argument_is_refused(tmp_path):
+    """A filter on an argument that does not exist narrows nothing, and nothing
+    would ever say so."""
+    tool = make_tool(tmp_path, ACCEPTS_BODY.replace('"ios":', '"nope":'))
+
+    result = describe(tool)
+
+    assert result.returncode != 0
+    assert "no argument 'nope'" in result.stderr, result.stderr
+
+
+def test_only_a_path_argument_accepts_extensions(tmp_path):
+    """The server carries this to `ArgSpec.accepts` and refuses an upload that
+    contradicts it, so it has to describe something uploadable."""
+    tool = make_tool(tmp_path, ACCEPTS_BODY.replace("run(ios: Path,", "run(ios: str,"))
+
+    result = describe(tool)
+
+    assert result.returncode != 0
+    assert "only a path argument" in result.stderr, result.stderr
+
+
+def test_something_that_is_not_an_extension_is_refused(tmp_path):
+    tool = make_tool(tmp_path, ACCEPTS_BODY.replace('".vtk"', '"vtk"'))
+
+    result = describe(tool)
+
+    assert result.returncode != 0
+    assert "not an extension" in result.stderr, result.stderr

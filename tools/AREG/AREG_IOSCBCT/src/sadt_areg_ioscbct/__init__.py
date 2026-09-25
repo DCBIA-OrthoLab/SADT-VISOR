@@ -17,7 +17,26 @@ AREG and ALI splits removed. What is left here is geometry.
 from pathlib import Path
 from typing import Literal
 
+from sadt_areg_common import pairing
+
+from . import pipeline
 from .dispatch import main
+
+
+# What each path argument can read, for the client's file dialog and for the
+# server's refusal of an upload that contradicts it. DERIVED from the tables
+# the pipeline already registers against -- a second spelling of them would be
+# a second thing to keep in step.
+#
+# Without this the intraoral picker offered a folder of CBCT volumes, and the
+# mistake surfaced as "No patient has both an intraoral scan and a CBCT" a
+# minute into the run rather than at the click.
+ACCEPTS = {
+    "ios": pipeline.SURFACE_EXTENSIONS,
+    "cbct": pairing.SCAN_EXTENSIONS,
+    "ios_landmarks": pipeline.LANDMARK_EXTENSIONS,
+    "cbct_landmarks": pipeline.LANDMARK_EXTENSIONS,
+}
 
 
 def run(
