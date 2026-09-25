@@ -1102,3 +1102,64 @@ def test_without_a_supervisor_a_named_number_is_the_one_that_decides():
     assert pipeline._channels_for(None, 5, declared=3) == 3
     assert pipeline._channels_for(None, 2, declared=9) == 2
     assert pipeline._channels_for(None, 5, declared=0) == 1
+
+
+def test_the_width_is_declared_only_where_it_is_actually_in_force(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """A MEASUREMENT, not the permission. The server keeps the NARROWEST width
+    it was told and divides the run's peak by it; a record with no width is
+    ignored rather than read as one. So the phase that has a width declares it
+    and the serial phases either side stay silent -- and the peak, which is one
+    nnUNet model per channel, lands inside the phase that declared it.
+
+    Told nothing, the whole peak is priced as a single channel: every run after
+    this one is reserved for five channels' worth and then granted fewer.
+    """
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+        sup=_Supervisor(grant=2),
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines()]
+    widths = {r["message"].split()[0]: r.get("width") for r in records}
+    assert widths["structure"] == 2, widths
+    # The narrowest width the server would keep is the only one declared.
+    declared = [r["width"] for r in records if "width" in r]
+    assert declared and min(declared) == 2, records
+    assert widths.get("reading") is None
+    assert widths.get("writing") is None
+
+
+def test_a_serial_run_declares_one_and_not_nothing(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """Width one IS a measurement -- it is the fixed cost, and the fit needs
+    that column as much as it needs a wide one."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines()]
+    declared = [r["width"] for r in records if "width" in r]
+    assert declared and min(declared) == 1, records

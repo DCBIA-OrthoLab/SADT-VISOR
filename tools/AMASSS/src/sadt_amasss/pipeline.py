@@ -452,6 +452,13 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
         )
         return code, structure_output
 
+    # Declared around THIS phase and nowhere else. The peak is here -- one
+    # nnUNet model resident per channel -- and the serial phases either side
+    # report no width at all, which the server ignores rather than reading as
+    # one. Without it the whole peak is priced as a single channel, and every
+    # run after this one is reserved for five channels' worth and then granted
+    # fewer of them.
+    progress.set_width(width)
     done = 0
     with futures.ThreadPoolExecutor(max_workers=width) as pool:
         running = {pool.submit(predict, item): item[0] for item in models.items()}
@@ -469,6 +476,10 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
                 # One structure failing must not lose the others.
                 logger.exception("Prediction failed for structure %s", code)
                 failed_structures[code] = str(exc)
+    # Back to declaring nothing: what follows is one scan at a time again, and
+    # a width left standing over it would be the permission masquerading as a
+    # measurement.
+    progress.set_width(None)
 
     if not predictions:
         raise RuntimeError(
