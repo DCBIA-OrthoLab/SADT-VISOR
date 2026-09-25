@@ -338,6 +338,36 @@ def _channels_for(sup, wanted: int, declared: int = 0) -> int:
         return 1
 
 
+def _walk_on_one_thread(device: str) -> None:
+    """One CPU thread for the process that walks, and this is what makes the
+    width pay.
+
+    The volume lives in host memory, so every step crops and rescales it on
+    the CPU -- 0.9 ms of arithmetic that enters torch's intra-op pool and
+    occupies about ten cores while it does. Multiplied by the width, that is
+    more threads than the machine has cores, and the walkers spend their time
+    taking the card away from each other: measured on the full 119 landmarks,
+    width 8 came out at 425 s against 359 s for width 1, and 128.0 s once each
+    worker was held to one thread.
+
+    Called in the PARENT as well as in each worker, because the parent is what
+    walks at width 1 -- and because the server reserves against the cores a run
+    was SEEN to occupy. A run measured at 2.2 cores a channel is priced at 2.9
+    with the safety margin, so on 42 cores the ladder stops at fourteen
+    channels: the occupancy is not just waste, it is the bound on the width.
+
+    Only on the card. A CPU deployment does its FORWARD pass in this pool too
+    -- 31.6 ms on 28 threads against 143.9 ms on one -- so capping it there
+    would cost such a run 4.6x for nothing.
+    """
+    if not device.startswith("cuda"):
+        return
+    try:
+        import_torch().set_num_threads(1)
+    except Exception:  # noqa: BLE001 - a thread cap must never fail a run
+        logger.warning("Could not cap this process's torch threads", exc_info=True)
+
+
 def _agent_padding():
     """Half a field of view plus one, so a box centred anywhere inside the
     volume is still complete once the borders are padded."""
@@ -410,19 +440,7 @@ def _worker_setup(device, padding, weights, budget, seed) -> None:
     # be the single hardest thing to notice if that ever stopped being true.
     seed_everything(seed)
 
-    # **One CPU thread per worker, and this is what makes the width pay.**
-    # The volume lives in host memory, so every step crops and rescales it on
-    # the CPU -- 0.9 ms of arithmetic that enters torch's intra-op pool and
-    # occupies about ten cores while it does. Multiplied by the width that is
-    # more threads than the machine has cores, and the workers spend their
-    # time taking the card away from each other: measured on the full 119
-    # landmarks, width 8 came out at 425 s against 359 s for width 1.
-    #
-    # Only on the card. A CPU deployment does its FORWARD pass in this pool
-    # too -- 31.6 ms on 28 threads against 143.9 ms on one -- so capping it
-    # there would cost such a run 4.6x for nothing.
-    if device.startswith("cuda"):
-        import_torch().set_num_threads(1)
+    _walk_on_one_thread(device)
 
 
 def _worker_environment(images, key):
@@ -537,6 +555,10 @@ def predict_landmarks(
 
     check_dependencies()
     device = resolve_device(device)
+    # Before anything walks, and in this process too: at width 1 the parent IS
+    # the walker, and the pool it would otherwise open is what the cost table
+    # then reads back as cores this run needs.
+    _walk_on_one_thread(device)
     regions = tuple(regions) if regions is not None else catalog.REGION_CODES
     landmarks = tuple(landmarks or ())
     prediction_ID = (prediction_ID or "Pred").strip() or "Pred"
