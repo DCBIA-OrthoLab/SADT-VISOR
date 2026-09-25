@@ -26,6 +26,8 @@ import logging
 import os
 import time
 
+import numpy as np
+
 from .torch_helpers import import_torch, resolve_device
 from .errors import ToolInputError, ToolUnavailableError
 from sadt_ali_common.markups import MARKUPS_EXTENSION
@@ -240,18 +242,26 @@ def _landmark_position(faces, face_table, vertices, locator, scaled_surface):
     interpret.
 
     Two details make the vectorised form bit-identical rather than merely
-    close, both established by measurement and not by reasoning:
+    close, and neither was arrived at by reasoning -- both are what measurement
+    forced, after a first version that looked obviously correct was not:
 
-    * `cumsum(dim=0)[-1]` and not `sum(dim=0)`. float32 addition is not
-      associative, so a tree reduction is not the number the sequential loop
-      produced; the scan is, and its last row is the sequential total. Checked
-      against the loop at five sizes from 3 to 14,220 rows and on all 69 calls
-      of a real run.
-    * the division stays in torch, on the card. Moved to numpy it came out one
-      ULP different, because torch divides a tensor by a scalar by multiplying
-      by the reciprocal -- a 6e-08 shift in unit-sphere space, 2 nanometres of
-      patient, which would never have moved the snapped point and would still
-      have made this function something other than what it replaced.
+    * **a sequential accumulation, and numpy's**, not `sum(dim=0)`. float32
+      addition is not associative, so a tree reduction is a different number
+      from adding the rows one after another -- about a ULP per thousand rows.
+      `torch.cumsum` is sequential on CUDA and NOT on the CPU, which this tool
+      also runs on, so it is right on the card and wrong in the test suite;
+      `np.add.accumulate`, which `np.cumsum` is, is sequential on both.
+      Verified against the loop at five sizes from 3 to 14,220 rows and on
+      every call of a real run, on both devices.
+    * **the division stays in torch, on the tensor's own device.** Moved to
+      numpy it came out one ULP different, because torch divides a tensor by a
+      scalar by multiplying by the reciprocal. That is a 6e-08 shift in
+      unit-sphere space -- 2 nanometres of patient, which would never have
+      moved the snapped point, and would still have made this function
+      something other than what it replaced.
+
+    So the total comes back to the device as three floats to be divided there.
+    Two 12-byte transfers, against the 4,866 synchronisations they replace.
     """
     torch = import_torch()
 
@@ -260,8 +270,10 @@ def _landmark_position(faces, face_table, vertices, locator, scaled_surface):
     wanted = torch.as_tensor(faces, dtype=torch.long, device=face_table.device)
     # Face-major, corner-minor: the order the nested loop visited them in.
     vertex_ids = face_table[0][wanted].reshape(-1)
+    gathered = vertices[0][vertex_ids]
 
-    centroid = vertices[0][vertex_ids].cumsum(dim=0)[-1] / vertex_ids.numel()
+    total = np.cumsum(gathered.detach().cpu().numpy(), axis=0, dtype=np.float32)[-1]
+    centroid = torch.from_numpy(total).to(gathered.device) / vertex_ids.numel()
     point_id = locator.FindClosestPoint(centroid.detach().cpu().numpy())
     return scaled_surface.GetPoint(point_id)
 
