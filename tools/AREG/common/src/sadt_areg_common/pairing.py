@@ -31,6 +31,7 @@ import os
 import re
 
 from . import catalogs
+from .errors import ToolInputError
 
 SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
 
@@ -245,6 +246,17 @@ def discover(root: str, suffix: str, accept=is_scan_file) -> dict:
         for file_name in sorted(file_names):
             if file_name.startswith(".") or not accept(file_name):
                 continue
+            # A file that says it is a SEGMENTATION is not a subject. Only the
+            # extension was tested, so a folder holding a scan beside the masks
+            # of a previous run -- `<scan>_SegOut/`, which is what AMASSS and
+            # this tool both write -- offered four subjects where there is one,
+            # and each mask was then paired, segmented again and registered.
+            # `discover_masks` has always required this token; its absence here
+            # was the asymmetry.
+            # The RAW stem, not `patient_stem`: that one strips exactly these
+            # markers ("_Seg", "_lm_Pred"), so asking it would always answer no.
+            if has_token(split_scan_extension(file_name)[0], catalogs.MASK_TOKENS):
+                continue
             key = os.path.join(prefix, patient_stem(file_name))
             target = previous if is_previous_output(file_name, suffix) else fresh
             target.setdefault(key, os.path.join(directory, file_name))
@@ -276,8 +288,50 @@ class Pairing:
         return {"t1_without_t2": self.t1_only, "t2_without_t1": self.t2_only}
 
 
+def timepoints_in(root: str, accept=is_scan_file) -> set:
+    """The timepoint tokens the scans under `root` carry, e.g. {"t1", "t2"}.
+
+    Read off the file NAMES and the directories above them, both: the shipped
+    cohorts say it in the folder (`CBCT_FullyAuto/T1/...`) and a clinician's
+    own export usually says it in the file.
+    """
+    seen = set()
+    for directory, _, file_names in os.walk(root):
+        parts = os.path.relpath(directory, root).split(os.sep)
+        for file_name in file_names:
+            if file_name.startswith(".") or not accept(file_name):
+                continue
+            if has_token(split_scan_extension(file_name)[0], catalogs.MASK_TOKENS):
+                continue
+            stem = split_scan_extension(file_name)[0]
+            for part in (*parts, stem):
+                seen |= {token for token in catalogs.TIMEPOINT_TOKENS
+                         if has_token(part, (token,))}
+    return seen
+
+
 def pair(t1_root: str, t2_root: str, suffix: str, accept=is_scan_file) -> Pairing:
-    """Match the subjects of two timepoint folders by name."""
+    """Match the subjects of two timepoint folders by name.
+
+    Each folder is ONE timepoint. A folder holding both -- which is the shape
+    every shipped test cohort has, `CBCT_FullyAuto/{T1,T2}/` -- is refused
+    rather than paired: handed one as T1 and another as T2, this matched
+    `T1/C_0001` with `T1/C_0001` and `T2/C_0001` with `T2/C_0001`, registering
+    a baseline onto a baseline and reporting a success. Nothing downstream can
+    notice that; the names line up perfectly.
+    """
+    for label, root in (("T1", t1_root), ("T2", t2_root)):
+        found = timepoints_in(root, accept)
+        if len(found) > 1:
+            raise ToolInputError(
+                f"The {label} folder holds scans from more than one timepoint "
+                f"({', '.join(sorted(t.upper() for t in found))}). Each side of a "
+                f"registration is ONE timepoint: point {label} at that folder's "
+                f"{label} subfolder rather than at the whole cohort, or the two "
+                f"will be paired timepoint against timepoint and the run will "
+                f"look like it worked."
+            )
+
     t1 = discover(t1_root, suffix, accept)
     t2 = discover(t2_root, suffix, accept)
 
