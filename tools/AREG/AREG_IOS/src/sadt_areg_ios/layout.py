@@ -58,7 +58,9 @@ LAYOUT = {
     "registration_model": {
         "section": _REGISTRATION, "label": "Patch model", "visible_when": _PREDICTED,
     },
-    "crown_model": {
+    # Not offered: Crown_Seg resolves its own weights, and this name has to
+    # mean the same thing in every engine the AREG facade composes.
+    "crown_model": {"hidden": True, 
         "section": _REGISTRATION, "label": "Crown segmentation model", "visible_when": _FULLY,
     },
     "mgl_model": {

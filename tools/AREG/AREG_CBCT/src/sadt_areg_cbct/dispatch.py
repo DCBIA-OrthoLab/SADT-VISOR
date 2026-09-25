@@ -132,16 +132,11 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
                 "registering onto them, which needs an orientation reference: name "
                 "one in 'cbct_reference' (see GET /tools/AREG_CBCT/data)."
             )
-        if not landmark_model:
-            # ASO's own Fully-Automated CBCT mode refuses without it, so the run
-            # dies anyway -- but only after this tool has converted two cohorts
-            # of DICOM and started a second interpreter. `tools.orient_scans`
-            # said this was "required by _check_cbct" before it was.
-            raise ToolInputError(
-                "Oriented + Fully-Automated CBCT orients the T1 scans by predicting "
-                "landmarks on them, which needs the landmark weights: name a bundle "
-                "in 'landmark_model' (see GET /tools/AREG_CBCT/data)."
-            )
+        # `landmark_model` is NOT required here any more. Which weights the
+        # landmark tool predicts with is that tool's business -- ALI_CBCT
+        # resolves its own from the deployment's data folder, the way ASO's
+        # comment says it should -- and demanding a name here made AREG hold a
+        # name for its neighbour's storage. An explicit one is still obeyed.
 
     if not segmentation_model:
         # Named here rather than left to AMASSS, which receives None and fails on

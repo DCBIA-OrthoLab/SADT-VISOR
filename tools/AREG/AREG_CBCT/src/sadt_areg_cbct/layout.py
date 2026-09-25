@@ -87,8 +87,13 @@ LAYOUT = {
     "reference": {
         "section": _REGISTRATION, "label": "Orientation reference", "visible_when": _ORIENTED,
     },
+    # Not offered: ALI_CBCT resolves its own weights from the deployment's data
+    # folder, so there is no second answer here -- and two engines of this
+    # facade disagreeing about whether this argument is a hosted NAME or a path
+    # is what stopped `AREG` composing at all.
     "landmark_model": {
-        "section": _REGISTRATION, "label": "Landmark model bundle", "visible_when": _ORIENTED,
+        "section": _REGISTRATION, "label": "Landmark model bundle",
+        "visible_when": _ORIENTED, "hidden": True,
     },
 
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
