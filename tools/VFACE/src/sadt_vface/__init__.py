@@ -45,6 +45,7 @@ def run(
     surface_model: Path = "",
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Classify a patient's facial asymmetry, or measure the change between two scans.
 
@@ -114,5 +115,6 @@ def run(
         maxilla_reference=maxilla_reference, mirror_reference=mirror_reference,
         segmentation_model=segmentation_model, landmark_model=landmark_model,
         classifier_model=classifier_model, surface_model=surface_model, sup=sup,
+        data_root=data_root,
     )
     return output_dir

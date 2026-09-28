@@ -296,14 +296,65 @@ def _short(region: str) -> str:
     }[region]
 
 
+# Which DATA folder this tool's bundles live in, and the name of each. Written
+# rather than derived: which folder serves which tool is a deployment fact, and
+# these are the names the manifest unpacks those archives to.
+#
+# Resolved here rather than asked of the caller, for the reason the three AREG
+# engines resolve theirs: `models/` holds all six bundles at once, so an unnamed
+# argument arrived as that FOLDER -- which is not a bundle -- and the run died
+# after the segmentation and the orientation had already been paid for. None of
+# them is a clinical choice either: one classifier, one mirror transform, one
+# reference per frame.
+#
+# `landmark_model` is absent on purpose. ALI_CBCT resolves its own weights from
+# the same data root, so the empty string it gets here is the right answer, not
+# an omission.
+_DATA_NAME = "VFACE"
+_BUNDLES = {
+    "segmentation_model": "AMASSS_Models",
+    "classifier_model": "VFACE_classifier",
+    "cranial_base_reference": "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
+    "maxilla_reference": "CBCT_Gold_Occlusal_Midsagittal_Plane",
+    "mirror_reference": "Mirror_matrix",
+    "measurements": "DefaultList",
+    "feature_template": "DefaultList",
+}
+
+
+def _own_bundle(data_root, argument):
+    """The bundle this deployment publishes for `argument`, or ""."""
+    name = _BUNDLES.get(argument)
+    if not data_root or name is None:
+        return ""
+    candidate = os.path.join(str(data_root), _DATA_NAME, "models", name)
+    return candidate if os.path.isdir(candidate) else ""
+
+
 def main(t1, output_dir, mode=None, study=None, outputs=None, regions=None,
          t2=None, measurements=None, feature_template=None,
          registration_transforms=None,
          cranial_base_reference=None, maxilla_reference=None,
          mirror_reference=None, segmentation_model=None, landmark_model=None,
-         classifier_model=None, surface_model=None, sup=None):
+         classifier_model=None, surface_model=None, sup=None,
+         data_root=None):
     """Validate, run the chain the mode asks for, and write the report."""
     started_at = time.monotonic()
+    # What the caller named wins; what it left empty this deployment fills. The
+    # checks below then see a real bundle, and their message stays about what is
+    # missing from the DEPLOYMENT rather than about a field the panel no longer
+    # shows. `feature_template` is a file inside its bundle, not the bundle.
+    segmentation_model = segmentation_model or _own_bundle(data_root, "segmentation_model")
+    classifier_model = classifier_model or _own_bundle(data_root, "classifier_model")
+    cranial_base_reference = cranial_base_reference or _own_bundle(
+        data_root, "cranial_base_reference")
+    maxilla_reference = maxilla_reference or _own_bundle(data_root, "maxilla_reference")
+    mirror_reference = mirror_reference or _own_bundle(data_root, "mirror_reference")
+    measurements = measurements or _own_bundle(data_root, "measurements")
+    if not feature_template:
+        bundle = _own_bundle(data_root, "feature_template")
+        candidate = os.path.join(bundle, "features.xlsx") if bundle else ""
+        feature_template = candidate if os.path.isfile(candidate) else ""
     mode = str(mode or catalogs.MODE_FULL)
     study = str(study or catalogs.STUDY_ASYMMETRY)
     outputs = str(outputs or catalogs.OUTPUT_QUANTITATIVE)

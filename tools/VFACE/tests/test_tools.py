@@ -248,3 +248,53 @@ def test_the_surfaces_are_asked_for_with_the_bundle_named(sup, tmp_path):
     is a TypeError one tool down rather than a refusal here."""
     tools.segment_surfaces(sup, str(tmp_path / "registered"), str(tmp_path / "bundle"))
     assert sup.asked("Batch_Dental_Seg")["model"] == str(tmp_path / "bundle")
+
+
+# ---------------------------------------------------------------------------
+# The bundles this deployment fills in
+# ---------------------------------------------------------------------------
+
+class TestTheBundlesVfaceResolvesItself:
+    """`models/` holds six bundles at once, so an unnamed argument arrived as
+    that FOLDER and the run died after the segmentation and the orientation had
+    already been paid for. None of them is a clinical choice, so the panel asks
+    for none and the deployment names them instead."""
+
+    def _root(self, tmp_path, *names):
+        for name in names:
+            # exist_ok: two arguments share `DefaultList`, the measurement
+            # lists and the feature template living in one bundle.
+            (tmp_path / "VFACE" / "models" / name).mkdir(parents=True, exist_ok=True)
+        return str(tmp_path)
+
+    def test_each_bundle_is_found_under_the_data_root(self, tmp_path):
+        from sadt_vface import dispatch
+
+        root = self._root(tmp_path, *dispatch._BUNDLES.values())
+        for argument, name in dispatch._BUNDLES.items():
+            assert dispatch._own_bundle(root, argument) == str(
+                tmp_path / "VFACE" / "models" / name), argument
+
+    def test_a_deployment_publishing_none_gets_an_empty_string(self, tmp_path):
+        """Empty, not a path that does not exist: the checks downstream say
+        what is missing, and they can only do that if handed nothing."""
+        from sadt_vface import dispatch
+
+        root = self._root(tmp_path)
+        assert dispatch._own_bundle(root, "segmentation_model") == ""
+        assert dispatch._own_bundle(None, "segmentation_model") == ""
+
+    def test_the_landmark_bundle_is_not_resolved_here(self, tmp_path):
+        """ALI_CBCT resolves its own weights from the same data root, so the
+        empty string it gets is the right answer rather than an omission."""
+        from sadt_vface import dispatch
+
+        assert "landmark_model" not in dispatch._BUNDLES
+        assert dispatch._own_bundle(self._root(tmp_path), "landmark_model") == ""
+
+    def test_the_surface_bundle_is_not_resolved_here(self, tmp_path):
+        """Nothing publishes it yet, and heat maps are the only path that asks
+        for one. Pinned so its absence stays a known gap."""
+        from sadt_vface import dispatch
+
+        assert "surface_model" not in dispatch._BUNDLES
