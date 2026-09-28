@@ -1,6 +1,11 @@
 """The patient key, which is the one thing AREG's engines must agree on."""
 
+import os
+
+import pytest
+
 from sadt_areg_common import catalogs, pairing
+from sadt_areg_common.errors import ToolInputError
 
 JAW = set(catalogs.JAW_TOKENS)
 
@@ -47,3 +52,70 @@ def test_the_split_only_fires_when_both_halves_are_droppable():
     """A jaw token glued to something that is not a timepoint stays whole."""
     # `upperx` is not jaw+timepoint, so it survives as one token.
     assert pairing.patient_stem("A2_UpperX.vtk", also_drop=JAW) == "A2_UpperX"
+
+
+# ---------------------------------------------------------------------------
+# One timepoint per side, and a mask is not a subject
+# ---------------------------------------------------------------------------
+def _scan(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x")
+
+
+def test_a_mask_beside_a_scan_is_not_a_second_subject(tmp_path):
+    """`<scan>_SegOut/` is what AMASSS and AREG both write, so a folder that has
+    been through a run holds masks beside its scans. Counted as subjects, each
+    was paired, segmented again and registered: four runs where there is one."""
+    _scan(tmp_path / "C_0001_T1_Or.nii.gz")
+    _scan(tmp_path / "C_0001_T1_Or_SegOut" / "C_0001_T1_Or_CBMASK-Seg_Pred.nii.gz")
+    _scan(tmp_path / "C_0001_T1_Or_SegOut" / "C_0001_T1_Or_MANDMASK-Seg_Pred.nii.gz")
+
+    assert sorted(pairing.discover(str(tmp_path), "Reg")) == ["C_0001"]
+
+
+def test_a_cohort_resolves_to_its_own_timepoint_subfolder(tmp_path):
+    """Every shipped cohort is `<name>/{T1,T2}/`, and a hosted-file picker can
+    only offer the cohort. Paired as given, `T1/C_0001` matched `T1/C_0001` --
+    a baseline registered onto a baseline, reported as a success, the names
+    lining up perfectly.
+
+    The caller descends, not `pair`: doing it inside the pairing left the
+    segmentation looking at the whole cohort while the pairing looked at one
+    timepoint, so the masks were keyed `T1/C_0001` against subjects keyed
+    `C_0001` and the run segmented twice and registered nothing.
+    """
+    _scan(tmp_path / "cohort" / "T1" / "C_0001_T1_Or.nii.gz")
+    _scan(tmp_path / "cohort" / "T2" / "C_0001_T2_Or.nii.gz")
+
+    assert pairing.timepoint_root(str(tmp_path / "cohort"), "T1") == str(
+        tmp_path / "cohort" / "T1")
+    assert pairing.timepoint_root(str(tmp_path / "cohort"), "T2") == str(
+        tmp_path / "cohort" / "T2")
+
+
+def test_a_single_timepoint_folder_resolves_to_itself(tmp_path):
+    """What a clinician gives, and what the descent must not touch."""
+    _scan(tmp_path / "mine" / "C_0001_T1.nii.gz")
+
+    assert pairing.timepoint_root(str(tmp_path / "mine"), "T1") == str(tmp_path / "mine")
+
+
+def test_both_timepoints_mixed_in_one_directory_is_still_refused(tmp_path):
+    """No subfolder to descend into, and no rule can say which scan is which
+    side of the registration. The one case that has to come back to the user."""
+    _scan(tmp_path / "flat" / "C_0001_T1_Or.nii.gz")
+    _scan(tmp_path / "flat" / "C_0001_T2_Or.nii.gz")
+    _scan(tmp_path / "other" / "C_0001_T2_Or.nii.gz")
+
+    with pytest.raises(ToolInputError, match="more than one timepoint"):
+        pairing.pair(str(tmp_path / "flat"), str(tmp_path / "other"), "Reg")
+
+
+def test_pointing_at_the_timepoint_subfolders_works(tmp_path):
+    """The same data, used the way the refusal above asks for."""
+    _scan(tmp_path / "T1" / "C_0001_T1_Or.nii.gz")
+    _scan(tmp_path / "T2" / "C_0001_T2_Or.nii.gz")
+
+    matched = pairing.pair(str(tmp_path / "T1"), str(tmp_path / "T2"), "Reg")
+
+    assert sorted(matched.matched) == ["C_0001"]

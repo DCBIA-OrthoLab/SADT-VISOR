@@ -87,7 +87,11 @@ def patient_and_jaw(filename: str, output_suffix: str = "") -> tuple:
     stem = _strip_extension(filename)
     tokens = [token for token in _SPLIT.split(stem) if token]
     for index, token in enumerate(tokens):
-        jaw = _JAW_TOKENS.get(token.lower())
+        # `jaw_in_token`, not a lookup in the table: it also reads a jaw word
+        # with a timepoint glued to it, which is how upstream's published IOS
+        # test set is named (`A2_UpperT1.vtk`). A plain lookup found no jaw in
+        # that name and the mesh was refused.
+        jaw = sadt_naming.jaw_in_token(token)
         if jaw is None:
             continue
         before = tokens[:index]
@@ -96,7 +100,7 @@ def patient_and_jaw(filename: str, output_suffix: str = "") -> tuple:
         after = tokens[index + 1:]
         decoration = {output_suffix.lower()} if output_suffix else set()
         for offset, later in enumerate(after):
-            if _JAW_TOKENS.get(later.lower()) or later.lower() in decoration:
+            if sadt_naming.jaw_in_token(later) or later.lower() in decoration:
                 after = after[:offset]
                 break
         return "_".join(after) or stem, jaw

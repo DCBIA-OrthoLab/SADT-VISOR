@@ -12,6 +12,14 @@ string, and `describe.py` reads THIS FILE to publish the `calls` list the server
 checks at startup. Which is why the calls live here rather than in
 `../common/`: shared, they would be invisible to that check.
 
+No `output_dir` is passed to any of them. Where a supervised tool writes is
+the supervisor's business, the same way it is the server's over HTTP: it gives
+each nested call its own slot, `<job>/sup/<NN>_<tool>/output`, and that slot is
+the only place `keep_intermediate` collects from. Naming a directory here
+pointed every callee away from it, so each step ran, wrote its files, and came
+back to the reader as "a call that wrote nowhere". What the call RETURNS is
+where to read from.
+
 The mapping from upstream, made deliberately rather than discovered during a
 run, because getting it wrong has cost three separate defects already:
 
@@ -83,12 +91,6 @@ def require(sup, tool: str, mode: str) -> None:
     )
 
 
-def _output(sup, tool: str) -> str:
-    """A directory of the supervisor's scratch for one callee's results."""
-    destination = os.path.join(str(sup.tmp), "tools", tool)
-    os.makedirs(destination, exist_ok=True)
-    return destination
-
 
 def _returned(produced) -> str:
     """A tool returns a Path, or a dict of named ones; AREG wants a directory."""
@@ -110,7 +112,6 @@ def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
     logger.info("AREG: asking 'Crown_Seg' for tooth-labelled meshes")
     parameters = {
         "meshes": mesh_dir,
-        "output_dir": _output(sup, "Crown_Seg"),
         "suffix": "Seg",
     }
     if model_path:
@@ -129,7 +130,6 @@ def predict_cbct_landmarks(sup, scan_dir: str, model_path: str) -> str:
         sup.progress(0.1, "predicting CBCT landmarks with ALI_CBCT")
     parameters = {
         "input": scan_dir,
-        "output_dir": _output(sup, "ALI_CBCT"),
         "landmarks": list(CBCT_LANDMARKS),
     }
     if model_path:
@@ -149,7 +149,6 @@ def predict_ios_landmarks(sup, mesh_dir: str, model_path: str) -> str:
         sup.progress(0.3, "predicting intraoral landmarks with ALI_IOS")
     parameters = {
         "input": mesh_dir,
-        "output_dir": _output(sup, "ALI_IOS"),
         "networks": ["Occlusal"],
     }
     if model_path:
@@ -170,7 +169,6 @@ def orient_cbct(sup, scan_dir: str, reference_path: str, landmark_model: str = "
     parameters = {
         "input": scan_dir,
         "reference": reference_path,
-        "output_dir": _output(sup, "ASO"),
         "modality": "CBCT",
         "automation": "Fully-Automated",
     }

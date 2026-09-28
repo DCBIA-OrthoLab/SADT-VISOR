@@ -155,21 +155,90 @@ def shared_landmarks(moving: dict, fixed: dict) -> tuple:
     )
 
 
-def register_one(mesh_points: np.ndarray, ios_landmarks: dict, cbct_landmarks: dict,
-                 cbct_points: np.ndarray = None, max_dist: float = geometry.DEFAULT_MAX_DIST):
-    """Align by landmarks, then refine by ICP when there is a surface to refine on.
+def register_one(mesh, ios_landmarks: dict, cbct_landmarks: dict,
+                 cbct_surface=None, on_enamel: dict = None,
+                 max_dist: float = geometry.ICP_MAX_DIST_MM):
+    """Place the arch on its landmarks, then let the CBCT surface correct it.
 
-    The landmark stage alone is what upstream's "Registration" mode does when no
-    CBCT surface is available; the ICP is the refinement, and it needs points
-    sampled from the CBCT rather than the volume itself.
+    Two stages, and the order is load-bearing. The landmark fit puts the two
+    meshes in roughly the same place so the ICP starts inside its capture range;
+    an ICP started on unaligned meshes converges to whatever local minimum it
+    happens to reach. What the fit cannot do is notice that it is wrong: six
+    points are perfectly consistent with themselves however badly one of them
+    was predicted, so the arch follows the bad one and the residual looks like
+    ordinary noise. Forty thousand crown points against the CBCT surface is what
+    notices.
+
+    Without a surface this degrades to the landmark fit alone, which is what the
+    "Registration" mode does -- the arch is placed, nothing corrects it, and the
+    report says the ICP did not run.
     """
     moving, fixed, used, dropped = shared_landmarks(ios_landmarks, cbct_landmarks)
-    matrix = geometry.align_by_landmarks(moving, fixed)
-    report = {"landmarks_used": used, "landmarks_dropped": dropped, "icp": None}
+    matrix, prealignment = geometry.prealign(moving, fixed, used, on_enamel)
+    report = {
+        "landmarks_used": used,
+        "landmarks_dropped": dropped,
+        "prealignment": prealignment,
+        "icp": None,
+    }
+    if cbct_surface is None:
+        return matrix, report
 
-    if cbct_points is not None and len(cbct_points) >= 3:
-        moved = geometry.apply(mesh_points, matrix)
-        refinement, stats = geometry.icp_point_to_point(moved, cbct_points, max_dist=max_dist)
-        matrix = refinement @ matrix
-        report["icp"] = stats
-    return matrix, report
+    target = geometry.Target.from_mesh(cbct_surface).around(fixed)
+    moved = mesh.transform(matrix, inplace=False)
+    refinement, stats = geometry.icp_point_to_plane(moved, target, max_dist=max_dist)
+    report["icp"] = stats
+
+    if stats["fitness"] < geometry.MIN_ICP_FITNESS:
+        # Refused rather than written out: an ICP that matched nothing still
+        # returns a matrix, and writing it put an untouched intraoral scan in the
+        # results under the name of a registered one.
+        raise RuntimeError(
+            "Only %.1f%% of this arch matched the CBCT surface, under the %.0f%% "
+            "floor. Nothing is written for it: check its landmarks -- the "
+            "pre-alignment %s."
+            % (100 * stats["fitness"], 100 * geometry.MIN_ICP_FITNESS,
+               "was accepted" if prealignment["accepted"] else "was skipped")
+        )
+
+    # The one check on the ICP that the ICP does not grade itself. Measured over
+    # the pairs the pre-alignment was fitted on, so the two numbers are the same
+    # measurement taken twice: including a pair the pre-alignment rejected would
+    # compare the ICP against a residual nothing tried to minimise, and report a
+    # drift on an arch that had not moved.
+    report["icp"].update(
+        _landmark_drift(moving, fixed, used, matrix, refinement,
+                        prealignment["landmarks_fitted"], stats))
+    return refinement @ matrix, report
+
+
+def _landmark_drift(moving, fixed, labels, matrix, refinement, fitted, stats) -> dict:
+    """Whether the ICP moved the arch towards its landmarks or away from them.
+
+    Only logged, never refused: a registration can legitimately trade a little
+    landmark agreement for a much better surface fit, and on these six points it
+    usually should. What it must not do is trade it silently.
+    """
+    keep = [index for index, label in enumerate(labels) if label in set(fitted)]
+    if not keep:
+        return {}
+
+    placed = geometry.apply(moving[keep], matrix)
+    before = float(np.sqrt(np.mean(
+        np.sum((placed - fixed[keep]) ** 2, axis=1))))
+    after = float(np.sqrt(np.mean(
+        np.sum((geometry.apply(placed, refinement) - fixed[keep]) ** 2, axis=1))))
+
+    if after - before > geometry.MAX_ICP_LANDMARK_DRIFT_MM:
+        logger.warning(
+            "The ICP left the arch %.1f mm from its landmarks where the fit had "
+            "it at %.1f mm, a drift of %.1f mm. It matched %.1f%% of the arch at "
+            "%.2f mm, so the surface agrees with it -- but on a smooth occlusal "
+            "surface that pattern is also what a fit sliding along the arch looks "
+            "like, and its own fitness cannot tell the two apart.",
+            after, before, after - before, 100 * stats["fitness"],
+            stats["inlier_rmse"])
+    else:
+        logger.info("Landmarks %.1f mm from their CBCT counterparts after the ICP, "
+                    "against %.1f mm before it.", after, before)
+    return {"landmark_rms_before_mm": before, "landmark_rms_after_mm": after}

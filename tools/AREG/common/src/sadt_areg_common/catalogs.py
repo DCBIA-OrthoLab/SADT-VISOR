@@ -83,6 +83,30 @@ REGION_MASK_STRUCTURES = {
     "MAX": "MAXMASK",
 }
 
+# The anatomical segmentations AMASSS can produce BESIDE the registration
+# masks, and the second group of check boxes the original module offers
+# ("AMASSS Segmentation", AREG_Method/CBCT.py's DicLandmark). Two groups
+# rather than one, because they answer different questions: the regions above
+# decide what the registration is masked to, these decide what comes back for
+# the clinician to look at. Nothing here changes the registration.
+#
+# The six are AMASSS's non-mask structures, which is exactly what the original
+# offers. Spelled the way this repository spells the regions above ("Cranial
+# base", not "Cranial Base"): one schema, one convention.
+SEGMENTATION_CODES = {
+    "Cranial base": "CB",
+    "Cervical vertebra": "CV",
+    "Mandible": "MAND",
+    "Maxilla": "MAX",
+    "Skin": "SKIN",
+    "Upper airway": "UAW",
+}
+
+# None ticked: a registration run returns a registration. Asking for skin and
+# airway on every patient would add minutes of GPU and gigabytes of output to
+# a run nobody asked to segment.
+SEGMENTATION_CHOICES = {name: False for name in SEGMENTATION_CODES}
+
 # Tokens that name a region inside a mask's file name, matched as WHOLE tokens
 # of the stem rather than as substrings.
 #

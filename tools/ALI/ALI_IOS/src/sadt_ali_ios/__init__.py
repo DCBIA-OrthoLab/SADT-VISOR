@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 from .dispatch import identify
+from .errors import ToolInputError
 
 # What this engine appends to the name it was handed, and it is a CONSTANT.
 # It used to be an argument, `prediction_ID`, defaulting to "Pred". That made
@@ -42,10 +43,34 @@ OUTPUT_SUFFIXES = ("_lm_Pred", "_lm")
 REVIEW_KIND = "landmarks"
 
 
+# The DATA folder this tool's weights live in. Its own name, except that
+# ALI_IOS and ALI_CBCT are two engines behind the ALI facade and share one.
+# Written rather than derived, for the reason the CBCT engine gives beside its
+# own copy: which folder serves which engine is a deployment fact, and a wrong
+# guess is a folder that is simply not there.
+_DATA_NAME = "ALI"
+
+
+def _own_models(data_root):
+    """`<root>/ALI/models`, or a refusal a caller can act on."""
+    if data_root is None:
+        raise ToolInputError(
+            "No 'model' given and no data root to look in. Name the model "
+            "bundle, or run this through a server that publishes one."
+        )
+    return Path(data_root) / _DATA_NAME / "models"
+
+
 def run(
     input: Path,
-    model: Path,
     output_dir: Path,
+    # After `output_dir` and optional, the shape the CBCT engine already has
+    # and for the same reason: it lets a neighbour ask for landmarks WITHOUT
+    # naming weights. Required, a supervised call omitting it died on
+    # `TypeError: run() missing 1 required positional argument: 'model'`, and
+    # the caller had to hold a name for this tool's storage. Empty means "my
+    # own", resolved below from this tool's data folder.
+    model: Path = "",
     # Mucogingival is OFF by default: it is one point per lower tooth on the
     # gingival margin, wanted by a mandible registration and by nobody asking
     # for crown landmarks. On by default would add a third pass over every mesh
@@ -91,6 +116,7 @@ def run(
     device: Literal["cuda", "cpu"] = "cuda",
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Place anatomical landmarks on an intraoral surface scan.
 
@@ -140,7 +166,7 @@ def run(
     output_dir = Path(output_dir)
     identify(
         input_path=str(input),
-        model_path=str(model),
+        model_path=str(model or _own_models(data_root)),
         output_dir=str(output_dir),
         ios_networks=networks,
         landmarks=landmarks,

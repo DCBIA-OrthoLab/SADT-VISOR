@@ -18,6 +18,7 @@ import inspect
 import json
 import logging
 import os
+from types import SimpleNamespace
 import typing
 from pathlib import Path
 
@@ -127,14 +128,25 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
         lambda root: {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
                       for name in ("P1", "P2")},
     )
-    monkeypatch.setattr(dispatch, "_surface_points", lambda path: (None, np.zeros((3, 3))))
+    # A stand-in that answers the one call the loop makes on a mesh. Returning
+    # None here made the loop raise on `mesh.transform`, which this test would
+    # have reported as a progress failure.
+    monkeypatch.setattr(
+        dispatch, "_read_mesh",
+        lambda path: SimpleNamespace(transform=lambda matrix, inplace=False: None),
+    )
+    # Contouring the CBCT is the expensive half of a real run and this test is
+    # about the progress bar, so it is stood in for like everything else inside
+    # the loop.
+    monkeypatch.setattr(dispatch, "_cbct_surface", lambda path, sets: (None, {}, None))
     monkeypatch.setattr(
         dispatch.pipeline, "register_one",
-        lambda points, moving, fixed, max_dist: (np.eye(4), {"rms": 0.0}),
+        lambda mesh, moving, fixed, surface, on_enamel, max_dist: (
+            np.eye(4), {"rms": 0.0}),
     )
     monkeypatch.setattr(
-        dispatch, "_write_surface",
-        lambda surface, points, path: (
+        dispatch, "_write_mesh",
+        lambda mesh, path: (
             os.makedirs(os.path.dirname(path), exist_ok=True), open(path, "w").close()
         ),
     )
@@ -308,12 +320,17 @@ def _captured_max_dist(tmp_path, monkeypatch, **overrides):
 def test_a_max_dist_of_zero_means_upstreams_own_value(tmp_path, monkeypatch):
     """0 is what an untouched numeric field sends, and it is not a distance
     anybody meant -- every point would be further from its neighbour than
-    that, and the ICP would match nothing."""
-    assert _captured_max_dist(tmp_path, monkeypatch, max_dist=0.0) == [1.5]
+    that, and the ICP would match nothing.
+
+    1.0, not the 1.5 in upstream's `run_icp_point_to_plane` signature: every
+    call site upstream has passes 1.0, and the call sites are what produced the
+    results this tool is checked against.
+    """
+    assert _captured_max_dist(tmp_path, monkeypatch, max_dist=0.0) == [1.0]
 
 
 def test_an_omitted_max_dist_means_the_same(tmp_path, monkeypatch):
-    assert _captured_max_dist(tmp_path, monkeypatch) == [1.5]
+    assert _captured_max_dist(tmp_path, monkeypatch) == [1.0]
 
 
 @pytest.mark.parametrize("given", [0.25, 1.5, 12.0])
@@ -331,10 +348,19 @@ def test_an_integer_max_dist_is_accepted_as_a_distance(tmp_path, monkeypatch):
 # The panel
 # ---------------------------------------------------------------------------
 
+# The arguments the SERVER adds for a tool that calls another, which a layout
+# is allowed to name and `run()` therefore does not take. Restated here because
+# `scripts/describe.py` is a script at the root of the repository and not an
+# importable package -- the same way ALI_IOS's suite restates it.
+INJECTED_ARGUMENTS = ("keep_intermediate", "stop_after")
+
+
 def test_the_layout_only_names_arguments_the_signature_offers():
-    """`describe.py` refuses a hint naming an argument `run()` does not take,
-    so a stale entry here is a tool that will not publish its schema at all."""
-    assert set(LAYOUT) <= set(inspect.signature(run).parameters)
+    """`describe.py` refuses a hint naming an argument `run()` does not take
+    AND is not injected, so a stale entry here is a tool that will not publish
+    its schema at all."""
+    allowed = set(inspect.signature(run).parameters) | set(INJECTED_ARGUMENTS)
+    assert set(LAYOUT) <= allowed
 
 
 def test_every_layout_condition_names_a_mode_this_tool_has():
@@ -373,9 +399,15 @@ def test_every_published_argument_has_a_label(tmp_path):
     above a file picker."""
     published = [
         name for name in inspect.signature(run).parameters
-        if name not in ("output_dir", "sup")
+        # `sup` and `data_root` are INJECTED by the server (describe.INJECTED),
+        # never published and never laid out: a panel cannot offer a supervisor
+        # or the server's own data folder.
+        if name not in ("output_dir", "sup", "data_root")
     ]
-    assert sorted(LAYOUT) == sorted(published)
+    # The injected ones are not published by this tool and carry no label: they
+    # are named here only to be hidden, which is presentation and not an
+    # argument of `run()`.
+    assert sorted(set(LAYOUT) - set(INJECTED_ARGUMENTS)) == sorted(published)
     for name in published:
         assert LAYOUT[name].get("label"), name
 
