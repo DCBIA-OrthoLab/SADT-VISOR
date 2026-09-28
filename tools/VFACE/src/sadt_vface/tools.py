@@ -269,8 +269,41 @@ def _region_folder(produced: str) -> str:
     raise ToolInputError(
         f"The registration produced no transform to move the landmarks by. "
         f"Looked in '{os.path.basename(str(produced))}' and in each folder "
-        f"below it; it holds: {found}."
+        f"below it; it holds: {found}.{_why_nothing_registered(produced)}"
     )
+
+
+def _why_nothing_registered(produced: str) -> str:
+    """AREG's own account of the run, when it left one and registered nothing.
+
+    It writes a report whether or not it registered anything, and that report
+    is the only place that says WHY -- which patients it could not pair, and
+    what it did with the ones it could. Reading it here is what turns "no
+    transform" into an answer: the alternative is a reader who has the refusal
+    and no way to reach the explanation, the job directory being torn down with
+    the failure.
+    """
+    import json
+
+    report = os.path.join(produced, "AREG_report.json")
+    try:
+        with open(report, encoding="utf-8") as handle:
+            content = json.load(handle)
+    except (OSError, ValueError):
+        return ""
+
+    parts = []
+    unpaired = content.get("unpaired")
+    if unpaired:
+        parts.append(f"unpaired: {unpaired}")
+    patients = content.get("patients") or {}
+    for key, entry in list(patients.items())[:3]:
+        state = entry.get("status", "?")
+        reason = entry.get("error") or entry.get("reason") or ""
+        parts.append(f"{key}: {state}{f' ({reason})' if reason else ''}")
+    if not patients and not unpaired:
+        parts.append("its report names no patient at all")
+    return " AREG says -- " + "; ".join(parts) + "."
 
 
 # What AutoMatrix will accept as a transform, so this tool can check for one
