@@ -156,3 +156,48 @@ class TestMarkers:
         dropped the second and merged both landmark sets into the survivor."""
         assert formats.strip_markers("P1_T1") == "P1_T1"
         assert formats.strip_markers("P1_T2_Or") == "P1_T2"
+
+
+class TestAJawWordWithATimepointGluedToIt:
+    """`A2_UpperT1.vtk` is how upstream's published IOS test set is named.
+
+    The whole-token rule finds no jaw in `UpperT1`, so the mesh was refused and
+    the dataset this repository is checked against could not be run at all.
+    """
+
+    def test_the_glued_timepoint_is_read_as_the_jaw_it_names(self):
+        assert formats.jaw_of("A2_UpperT1") == "Upper"
+        assert formats.jaw_of("A2_LowerT2") == "Lower"
+        assert formats.jaw_of("A2_UpperT0") == "Upper"
+
+    def test_the_reverse_order_is_a_known_limit(self):
+        """`T1Upper` is not read, and that is AREG's limit too. Pinned so it is
+        a known one: widening it here alone would put the two vocabularies back
+        out of step, which is the whole thing this rule was aligned to fix."""
+        assert formats.jaw_of("A2_T1Upper") is None
+
+    def test_a_word_that_merely_starts_with_a_jaw_word_still_names_none(self):
+        """The substring disaster, one step removed: a timepoint is evidence,
+        the rest of an English word is not."""
+        assert formats.jaw_of("P1_lowering") is None
+        assert formats.jaw_of("P1_uppermost") is None
+        assert formats.jaw_of("MAXILLOFACIAL_03") is None
+
+    def test_every_spelling_the_table_knows_splits_the_same_way(self):
+        """The rule is keyed on the two tables, so it covers the short
+        spellings too. That is AREG's reading of these names, and one file must
+        not be read by AREG and refused here."""
+        assert formats.jaw_of("P1_ut1") == "Upper"
+        assert formats.jaw_of("P1_lt2") == "Lower"
+        assert formats.jaw_of("P1_maxt1") == "Upper"
+
+    def test_an_identifier_that_merely_ends_in_a_timepoint_is_untouched(self):
+        """The prefix has to be a jaw as well: `pa` is not one, so `PAT1` stays
+        a patient identifier."""
+        assert formats.jaw_of("PAT1") is None
+        assert formats.jaw_of("SUBJECTT2") is None
+
+    def test_the_whole_token_rule_is_untouched(self):
+        assert formats.jaw_of("P1_U_Seg") == "Upper"
+        assert formats.jaw_of("Upper_gold") == "Upper"
+        assert formats.jaw_of("P1_MX") == "Upper"

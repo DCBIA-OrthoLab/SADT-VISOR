@@ -190,6 +190,51 @@ def tokens_of(stem: str) -> list:
     return out
 
 
+# ---------------------------------------------------------------------------
+# A jaw run together with a timepoint
+# ---------------------------------------------------------------------------
+#
+# Upstream's own AREG test set is named `A2_UpperT1.vtk` / `A2_UpperT2.vtk`:
+# the jaw and the timepoint run together with no separator, so the whole thing
+# is a single token, `uppert1`, matching neither table. `jaw_of` then found no
+# jaw at all and the mesh was refused -- upstream's published IOS data could not
+# be run.
+#
+# The rule is AREG's, verbatim rather than reinvented: the AREG family already
+# split these names in `sadt_areg_common.pairing`, and this module did not, so
+# one file was read by AREG_IOS and refused by ASO. A THIRD reading of the same
+# name is the failure this shared vocabulary exists to prevent, so the fix is to
+# adopt that one, not to write a better one.
+#
+# Deliberately narrow, and keyed on the two STATIC tables rather than on
+# anything a caller passes: the split fires only when the prefix is a known jaw
+# token AND the suffix is a known timepoint. `PAT1` is therefore untouched
+# (`pa` is not a jaw), and so is any identifier that merely ends in something
+# timepoint-shaped. Splitting on every camelCase boundary would start eating
+# patient identifiers, which is what token matching exists to prevent.
+
+
+def split_jaw_timepoint(part: str) -> list:
+    """`['UpperT1']` -> `['Upper', 'T1']`, and everything else untouched."""
+    lowered = part.lower()
+    for timepoint in TIMEPOINT_TOKENS:
+        if not lowered.endswith(timepoint) or len(lowered) <= len(timepoint):
+            continue
+        if lowered[: -len(timepoint)] in JAW_TOKENS:
+            cut = len(lowered) - len(timepoint)
+            return [part[:cut], part[cut:]]
+    return [part]
+
+
+def jaw_in_token(token: str):
+    """The jaw one token names, or None -- a concatenated timepoint included."""
+    for part in split_jaw_timepoint(token):
+        jaw = JAW_TOKENS.get(part.lower())
+        if jaw is not None:
+            return jaw
+    return None
+
+
 def jaw_of(stem: str):
     """`Upper`, `Lower`, or None when no token names a jaw.
 
@@ -198,7 +243,7 @@ def jaw_of(stem: str):
     mandibular reference and returned it as a success.
     """
     for token in tokens_of(stem):
-        jaw = JAW_TOKENS.get(token.lower())
+        jaw = jaw_in_token(token)
         if jaw is not None:
             return jaw
     return None
