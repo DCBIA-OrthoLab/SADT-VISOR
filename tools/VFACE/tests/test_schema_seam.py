@@ -74,6 +74,13 @@ class RecordingSup:
         self.calls.append((tool, params))
         produced = self.tmp / "produced"
         produced.mkdir(exist_ok=True)
+        # AREG_CBCT groups its matrices by region, and `register` reads that
+        # shape back before handing the folder to AutoMatrix. A slot with
+        # nothing in it is refused, which is the point of that check.
+        if tool == "AREG_CBCT":
+            region = produced / "CB"
+            region.mkdir(exist_ok=True)
+            (region / "C_0001_Reg_transform.tfm").write_text("")
         return produced
 
     def progress(self, fraction, message):

@@ -38,7 +38,7 @@ Three things worth knowing before changing anything here:
 import logging
 import os
 
-from .errors import SupervisorRequired
+from .errors import SupervisorRequired, ToolInputError
 
 logger = logging.getLogger(__name__)
 
@@ -247,10 +247,43 @@ def _region_folder(produced: str) -> str:
     precisely because the two vocabularies are not the same.
     """
     try:
-        inside = [entry for entry in os.scandir(produced) if entry.is_dir()]
-    except OSError:
+        entries = list(os.scandir(produced))
+    except OSError as exc:
+        raise ToolInputError(
+            f"The registration returned '{os.path.basename(str(produced))}', which "
+            f"cannot be read back ({exc.strerror})."
+        ) from exc
+
+    folders = [entry for entry in entries if entry.is_dir()]
+    here = _transforms_in(produced)
+    if here:
         return produced
-    return inside[0].path if len(inside) == 1 else produced
+    if len(folders) == 1 and _transforms_in(folders[0].path):
+        return folders[0].path
+
+    # Said HERE rather than left to AutoMatrix, which is handed this directory
+    # three steps later and can only report that it holds no transform -- with
+    # no way to say which tool produced it or what it does hold. The whole
+    # segmentation and registration have been paid for by then.
+    found = ", ".join(sorted(entry.name for entry in entries)) or "nothing"
+    raise ToolInputError(
+        f"The registration produced no transform to move the landmarks by. "
+        f"Looked in '{os.path.basename(str(produced))}' and in each folder "
+        f"below it; it holds: {found}."
+    )
+
+
+# What AutoMatrix will accept as a transform, so this tool can check for one
+# before handing a directory over rather than after.
+_TRANSFORM_SUFFIXES = (".tfm", ".mat", ".h5", ".txt")
+
+
+def _transforms_in(directory: str) -> list:
+    try:
+        return [entry.name for entry in os.scandir(directory)
+                if entry.is_file() and entry.name.endswith(_TRANSFORM_SUFFIXES)]
+    except OSError:
+        return []
 
 
 def predict_landmarks(sup, scans: str, landmarks, model: str = "",

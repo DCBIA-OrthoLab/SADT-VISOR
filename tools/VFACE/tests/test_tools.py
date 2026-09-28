@@ -21,11 +21,25 @@ from sadt_vface.errors import SupervisorRequired
 
 @pytest.fixture
 def sup(tmp_path):
-    return FakeSup(tmp_path, {
-        name: (lambda params: params["output_dir"])
-        for name in ("ASO", "AMASSS", "AutoMatrix", "AREG_CBCT", "ALI_CBCT",
-                     "Batch_Dental_Seg")
-    })
+    def slot(params):
+        return params["output_dir"]
+
+    def registration(params):
+        # AREG_CBCT groups its results by region and writes one matrix per
+        # patient inside. `register` reads that shape back, so a slot with
+        # nothing in it would not exercise what the caller actually receives.
+        import os
+        produced = params["output_dir"]
+        region = os.path.join(produced, "CB")
+        os.makedirs(region, exist_ok=True)
+        open(os.path.join(region, "C_0001_Reg_transform.tfm"), "w").close()
+        return produced
+
+    return FakeSup(tmp_path, dict(
+        {name: slot for name in ("ASO", "AMASSS", "AutoMatrix", "ALI_CBCT",
+                                 "Batch_Dental_Seg")},
+        AREG_CBCT=registration,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -305,41 +319,50 @@ class TestWhereTheRegistrationPutItsMatrices:
     no transform at all -- the matrices are one level down, beside its report.
 
     Nothing caught this until the chain was run for the first time: AutoMatrix,
-    handed that directory next, refused with "No transform found", after the
-    segmentation and the three registrations had already been paid for.
+    handed that directory three steps later, could only say it held no
+    transform, with no way to name the tool that produced it. The segmentation
+    and the three registrations had been paid for by then.
     """
 
-    def test_the_region_subfolder_is_what_comes_back(self, sup, tmp_path):
-        from sadt_vface import tools
+    def _with_transform(self, folder):
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "C_0001_Reg_transform.tfm").write_text("")
+        return folder
 
-        produced = tools.register(sup, str(tmp_path / "t1"), str(tmp_path / "t2"),
-                                  "Cranial base", str(tmp_path / "masks"))
-        # The fake supervisor hands back its slot; plant AREG's shape in it.
-        assert produced
-
-    def test_one_subfolder_is_descended_into(self, tmp_path):
+    def test_one_subfolder_holding_the_matrices_is_descended_into(self, tmp_path):
         from sadt_vface import tools
 
         root = tmp_path / "output"
-        (root / "CB").mkdir(parents=True)
+        self._with_transform(root / "CB")
         (root / "AREG_report.json").write_text("{}")
         assert tools._region_folder(str(root)) == str(root / "CB")
-
-    def test_several_subfolders_are_left_alone(self, tmp_path):
-        """Only a single-region call can be descended into unambiguously. Two
-        means the caller asked for two, and picking one would be a guess."""
-        from sadt_vface import tools
-
-        root = tmp_path / "output"
-        for name in ("CB", "MAND"):
-            (root / name).mkdir(parents=True)
-        assert tools._region_folder(str(root)) == str(root)
 
     def test_a_flat_output_is_left_alone(self, tmp_path):
         """A tool that writes its matrices at the top level needs no descent."""
         from sadt_vface import tools
 
-        root = tmp_path / "output"
-        root.mkdir()
-        (root / "C_0001_Reg_transform.tfm").write_text("")
+        root = self._with_transform(tmp_path / "output")
         assert tools._region_folder(str(root)) == str(root)
+
+    def test_no_transform_anywhere_is_refused_with_what_was_found(self, tmp_path):
+        """The refusal names the directory and its contents, so a reader can
+        see whether the registration wrote nothing or wrote it elsewhere."""
+        from sadt_vface import tools
+        from sadt_vface.errors import ToolInputError
+
+        root = tmp_path / "output"
+        (root / "CB").mkdir(parents=True)
+        (root / "AREG_report.json").write_text("{}")
+        with pytest.raises(ToolInputError, match="AREG_report.json"):
+            tools._region_folder(str(root))
+
+    def test_two_region_folders_are_refused_rather_than_guessed(self, tmp_path):
+        """Only a single-region call can be descended into unambiguously."""
+        from sadt_vface import tools
+        from sadt_vface.errors import ToolInputError
+
+        root = tmp_path / "output"
+        for name in ("CB", "MAND"):
+            self._with_transform(root / name)
+        with pytest.raises(ToolInputError, match="no transform"):
+            tools._region_folder(str(root))
