@@ -300,6 +300,12 @@ def _why_nothing_registered(produced: str) -> str:
     for key, entry in list(patients.items())[:3]:
         state = entry.get("status", "?")
         reason = entry.get("error") or entry.get("reason") or ""
+        # AREG records the reason PER REGION, one level below the patient, so
+        # reading only the patient gives "failed" and nothing else.
+        for code, region in (entry.get("regions") or {}).items():
+            if region.get("reason"):
+                reason = f"{code}: {region['reason']}"
+                break
         parts.append(f"{key}: {state}{f' ({reason})' if reason else ''}")
     if not patients and not unpaired:
         parts.append("its report names no patient at all")
