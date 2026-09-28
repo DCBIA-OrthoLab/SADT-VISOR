@@ -88,24 +88,26 @@ def require(sup, tool: str, mode: str) -> None:
     )
 
 
-def _output(sup, tool: str, label: str = "") -> str:
-    """A directory of the supervisor's scratch for one callee's results.
-
-    `label` separates two calls to the SAME tool -- VFACE orients twice and
-    registers three times -- which would otherwise write into one directory and
-    leave the second call reading the first one's output as its own.
-    """
-    destination = os.path.join(str(sup.tmp), "tools", tool, label or "run")
-    os.makedirs(destination, exist_ok=True)
-    return destination
-
-
 def _returned(produced) -> str:
     """A tool returns a Path, or a dict of named ones; VFACE wants a directory."""
     if isinstance(produced, dict):
         produced = next(iter(produced.values()))
     return str(produced)
 
+
+# No `output_dir` is passed to any of the six. Where a supervised tool writes is
+# the supervisor's business: it gives each nested call its own slot,
+# `<job>/sup/<NN>_<tool>/output`, numbered per CALL -- so the two orientations
+# and the three registrations are already separated, which is what the helper
+# this replaced was for. That slot is also the only place `keep_intermediate`
+# collects from, so naming a directory here pointed every callee away from it
+# and every step came back to the reader as "a call that wrote nowhere".
+# What the call RETURNS is where to read from.
+#
+# `prediction_ID` survives for AMASSS and Batch_Dental_Seg, which still take it.
+# ALI_CBCT does not: it turned the marker into a constant, `PREDICTION_ID`,
+# precisely so that whatever consumes its output can predict it. The value sent
+# here was "Pred", which is that constant, so nothing moved.
 
 # ---------------------------------------------------------------------------
 # The calls
@@ -129,7 +131,6 @@ def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
     parameters = {
         "input": scans,
         "reference": reference,
-        "output_dir": _output(sup, "ASO", label),
         "modality": "CBCT",
         "automation": "Fully-Automated",
         "cbct_landmarks": list(landmarks),
@@ -154,7 +155,6 @@ def segment_masks(sup, scans: str, model: str, structures, label: str = "") -> s
         "AMASSS",
         scans=scans,
         model=model,
-        output_dir=_output(sup, "AMASSS", label),
         structures=list(structures),
         merge=["SEPARATE"],
         prediction_ID="seg",
@@ -178,7 +178,6 @@ def mirror(sup, files: str, transform: str, content: str = "Automatic",
         "AutoMatrix",
         files=files,
         transforms=transform,
-        output_dir=_output(sup, "AutoMatrix", label),
         # One transform for the whole cohort: it is a reflection of the frame,
         # not something fitted per patient.
         same_transform_for_every_patient=True,
@@ -205,7 +204,6 @@ def apply_transforms(sup, files: str, transforms: str, label: str = "") -> str:
         "AutoMatrix",
         files=files,
         transforms=transforms,
-        output_dir=_output(sup, "AutoMatrix", label),
         same_transform_for_every_patient=False,
         output_suffix="reg",
         content="Automatic",
@@ -226,7 +224,6 @@ def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "") ->
         "AREG_CBCT",
         t1=t1,
         t2=t2,
-        output_dir=_output(sup, "AREG_CBCT", label or region),
         automation="Semi-Automated",
         regions=[region],
         t1_masks=masks,
@@ -246,9 +243,7 @@ def predict_landmarks(sup, scans: str, landmarks, model: str = "",
     logger.info("VFACE: asking 'ALI_CBCT' for %d landmark(s)", len(landmarks))
     parameters = {
         "input": scans,
-        "output_dir": _output(sup, "ALI_CBCT", label),
         "landmarks": list(landmarks),
-        "prediction_ID": "Pred",
     }
     if model:
         parameters["model"] = model
@@ -271,6 +266,5 @@ def segment_surfaces(sup, scans: str, model: str, label: str = "") -> str:
         "Batch_Dental_Seg",
         scans=scans,
         model=model,
-        output_dir=_output(sup, "Batch_Dental_Seg", label),
         prediction_ID="Seg",
     ))

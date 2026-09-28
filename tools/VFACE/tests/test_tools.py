@@ -102,15 +102,23 @@ def test_each_frame_is_fitted_on_its_own_landmarks(sup, tmp_path):
     assert len({params["reference"] for params in sent}) == len(catalogs.FRAMES)
 
 
-def test_the_two_orientations_do_not_write_into_one_folder(sup, tmp_path):
-    """Two calls to the same tool. Sharing an output directory leaves the
-    second reading the first one's scans as its own, and a cohort then comes
-    back oriented into the wrong frame with nothing raised."""
+def test_the_two_orientations_land_apart_without_naming_a_folder(sup, tmp_path):
+    """Two calls to the same tool, which must not read each other's scans.
+
+    VFACE used to keep them apart by naming a directory per call. That is the
+    supervisor's job -- it gives every call its own slot -- and naming one here
+    pointed the callee away from the slot `keep_intermediate` collects from. So
+    the property is still required, and it is now asserted where it lives: on
+    what the calls RETURN, no `output_dir` being sent at all.
+    """
+    produced = []
     for frame_name, frame in catalogs.FRAMES.items():
-        tools.orient_scans(sup, str(tmp_path / "scans"), str(tmp_path / "ref"),
-                           frame["landmarks"], frame["suffix"], label=frame_name)
-    sent = [params["output_dir"] for name, params in sup.calls if name == "ASO"]
-    assert len(set(sent)) == len(sent)
+        produced.append(tools.orient_scans(
+            sup, str(tmp_path / "scans"), str(tmp_path / "ref"),
+            frame["landmarks"], frame["suffix"], label=frame_name))
+    assert len(set(produced)) == len(produced)
+    assert not [params for name, params in sup.calls
+                if name == "ASO" and "output_dir" in params]
 
 
 def test_an_orientation_with_no_bundle_named_does_not_send_an_empty_one(sup, tmp_path):
@@ -195,12 +203,17 @@ def test_the_registration_is_semi_automated_on_masks_vface_already_has(sup, tmp_
     assert asked["t1_masks"] == str(tmp_path / "masks")
 
 
-def test_each_region_is_registered_into_its_own_folder(sup, tmp_path):
+def test_each_region_is_registered_into_its_own_slot(sup, tmp_path):
+    """Same property as the orientations, for the three registrations: each
+    comes back with its own directory, and none of them asked for one."""
+    produced = []
     for region in catalogs.REGIONS:
-        tools.register(sup, str(tmp_path / "t1"), str(tmp_path / "t2"),
-                       catalogs.REGION_TABLE[region]["areg"], str(tmp_path / "masks"))
-    sent = [params["output_dir"] for name, params in sup.calls if name == "AREG_CBCT"]
-    assert len(set(sent)) == len(catalogs.REGIONS)
+        produced.append(tools.register(
+            sup, str(tmp_path / "t1"), str(tmp_path / "t2"),
+            catalogs.REGION_TABLE[region]["areg"], str(tmp_path / "masks")))
+    assert len(set(produced)) == len(catalogs.REGIONS)
+    assert not [params for name, params in sup.calls
+                if name == "AREG_CBCT" and "output_dir" in params]
 
 
 def test_the_region_names_sent_are_the_ones_areg_publishes():

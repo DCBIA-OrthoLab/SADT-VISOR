@@ -88,11 +88,17 @@ class FakeSup:
         self.messages = []
 
     def run(self, tool, **params):
+        # A slot per CALL, which is what the real supervisor gives
+        # (`<job>/sup/<NN>_<tool>/output`) and why no caller passes `output_dir`
+        # any more. Numbered, so the two orientations and the three
+        # registrations land apart without anyone naming a directory.
         self.calls.append((tool, params))
+        slot = self.tmp / "sup" / f"{len(self.calls):02d}_{tool}" / "output"
+        slot.mkdir(parents=True, exist_ok=True)
         maker = self.outputs.get(tool)
         if maker is None:
             raise AssertionError(f"nothing planted for {tool!r} in this test")
-        produced = maker(params)
+        produced = maker(dict(params, output_dir=str(slot)))
         if isinstance(produced, Exception):
             raise produced
         return Path(produced)
@@ -188,9 +194,12 @@ class PipelineSup:
     # -- the five members a tool can see ------------------------------------
 
     def run(self, tool, **params):
+        # The slot the real supervisor allocates per call, rather than one the
+        # caller named: no tool passes `output_dir` any more, and numbering by
+        # call is what keeps two runs of the same tool apart.
         self.calls.append((tool, params))
         handler = getattr(self, f"_{tool.lower()}")
-        destination = Path(params["output_dir"])
+        destination = self.tmp / "sup" / f"{len(self.calls):02d}_{tool}" / "output"
         destination.mkdir(parents=True, exist_ok=True)
         handler(params, destination)
         return destination
