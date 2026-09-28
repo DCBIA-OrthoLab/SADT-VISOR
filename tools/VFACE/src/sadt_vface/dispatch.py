@@ -475,12 +475,21 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
     # --- the masks, the second scan, the registration ------------------------
     if mode != catalogs.MODE_REGISTERED:
         _stage(sup, "segment", "segmenting the bone each region registers on")
+        # Only the frames some region actually registers on. Both frames are
+        # oriented whatever was asked for -- the landmarks are predicted in the
+        # cranial base frame and derived into the maxillary one, so the
+        # measurement path needs both -- but a frame no region registers on has
+        # no structures to segment, and AMASSS rightly refuses an empty list
+        # with "Select at least one structure to segment". A request for the
+        # cranial base alone died there, after both orientations had been paid
+        # for.
         masks = {
             frame: tools.segment_masks(
-                sup, folder, segmentation_model,
-                catalogs.structures_for(frame, regions), label=frame,
+                sup, folder, segmentation_model, structures, label=frame,
             )
             for frame, folder in oriented.items()
+            for structures in [catalogs.structures_for(frame, regions)]
+            if structures
         }
         _stage(sup, "second", "building the scan each patient is compared against")
         second = _second_timepoint(sup, study, oriented, mirror_reference, t2,

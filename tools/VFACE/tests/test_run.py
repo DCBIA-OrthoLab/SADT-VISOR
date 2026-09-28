@@ -475,3 +475,36 @@ def test_a_supplied_registration_is_measured_without_registering_again(tmp_path)
     assert sup.asked("AMASSS") == []
     assert sup.asked("AREG_CBCT") == []
     assert os.path.join("Measurements", "Measurements_CB.xlsx") in tree_of(tmp_path / "out")
+
+
+# ---------------------------------------------------------------------------
+# The frames a request actually segments
+# ---------------------------------------------------------------------------
+
+def test_a_frame_no_region_registers_on_is_not_segmented(tmp_path):
+    """Both frames are oriented whatever was asked for -- the landmarks are
+    predicted in the cranial base frame and derived into the maxillary one, so
+    the measurement path needs both. But a frame no region registers on has no
+    structures, and AMASSS rightly refuses an empty list. A cranial-base-only
+    request died there, after both orientations had been paid for.
+    """
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(tmp_path, regions=[catalogs.REGION_CRANIAL_BASE]))
+    segmented = [params for name, params in sup.calls if name == "AMASSS"]
+    assert len(segmented) == 1, f"{len(segmented)} segmentations for one region"
+    assert all(params["structures"] for params in segmented)
+
+
+def test_a_longitudinal_study_orients_its_follow_up_too(tmp_path):
+    """The follow-up goes through the same frames as the baseline, and that
+    second orientation is a separate code path with no coverage of its own."""
+    sup = PipelineSup(tmp_path)
+    for patient in PATIENTS:
+        write_volume(tmp_path / "t2" / f"{patient}_T2.nii.gz")
+    run(sup=sup, **request(
+        tmp_path,
+        study=catalogs.STUDY_LONGITUDINAL,
+        t2=str(tmp_path / "t2"),
+    ))
+    oriented = [params for name, params in sup.calls if name == "ASO"]
+    assert len(oriented) == 4, "two frames, baseline and follow-up"
