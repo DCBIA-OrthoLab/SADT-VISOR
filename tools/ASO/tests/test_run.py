@@ -384,7 +384,7 @@ def test_the_run_report_names_the_unmatched_landmark_files(tmp_path):
 
     assert report["summary"]["oriented"] == 0
     assert report["unmatched_markups"] == ["P1.mrk.json"]
-    reason = report["patients"]["P1_CBCT"]["reason"]
+    reason = report["cases"]["P1_CBCT"]["reason"]
     # The file is NAMED, and so is the rule that would have paired it.
     assert "P1.mrk.json" in reason
     assert "_scan" in reason and "_lm" in reason
@@ -586,13 +586,13 @@ def test_semi_automated_cbct_end_to_end(tmp_path):
         cbct_landmarks=list(_REFERENCE_POINTS),
         output_dir=str(tmp_path / "out"),
     )
-    entry = run.report["patients"]["patient1"]
+    entry = run.report["cases"]["patient1"]
     assert entry["status"] == "ok"
-    assert set(entry["outputs"]) == {
+    assert set(entry["produced"]) == {
         "patient1_Or.nii.gz", "patient1_lm_Or.mrk.json", "patient1_Or_transform.tfm",
     }
-    assert run.report["summary"] == {"patients": 1, "oriented": 1, "failed": 0}
-    for name in entry["outputs"]:
+    assert run.report["summary"] == {"cases": 1, "oriented": 1, "failed": 0}
+    for name in entry["produced"]:
         assert os.path.getsize(os.path.join(run.output_dir, name)) > 0
 
 
@@ -634,7 +634,7 @@ def test_output_keeps_the_input_format_and_is_compressed(tmp_path, given, expect
         cbct_landmarks=list(_REFERENCE_POINTS),
         output_dir=str(tmp_path / "out"),
     )
-    assert f"patient1_Or{expected}" in run.report["patients"]["patient1"]["outputs"]
+    assert f"patient1_Or{expected}" in run.report["cases"]["patient1"]["produced"]
 
 
 def test_a_patient_without_landmarks_fails_alone(tmp_path):
@@ -651,10 +651,10 @@ def test_a_patient_without_landmarks_fails_alone(tmp_path):
         cbct_landmarks=list(_REFERENCE_POINTS),
         output_dir=str(tmp_path / "out"),
     )
-    assert run.report["patients"]["good"]["status"] == "ok"
-    assert run.report["patients"]["orphan"]["status"] == "failed"
-    assert "no landmark file" in run.report["patients"]["orphan"]["reason"]
-    assert run.report["summary"] == {"patients": 2, "oriented": 1, "failed": 1}
+    assert run.report["cases"]["good"]["status"] == "ok"
+    assert run.report["cases"]["orphan"]["status"] == "failed"
+    assert "no landmark file" in run.report["cases"]["orphan"]["reason"]
+    assert run.report["summary"] == {"cases": 2, "oriented": 1, "failed": 1}
 
 
 def test_the_output_tree_mirrors_the_input(tmp_path):
@@ -831,7 +831,7 @@ def test_fully_automated_cbct_runs_through_the_supervisor(tmp_path):
         cbct_landmarks=list(_REFERENCE_POINTS), sup=sup,
     )
     report = _report(output_dir)
-    assert report["patients"]["patient1"]["status"] == "ok"
+    assert report["cases"]["patient1"]["status"] == "ok"
     assert report["landmark_source"] == dispatch.LANDMARK_TOOL
 
 
@@ -908,7 +908,7 @@ def test_supplied_landmarks_need_no_supervisor(tmp_path):
         landmarks=str(supplied), cbct_landmarks=list(_REFERENCE_POINTS),
     )
     report = _report(output_dir)
-    assert report["patients"]["patient1"]["status"] == "ok"
+    assert report["cases"]["patient1"]["status"] == "ok"
     assert report["landmark_source"] == "supplied"
 
 
@@ -1018,7 +1018,7 @@ def test_semi_automated_cbct_from_dicom_end_to_end(tmp_path):
         cbct_landmarks=list(_REFERENCE_POINTS),
         dicom_input=True,
     )
-    assert _report(output_dir)["patients"]["patient1"]["status"] == "ok"
+    assert _report(output_dir)["cases"]["patient1"]["status"] == "ok"
     assert os.path.isfile(os.path.join(output_dir, "patient1_Or.nii.gz"))
 
 
@@ -1187,14 +1187,14 @@ def test_fully_automated_ios_end_to_end(tmp_path):
         ios_jaws=["Upper", "Lower"],
         output_dir=str(tmp_path / "out"),
     )
-    entry = run.report["patients"]["P1"]
+    entry = run.report["cases"]["P1"]
     assert entry["status"] == "ok"
     assert entry["jaws"]["Upper"]["status"] == "ok"
     assert entry["jaws"]["Lower"]["status"] == "ok"
     # Per jaw: the original wrote `<patient>_SegOr.tfm` for both, so the second
     # silently overwrote the first.
-    assert "P1_Upper_Or.tfm" in entry["outputs"]
-    assert "P1_Lower_Or.tfm" in entry["outputs"]
+    assert "P1_Upper_Or.tfm" in entry["produced"]
+    assert "P1_Lower_Or.tfm" in entry["produced"]
 
 
 def test_semi_automated_ios_end_to_end(tmp_path):
@@ -1210,10 +1210,10 @@ def test_semi_automated_ios_end_to_end(tmp_path):
         ios_jaws=["Upper", "Lower"],
         output_dir=str(tmp_path / "out"),
     )
-    entry = run.report["patients"]["P1"]
+    entry = run.report["cases"]["P1"]
     assert entry["status"] == "ok"
-    assert "P1_U_Seg_Or.vtk" in entry["outputs"]
-    assert "P1_U_lm_Or.mrk.json" in entry["outputs"]
+    assert "P1_U_Seg_Or.vtk" in entry["produced"]
+    assert "P1_U_lm_Or.mrk.json" in entry["produced"]
 
 
 def test_unsegmented_meshes_are_refused_with_the_array_names(tmp_path):
@@ -1261,9 +1261,9 @@ def test_a_mixed_batch_processes_what_it_can(tmp_path):
         ios_jaws=["Upper"],
         output_dir=str(tmp_path / "out"),
     )
-    assert run.report["patients"]["good"]["status"] == "ok"
-    assert run.report["patients"]["bad"]["status"] == "failed"
-    assert "tooth labels" in run.report["patients"]["bad"]["jaws"]["Upper"]["reason"]
+    assert run.report["cases"]["good"]["status"] == "ok"
+    assert run.report["cases"]["bad"]["status"] == "failed"
+    assert "tooth labels" in run.report["cases"]["bad"]["jaws"]["Upper"]["reason"]
 
 
 def test_occlusion_moves_both_jaws_with_one_transform(tmp_path):
@@ -1279,7 +1279,7 @@ def test_occlusion_moves_both_jaws_with_one_transform(tmp_path):
         ios_occlusion=catalogs.OCCLUSION_UPPER_DRIVES,
         output_dir=str(tmp_path / "out"),
     )
-    entry = run.report["patients"]["P1"]
+    entry = run.report["cases"]["P1"]
     assert entry["jaws"]["Lower"]["registered_on"] == "the Upper jaw's transform"
     upper = sitk.ReadTransform(os.path.join(run.output_dir, "P1_Upper_Or.tfm"))
     lower = sitk.ReadTransform(os.path.join(run.output_dir, "P1_Lower_Or.tfm"))
@@ -1404,7 +1404,7 @@ def test_the_matching_selection_runs_against_the_same_reference(tmp_path):
         cbct_landmarks=list(points),
         output_dir=str(tmp_path / "out"),
     )
-    assert run.report["patients"]["patient1"]["status"] == "ok"
+    assert run.report["cases"]["patient1"]["status"] == "ok"
     assert run.report["reference_landmarks"] == sorted(points)
 
 

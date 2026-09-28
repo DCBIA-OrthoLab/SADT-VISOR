@@ -72,5 +72,4 @@ LAYOUT = {
             for display, code in catalog.REGION_NAMES.items()
         },
     },
-    "prediction_ID": {"section": _OUTPUTS, "label": "Prediction ID"},
 }

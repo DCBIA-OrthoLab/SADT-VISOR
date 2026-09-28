@@ -103,7 +103,7 @@ def run(
             if single_roi
             else {key: os.path.basename(path) for key, path in sorted(roi_by_patient.items())}
         ),
-        "scans": {},
+        "cases": {},
         "failed": {},
         "without_a_roi": [],
     }
@@ -148,7 +148,7 @@ def run(
                 report["failed"][relative] = f"{type(error).__name__}: {error}"
                 continue
 
-            report["scans"][relative] = entry
+            report["cases"][relative] = entry
             written.append(entry.pop("_absolute"))
 
     report["summary"] = {
@@ -156,7 +156,7 @@ def run(
         "cropped": len(written),
         "failed": len(report["failed"]),
         "without_a_roi": len(report["without_a_roi"]),
-        "surfaces": sum(1 for entry in report["scans"].values() if entry.get("surface")),
+        "surfaces": sum(1 for entry in report["cases"].values() if entry.get("surface")),
     }
     report["duration_seconds"] = round(time.monotonic() - started, 2)
     (output_dir / "AutoCrop3D_report.json").write_text(json.dumps(report, indent=2))
@@ -230,7 +230,10 @@ def _crop_one(scan_path, relative, single_roi, roi_by_patient, output_dir, suffi
         "roi": os.path.basename(roi_path),
         # Relative to `output_dir`, never absolute: this report travels to the
         # client, and the server's job directory is no business of its.
-        "output": str(destination.relative_to(output_dir)),
+        # The union, as every tool of this catalogue now reports it. The
+        # cropped volume is always in it; the surface joins it below when one
+        # was written.
+        "produced": [str(destination.relative_to(output_dir))],
         "_absolute": str(destination),
         "index_lower": list(lower),
         "index_upper": list(upper),
@@ -249,6 +252,7 @@ def _crop_one(scan_path, relative, single_roi, roi_by_patient, output_dir, suffi
         )
         if labels:
             entry["surface"] = str(surface_path)
+            entry["produced"].append(str(surface_path))
             entry["surface_labels"] = labels
         else:
             # An empty crop has no surface. Said, rather than left as a missing

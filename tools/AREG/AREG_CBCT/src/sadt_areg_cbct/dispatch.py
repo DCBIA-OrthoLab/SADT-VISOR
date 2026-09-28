@@ -71,6 +71,37 @@ class RegistrationRun:
 
 
 
+# The DATA folder this tool's bundles live in, and the segmentation bundle
+# inside it. Written rather than derived, for the reason ALI_CBCT gives about
+# its own: which folder serves which engine is a DEPLOYMENT fact (AREG_CBCT,
+# AREG_IOS and AREG_IOSCBCT share `DATA/AREG/`), and a wrong guess is a folder
+# that is simply not there.
+#
+# The bundle name is the one `scripts/data-manifest.yml` unpacks AMASSS's
+# archive to for AREG, so an installation set up by `setup-models.sh` has it
+# without anybody choosing anything.
+_DATA_NAME = "AREG"
+_SEGMENTATION_BUNDLE = "AMASSS_Models"
+
+
+def _own_segmentation(data_root):
+    """The AMASSS bundle this deployment publishes for AREG, or "".
+
+    There is nothing for a clinician to decide here: the modes that segment
+    segment with AMASSS, and the only bundle that answers is the one the
+    deployment already holds. Asking which folder to use was asking a question
+    with one possible answer -- and one that a caller could get wrong in ways
+    that only surface fifteen seconds into a child process.
+
+    Returns "" rather than raising, so the single refusal below keeps saying
+    what is missing, now including where this looked.
+    """
+    if not data_root:
+        return ""
+    candidate = os.path.join(str(data_root), _DATA_NAME, "models", _SEGMENTATION_BUNDLE)
+    return candidate if os.path.isdir(candidate) else ""
+
+
 def _check_cbct(automation: str, regions: list, t1_masks, reference,
                 segmentation_model=None, sup=None, landmark_model=None) -> None:
     if not regions:
@@ -101,16 +132,11 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
                 "registering onto them, which needs an orientation reference: name "
                 "one in 'cbct_reference' (see GET /tools/AREG_CBCT/data)."
             )
-        if not landmark_model:
-            # ASO's own Fully-Automated CBCT mode refuses without it, so the run
-            # dies anyway -- but only after this tool has converted two cohorts
-            # of DICOM and started a second interpreter. `tools.orient_scans`
-            # said this was "required by _check_cbct" before it was.
-            raise ToolInputError(
-                "Oriented + Fully-Automated CBCT orients the T1 scans by predicting "
-                "landmarks on them, which needs the landmark weights: name a bundle "
-                "in 'landmark_model' (see GET /tools/AREG_CBCT/data)."
-            )
+        # `landmark_model` is NOT required here any more. Which weights the
+        # landmark tool predicts with is that tool's business -- ALI_CBCT
+        # resolves its own from the deployment's data folder, the way ASO's
+        # comment says it should -- and demanding a name here made AREG hold a
+        # name for its neighbour's storage. An explicit one is still obeyed.
 
     if not segmentation_model:
         # Named here rather than left to AMASSS, which receives None and fails on
@@ -120,15 +146,59 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
         # weights it should load.
         raise ToolInputError(
             f"{automation} CBCT segments the T1 scans before registering, which "
-            f"needs the segmentation weights: name a bundle in "
+            f"needs the segmentation weights. This deployment publishes none: "
+            f"no '{_SEGMENTATION_BUNDLE}' under DATA/{_DATA_NAME}/models/. Add it "
+            f"(scripts/setup-models.sh --tool AREG), or name another bundle in "
             f"'segmentation_model' (see GET /tools/AREG_CBCT/data)."
         )
+
+
+
+# Where the anatomical segmentations land in the caller's output. A folder of
+# their own: the registration writes one tree per region, and a mandible
+# segmentation belongs to neither of them.
+SEGMENTATION_DIRNAME = "Segmentations"
+
+
+def _collect_segmentations(amasss_dir, codes, output_dir, report) -> None:
+    """Copy the requested anatomy out of AMASSS's folder into the caller's.
+
+    AMASSS runs here as a STEP of the chain, so its output sits in the
+    supervisor's scratch and comes back only to someone who ticked
+    `keep_intermediate`. The original module writes these segmentations into
+    the user's own output folder, and a check box that produces files nobody
+    receives would be worse than no check box -- so what was asked for is
+    copied out, and only that.
+
+    The names are AMASSS's own and deterministic:
+    `<base>_<ID>_SegOut/<base>_<ID>_<CODE><extension>` (see its
+    `_assemble_scan_outputs`), which is what makes picking the requested
+    structures out of a folder holding the masks too a match rather than a
+    guess.
+    """
+    if not codes or not amasss_dir or not os.path.isdir(amasss_dir):
+        return
+    wanted = set(codes)
+    destination = os.path.join(output_dir, SEGMENTATION_DIRNAME)
+    collected = []
+    for root, _dirs, files in os.walk(amasss_dir):
+        for name in sorted(files):
+            stem = name.split(".")[0]
+            code = stem.rsplit("_", 1)[-1] if "_" in stem else ""
+            if code not in wanted:
+                continue
+            target_dir = os.path.join(destination, os.path.basename(root))
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(os.path.join(root, name), os.path.join(target_dir, name))
+            collected.append(os.path.join(SEGMENTATION_DIRNAME,
+                                          os.path.basename(root), name))
+    report["segmentations"] = sorted(collected)
 
 
 def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
-    suffix, report, sup=None, landmark_model=None,
+    suffix, report, sup=None, landmark_model=None, segmentations=None,
 ) -> None:
     # Imported here rather than at module level: the CBCT engine pulls in
     # SimpleITK and itk-elastix, and AREG must load on a server without them so
@@ -141,6 +211,13 @@ def _run_cbct(
     if dicom_input:
         t1_root = dicom.convert_tree(t1_root, os.path.join(work_dir, "dicom_t1"))
         t2_root = dicom.convert_tree(t2_root, os.path.join(work_dir, "dicom_t2"))
+
+    # Descended ONCE, here, before anything reads either folder: a hosted test
+    # entry is a whole cohort (`<name>/{T1,T2}/`) because that is all a picker
+    # can offer, and every step below -- the segmentation, the pairing, the
+    # output names -- has to be looking at the same directory.
+    t1_root = pairing.timepoint_root(t1_root, "T1")
+    t2_root = pairing.timepoint_root(t2_root, "T2")
 
     codes = [catalogs.region_code(name) for name in regions]
     report["regions"] = list(regions)
@@ -166,11 +243,17 @@ def _run_cbct(
         # Where the original looked when no mask folder was given.
         mask_roots.append(t1_root)
     else:
-        structures = [catalogs.REGION_MASK_STRUCTURES[code] for code in codes]
-        mask_roots.append(
-            tools.segment_masks(sup, t1_root, segmentation_model, structures)
-        )
+        masks = [catalogs.REGION_MASK_STRUCTURES[code] for code in codes]
+        # One AMASSS call for both: the masks the registration consumes and the
+        # anatomy the caller ticked. Asking twice would segment the same scan
+        # twice, and the card is serialised.
+        wanted = [catalogs.SEGMENTATION_CODES[name]
+                  for name in _selected(segmentations, catalogs.SEGMENTATION_CHOICES)]
+        structures = masks + [code for code in wanted if code not in masks]
+        amasss_dir = tools.segment_masks(sup, t1_root, segmentation_model, structures)
+        mask_roots.append(amasss_dir)
         report["segmented_t1"] = sorted(structures)
+        _collect_segmentations(amasss_dir, wanted, output_dir, report)
 
     # Step 3 -- pair the timepoints, then register once per region.
     matched = pairing.pair(t1_root, t2_root, suffix)
@@ -325,6 +408,7 @@ def register(
     output_suffix: str = "Reg",
     output_dir: str = None,
     sup=None,
+    segmentations=None,
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
@@ -362,6 +446,7 @@ def register(
         report=report,
         sup=sup,
         landmark_model=landmark_model,
+        segmentations=segmentations,
     )
 
     # Extracted inputs, converted DICOM, the oriented copies and whatever the
@@ -381,6 +466,7 @@ def main(
     t2,
     t1_masks=None,
     cbct_regions=None,
+    segmentations=None,
     segmentation_label=0,
     segmentation_model=None,
     cbct_reference=None,
@@ -389,6 +475,7 @@ def main(
     output_suffix="Reg",
     output_dir=None,
     sup=None,
+    data_root=None,
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -412,6 +499,10 @@ def main(
 
     regions = _selected(cbct_regions, catalogs.REGION_CHOICES)
     reference = cbct_reference
+    # Resolved BEFORE the checks, so the refusal below judges what will
+    # actually be loaded rather than what the caller happened to name.
+    if not segmentation_model:
+        segmentation_model = _own_segmentation(data_root)
     _check_cbct(
         automation, regions, t1_masks, reference, segmentation_model, sup,
         landmark_model,
@@ -431,6 +522,7 @@ def main(
         output_suffix=suffix,
         output_dir=output_dir,
         sup=sup,
+        segmentations=segmentations,
     )
 
     return run.output_dir

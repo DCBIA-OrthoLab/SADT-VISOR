@@ -87,8 +87,8 @@ def test_a_batch_reports_every_scan(tmp_path, stubbed):
 
     report = json.loads((out / "CLIC_report.json").read_text())
     assert report["summary"] == "2/2 scan(s) segmented"
-    assert sorted(s["input"] for s in report["scans"]) == ["one.nii.gz", "two.nii.gz"]
-    assert all(s["labels_present"] == [3] for s in report["scans"])
+    assert sorted(s["input"] for s in report["cases"].values()) == ["one.nii.gz", "two.nii.gz"]
+    assert all(s["labels_present"] == [3] for s in report["cases"].values())
     assert (out / "one_seg.nii.gz").exists() and (out / "two_seg.nii.gz").exists()
 
 
@@ -112,7 +112,7 @@ def test_one_bad_scan_does_not_cost_the_others(tmp_path, stubbed, monkeypatch):
 
     report = json.loads((out / "CLIC_report.json").read_text())
     assert report["summary"] == "1/2 scan(s) segmented"
-    failed = [s for s in report["scans"] if s["status"] == "failed"]
+    failed = [s for s in report["cases"].values() if s["status"] == "failed"]
     assert len(failed) == 1 and "reason" in failed[0]
 
 
@@ -128,7 +128,8 @@ def test_a_scan_with_no_detection_says_so(tmp_path, stubbed, monkeypatch):
     out = sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
                         output_dir=tmp_path / "out", device="cpu")
 
-    entry = json.loads((out / "CLIC_report.json").read_text())["scans"][0]
+    entry = next(iter(json.loads(
+        (out / "CLIC_report.json").read_text())["cases"].values()))
     assert entry["status"] == "ok"
     assert entry["detections"] == 0
     assert "no detection" in entry["note"]
@@ -206,7 +207,7 @@ def test_the_report_names_the_classes(tmp_path, stubbed):
     assert report["labels"] == {"Buccal": 1, "Bicortical": 2, "Palatal": 3}
     assert report["label_colors"]["Palatal"] == [0.6, 0.4, 0.2]
     # The stub paints label 3, and what a reader wants is the word.
-    assert report["scans"][0]["detected"] == ["Palatal"]
+    assert next(iter(report["cases"].values()))["detected"] == ["Palatal"]
 
 
 def test_a_checkpoint_of_another_shape_is_published_unnamed(tmp_path, stubbed, monkeypatch):
@@ -221,8 +222,8 @@ def test_a_checkpoint_of_another_shape_is_published_unnamed(tmp_path, stubbed, m
     report = json.loads((out / "CLIC_report.json").read_text())
     assert report["labels"] is None and report["label_colors"] is None
     assert "7 classes" in report["labels_note"]
-    assert report["scans"][0]["labels_present"] == [3]
-    assert report["scans"][0]["detected"] == []
+    assert next(iter(report["cases"].values()))["labels_present"] == [3]
+    assert next(iter(report["cases"].values()))["detected"] == []
 
 
 def test_the_installed_checkpoint_is_used_when_none_is_named(tmp_path, stubbed):

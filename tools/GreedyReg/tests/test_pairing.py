@@ -289,7 +289,7 @@ def test_the_report_carries_what_could_not_be_paired(tmp_path, greedy):
 
     report = json.loads((out / "GreedyReg_report.json").read_text())
     assert report["unmatched"] == {"t1_without_t2": ["Z9"], "t2_without_t1": ["C3"]}
-    assert report["summary"]["patients"] == 1
+    assert report["summary"]["cases"] == 1
 
 
 def test_a_previous_run_left_in_the_t1_folder_is_not_taken_for_the_scan(tmp_path, greedy):

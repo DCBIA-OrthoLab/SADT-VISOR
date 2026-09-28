@@ -330,8 +330,8 @@ def test_fully_automated_cbct_drives_ali_through_the_supervisor(tmp_path):
 
     report = json.loads((output_dir / "ASO_report.json").read_text())
     assert report["landmark_source"] == "ALI"
-    assert report["summary"] == {"patients": 1, "oriented": 1, "failed": 0}
-    patient = next(iter(report["patients"].values()))
+    assert report["summary"] == {"cases": 1, "oriented": 1, "failed": 0}
+    patient = next(iter(report["cases"].values()))
     assert sorted(patient["landmarks_used"]) == sorted(points)
     assert not patient["landmarks_dropped"]
     # Nothing of the tool's own working state survives in what the caller keeps.

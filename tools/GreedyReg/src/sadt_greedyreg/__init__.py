@@ -106,7 +106,7 @@ def run(
         "transform_type": transform_type,
         "output_suffix": output_suffix,
         "unmatched": matched.unmatched_report(),
-        "patients": {},
+        "cases": {},
     }
 
     if not matched:
@@ -168,12 +168,12 @@ def run(
         finally:
             if scratch:
                 shutil.rmtree(scratch, ignore_errors=True)
-        report["patients"][patient] = entry
+        report["cases"][patient] = entry
 
     report["summary"] = {
-        "patients": len(report["patients"]),
+        "cases": len(report["cases"]),
         "registered": registered,
-        "failed": len(report["patients"]) - registered,
+        "failed": len(report["cases"]) - registered,
     }
     report["duration_seconds"] = round(time.monotonic() - started, 2)
 
@@ -182,7 +182,7 @@ def run(
             "GreedyReg registered none of the pairs it was given. "
             + "; ".join(
                 f"{name}: {detail.get('reason', 'unknown')}"
-                for name, detail in report["patients"].items()
+                for name, detail in report["cases"].items()
             )
         )
 
@@ -280,7 +280,7 @@ def _register_one(patient, fixed, moving, output_dir, scratch, mask, init,
     # Relative to the output directory, not just the base name: a nested
     # patient's two files sit in a subfolder and a caller has to be able to
     # find them.
-    entry["outputs"] = [
+    entry["produced"] = [
         str(registered_path.relative_to(output_dir)),
         str(transform_path.relative_to(output_dir)),
     ]

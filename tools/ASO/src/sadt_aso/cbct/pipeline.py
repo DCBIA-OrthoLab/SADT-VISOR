@@ -19,7 +19,7 @@ import numpy as np
 import SimpleITK as sitk
 
 from .. import markups
-from ..scans import SCAN_EXTENSIONS, compressed_extension
+from sadt_naming import VOLUME as SCAN_EXTENSIONS, compressed_extension
 from . import icp
 
 logger = logging.getLogger(__name__)
@@ -34,6 +34,18 @@ logger = logging.getLogger(__name__)
 PATIENT_SUFFIXES = (
     "_lm_Pred", "_Scanreg", "_MERGED", "_scan", "_Scan", "_Or", "_OR", "_lm",
 )
+
+# The same markers, PUBLISHED. `describe.py` reads this name out of the source
+# and puts it in the schema, so a server that has to work out which results
+# belong to one patient -- to replay a chain for the cases a clinician marked
+# and leave the rest alone -- can do it without holding a table of its own.
+# It knows no dental tool, and this is how that stays true.
+#
+# Only the STABLE part of each marker. What this tool appends is
+# `_{output_suffix}` and what ALI appends is `_lm_{prediction_ID}`, both
+# caller-controlled: `_Or` is a default, `_lm` is the part that does not
+# move. Cutting at the earliest match handles the rest.
+OUTPUT_SUFFIXES = PATIENT_SUFFIXES
 
 # One separator character, for asking whether a suffix match ends where a token
 # ends. The same four the sibling engines split names on -- `ios/pipeline.py`'s
@@ -365,7 +377,7 @@ def orient_patient(
         "status": "ok",
         "landmarks_used": registration.used,
         "landmarks_dropped": registration.dropped,
-        "outputs": sorted(
+        "produced": sorted(
             os.path.relpath(path, output_dir)
             for path in (scan_output, landmark_output, transform_output)
         ),

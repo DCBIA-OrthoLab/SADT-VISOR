@@ -55,10 +55,72 @@ def write_mesh(path, points=None):
 
 
 def write_volume(path):
-    """A CBCT, by name. Its content is never read -- see this module's docstring."""
+    """A CBCT by name only, whose content no reader can open.
+
+    Most tests here are about the bookkeeping around the registration -- which
+    landmark file belongs to which mesh, what the report says, how a failure is
+    contained -- and for those the volume is a name. It is NOT inert any more,
+    though: `register` contours it to refine on, so a cohort built with this one
+    exercises the path where the CBCT cannot be read and the run falls back to
+    the landmarks alone. `write_contourable_volume` is the other half.
+    """
     os.makedirs(os.path.dirname(str(path)) or ".", exist_ok=True)
     with open(str(path), "wb") as handle:
         handle.write(b"\x1f\x8b not a volume")
+    return str(path)
+
+
+def write_plane(path, centre=(5.0, 5.0, 0.0), size=10.0, resolution=6):
+    """A flat, consistently wound patch of surface with usable normals.
+
+    `write_mesh` fans triangles around consecutive points, which on a flat set
+    winds neighbouring triangles against each other: the shared points then
+    average to a ZERO normal, and anything measuring along normals rejects them.
+    A test about the point-to-plane step needs a surface whose normals mean
+    something, or it pins that step's behaviour on degenerate input.
+    """
+    import pyvista as pv
+
+    patch = pv.Plane(center=centre, direction=(0.0, 0.0, 1.0),
+                     i_size=size, j_size=size,
+                     i_resolution=resolution, j_resolution=resolution)
+    os.makedirs(os.path.dirname(str(path)) or ".", exist_ok=True)
+    patch.triangulate().save(str(path), binary=True)
+    return str(path)
+
+
+def write_contourable_volume(path, box=((3.0, -2.0, 1.0), (13.0, 8.0, 11.0)),
+                             bright=1000.0, dark=-1000.0, margin=10.0):
+    """A CBCT holding one bright box, so contouring it gives a real surface.
+
+    The default box is where `write_mesh`'s arch lands once the landmark fit has
+    applied `moved`'s translation: five of that mesh's six points then sit on the
+    box's faces, which is what gives the ICP something to match and lets a test
+    assert it ran rather than only that it was called.
+
+    Two intensities and nothing between them, so the level `volume.read` works
+    out lands halfway: the landmarks read `bright` at their brightest, the band
+    it calls soft tissue is empty, and the surround falls back to `dark`.
+    """
+    import numpy as np
+    import SimpleITK as sitk
+
+    low = np.asarray(box[0], dtype=float) - margin
+    high = np.asarray(box[1], dtype=float) + margin
+    size = np.ceil(high - low).astype(int) + 1
+
+    # (k, j, i): SimpleITK indexes an array by z, y, x, the reverse of the
+    # coordinate order `low` and `size` are written in.
+    array = np.full(size[::-1], dark, dtype=np.float32)
+    start = np.floor(np.asarray(box[0], dtype=float) - low).astype(int)
+    stop = np.ceil(np.asarray(box[1], dtype=float) - low).astype(int) + 1
+    array[start[2]:stop[2], start[1]:stop[1], start[0]:stop[0]] = bright
+
+    image = sitk.GetImageFromArray(array)
+    image.SetSpacing((1.0, 1.0, 1.0))
+    image.SetOrigin(tuple(float(value) for value in low))
+    os.makedirs(os.path.dirname(str(path)) or ".", exist_ok=True)
+    sitk.WriteImage(image, str(path))
     return str(path)
 
 

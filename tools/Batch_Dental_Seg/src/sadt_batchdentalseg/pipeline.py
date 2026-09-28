@@ -38,9 +38,10 @@ from pathlib import Path
 import shutil
 import time
 
-from . import catalogs, nnunet_runner, progress
+from . import catalogs, mesh_export, nnunet_runner, progress
 from .errors import ToolInputError
-from .scans import SCAN_EXTENSIONS, compressed_extension, split_scan_extension
+from sadt_naming import (VOLUME as SCAN_EXTENSIONS, compressed_extension,
+                          split_extension as split_scan_extension)
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +222,8 @@ def segment(
     device: str = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
+    export_formats=(mesh_export.NIFTI,),
+    surface_decimation: int = 0,
 ) -> dict:
     """Segment every scan under `input_path` with one model bundle.
 
@@ -305,7 +308,7 @@ def segment(
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
-    report_scans = list(failed_conversions)
+    report_cases = {entry["case_id"]: entry for entry in failed_conversions}
     for index, (case_id, scan) in enumerate(cases.items(), start=1):
         progress.report(index, len(cases), "writing scan", start=0.9)
         entry = {"case_id": case_id, "input": _describe(scan)}
@@ -314,7 +317,7 @@ def segment(
             # Reported per scan rather than raised: one unreadable patient in a
             # cohort of forty must not lose the other thirty-nine.
             entry.update(status="failed", error="nnUNet produced no output for this scan")
-            report_scans.append(entry)
+            report_cases[case_id] = entry
             continue
 
         try:
@@ -332,23 +335,32 @@ def segment(
             )
             scan_output_dir = os.path.normpath(os.path.join(output_dir, relative))
 
-            produced = [
-                _write_segmentation(
-                    labels, os.path.join(scan_output_dir, f"{base}_{prediction_ID}{extension}")
-                )
-            ]
-            if separate_segments:
-                produced.extend(
-                    _split_segments(labels, model, base, extension, scan_output_dir, prediction_ID)
-                )
-            entry.update(status="ok", segmentations=produced)
+            produced = []
+            # `separate_segments` splits the VOLUME, so it follows NIFTI: a
+            # caller who asked for meshes only is asking for no volume, and
+            # one binary NIfTI per label is still a volume.
+            if mesh_export.NIFTI in export_formats:
+                produced.append(_write_segmentation(
+                    labels,
+                    os.path.join(scan_output_dir, f"{base}_{prediction_ID}{extension}"),
+                ))
+                if separate_segments:
+                    produced.extend(_split_segments(
+                        labels, model, base, extension, scan_output_dir, prediction_ID
+                    ))
+            produced.extend(mesh_export.write(
+                labels, model, base, scan_output_dir, prediction_ID,
+                export_formats, decimation=surface_decimation,
+            ))
+            entry.update(status="ok", produced=produced)
         except Exception as exc:  # noqa: BLE001 - one bad scan must not end the batch
             logger.exception("BatchDentalSeg: scan failed")
             entry.update(status="failed", error=f"{type(exc).__name__}: {exc}")
 
-        report_scans.append(entry)
+        report_cases[case_id] = entry
 
-    succeeded = [entry for entry in report_scans if entry.get("status") == "ok"]
+    succeeded = [entry for entry in report_cases.values()
+                 if entry.get("status") == "ok"]
     report = {
         "tool": TOOL_NAME,
         "model": model.name,
@@ -365,8 +377,13 @@ def segment(
         # segmentation must be able to see which pipeline made it.
         "gpu_resampling": bool(gpu_resampling) and device.startswith("cuda"),
         "tile_step_size": float(tile_step_size),
-        "scans": report_scans,
-        "summary": f"{len(succeeded)}/{len(report_scans)} scan(s) segmented",
+        # Both recorded for the same reason the resampling is: a mesh is a
+        # lossy view of the mask it came from, and whoever opens one has to be
+        # able to see how much of it was thrown away.
+        "export_formats": list(export_formats),
+        "surface_decimation": int(surface_decimation),
+        "cases": report_cases,
+        "summary": f"{len(succeeded)}/{len(report_cases)} scan(s) segmented",
         "duration_seconds": round(time.monotonic() - started, 2),
     }
 

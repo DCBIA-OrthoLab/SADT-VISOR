@@ -13,7 +13,8 @@ import pytest
 
 from conftest import (
     LOWER_LABELS, UPPER_LABELS, cohort, moved, read_mesh_points, read_report,
-    run_registration, tree_of, write_markups, write_mesh, write_volume,
+    run_registration, tree_of, write_contourable_volume, write_markups,
+    write_mesh, write_plane, write_volume,
 )
 from sadt_areg_ioscbct import dispatch, geometry, run
 from sadt_areg_common.errors import ToolInputError
@@ -221,33 +222,47 @@ def test_a_patient_with_only_one_modality_is_named_in_the_report(tmp_path):
     assert read_report(tmp_path / "out")["unpaired"] == {"9": "no CBCT"}
 
 
-def test_the_icp_stage_does_not_run_because_no_cbct_surface_is_sampled(tmp_path):
-    """A stated gap, pinned so it cannot become one by accident: `register_one`
-    refines by ICP only when it is handed points sampled from the CBCT, and
-    `register` never samples any. So `max_dist` is published and inert on every
-    run this tool performs today."""
+def test_the_icp_refines_on_the_cbct_the_run_was_given(tmp_path):
+    """The refinement is reached from `register`, not merely implemented.
+
+    It used to be unreachable: `register_one` refined only when handed points
+    sampled from the CBCT and `register` sampled none, so every run stopped at
+    the landmark fit -- six points placing an arch, with nothing able to notice
+    that one of them was wrong. This is the test that would have said so.
+    """
     cohort(tmp_path)
-    run_registration(tmp_path, max_dist=0.4)
-    assert read_report(tmp_path / "out")["patients"]["1"]["meshes"][
-        "P001_T2_U.vtk"
-    ]["icp"] is None
+    # A flat patch rather than the default arch, and a box with a face in its
+    # plane: the point-to-plane step measures along normals, so the moving
+    # surface has to have normals that mean something.
+    write_plane(tmp_path / "ios" / "P001_T2_U.vtk")
+    # Wide enough to hold every landmark as well as the patch: a landmark
+    # outside the bright box reads as not on a tooth, and the fit would drop it.
+    write_contourable_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz",
+                             box=((3.0, -2.0, 1.0), (23.0, 12.0, 11.0)))
+
+    run_registration(tmp_path)
+    icp = read_report(tmp_path / "out")["patients"]["1"]["meshes"][
+        "P001_T2_U.vtk"]["icp"]
+    assert icp is not None
+    assert icp["pairs"] >= 3 and icp["fitness"] > 0
+    assert icp["used_normals"] is True
 
 
-def test_the_icp_stage_does_run_when_a_surface_is_supplied(tmp_path):
-    """The other half of the same claim: the refinement is written and works,
-    it is simply not reachable from `register`."""
-    from sadt_areg_ioscbct import pipeline
+def test_a_cbct_no_reader_can_open_falls_back_to_the_landmarks_and_says_so(tmp_path):
+    """Worse than refining, better than stopping -- and never silent.
 
-    rng = np.random.default_rng(2)
-    cbct_points = rng.normal(scale=5.0, size=(200, 3))
-    mesh_points = geometry.apply(cbct_points, np.linalg.inv(np.eye(4)))
+    A volume that cannot be contoured leaves the landmark fit as the whole
+    registration, which is what this tool did on every run before the ICP was
+    wired in. It is a usable answer, so the run continues; what it must not do
+    is come back looking like a run that simply had no ICP to do.
+    """
+    cohort(tmp_path)
 
-    _matrix, report = pipeline.register_one(
-        mesh_points, UPPER_LABELS, moved(UPPER_LABELS),
-        cbct_points=cbct_points, max_dist=10.0,
-    )
-    assert report["icp"] is not None
-    assert set(report["icp"]) == {"rmse", "fitness", "iterations"}
+    run_registration(tmp_path)
+    patient = read_report(tmp_path / "out")["patients"]["1"]
+    assert patient["meshes"]["P001_T2_U.vtk"]["icp"] is None
+    assert "could not be contoured" in patient["cbct_surface_error"]
+    assert str(tmp_path) not in patient["cbct_surface_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +389,25 @@ def test_two_sites_holding_a_patient_of_the_same_name_keep_their_own_files(tmp_p
 
     run_registration(tmp_path)
     assert len(dispatch._landmarks_by_jaw(str(tmp_path / "ios_lm"))) == 2
+
+
+def test_an_arch_the_cbct_cannot_confirm_is_refused_rather_than_written(tmp_path):
+    """An ICP that matched nothing still returns a matrix.
+
+    Writing it put an untouched intraoral scan in the results folder under the
+    name of a registered one -- the worst failure this tool can have, because
+    nothing about the output says so. The floor is on the share of the arch that
+    found a match, which is the one number that sees it.
+    """
+    cohort(tmp_path)
+    write_contourable_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz",
+                             box=((3.0, -2.0, 1.0), (23.0, 12.0, 11.0)))
+    # Far from the CBCT surface and staying there: the landmark fit is a
+    # translation of a few millimetres, so it cannot bring this back.
+    write_plane(tmp_path / "ios" / "P001_T2_U.vtk", centre=(500.0, 500.0, 500.0))
+
+    with pytest.raises(RuntimeError, match="registered no mesh"):
+        run_registration(tmp_path)
+    # Nothing written is the whole point: the failure mode being guarded against
+    # is a file that looks like a registered arch and is not one.
+    assert list(tree_of(tmp_path / "out")) == []

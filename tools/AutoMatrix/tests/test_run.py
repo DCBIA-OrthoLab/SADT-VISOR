@@ -124,7 +124,7 @@ def test_a_patient_with_no_transform_is_named_not_dropped(tmp_path):
 
     report = json.loads((out / "AutoMatrix_report.json").read_text())
     assert report["without_a_transform"] == ["P2"]
-    assert list(report["patients"]) == ["P1"]
+    assert list(report["cases"]) == ["P1"]
 
 
 def test_a_transform_with_no_file_is_named_too(tmp_path):
@@ -268,7 +268,7 @@ def test_a_failure_names_the_position_and_never_the_file(tmp_path, caplog):
     assert not any("MAMP_0001" in m for m in messages), messages
 
     report = json.loads((tmp_path / "out" / "AutoMatrix_report.json").read_text())
-    assert report["patients"]["MAMP_0001"]["failed"], "the report still names it"
+    assert report["cases"]["MAMP_0001"]["failed"], "the report still names it"
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +406,7 @@ def _scanlike(path):
 
 def _outputs(out):
     report = json.loads((out / "AutoMatrix_report.json").read_text())
-    return {o["file"]: o for entry in report["patients"].values()
+    return {o["file"]: o for entry in report["cases"].values()
             for o in entry["outputs"]}
 
 

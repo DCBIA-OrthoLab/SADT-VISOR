@@ -34,6 +34,30 @@ def _own_models(data_root):
         )
     return Path(data_root) / _DATA_NAME / "models"
 
+# What this engine appends to the name it was handed, and it is a CONSTANT.
+# It used to be an argument, `prediction_ID`, defaulting to "Pred". That made
+# the marker a property of the REQUEST rather than of the tool, so nothing
+# downstream could know it: pairing a scan with its landmarks, and working out
+# which results belong to one patient, both have to strip a marker they can
+# predict. A caller wanting to label a run labels the output FOLDER, which
+# costs nobody a guess.
+#
+# Published through `OUTPUT_SUFFIXES` below, which is how the server learns it
+# without holding a table of dental names.
+PREDICTION_ID = "Pred"
+
+# Only the part that identifies the tool, not the whole written name: a file
+# is `<patient>_lm_Pred.mrk.json`, and cutting at `_lm` is what recovers the
+# patient whatever follows it.
+OUTPUT_SUFFIXES = ("_lm_Pred", "_lm")
+
+# What a reader may do with what this engine produced, and therefore whether a
+# stop after a call to it is somewhere to come BACK to. Landmarks are dragged
+# and saved back to their own file, which is the whole reason a reader is shown
+# them: an orientation computed from a bad point cannot be fixed where it is
+# looked at.
+REVIEW_KIND = "landmarks"
+
 
 def run(
     input: Path,
@@ -68,12 +92,17 @@ def run(
             "LL2R", "LR2R", "UR3OIP", "UL3OIP", "UR3RIP", "UL3RIP",
         ]
     ] = [],
-    prediction_ID: str = "Pred",
     device: Literal["cuda", "cpu"] = "cuda",
     search_seconds: float = 0.0,
     seed: int = 0,
     *,
     data_root=None,
+    # Declared even though this engine calls nobody. A supervisor is what
+    # makes a tool's environment homogeneous: every served tool is entered the
+    # same way, a checkpoint can be declared here the day one is wanted, and
+    # the server stops having two shapes of tool to reason about. Unused is
+    # the point -- it costs a keyword and buys one contract instead of two.
+    sup=None,
 ) -> Path:
     """Place anatomical landmarks on a CBCT scan.
 
@@ -95,7 +124,6 @@ def run(
             what lets a caller ask for the seven points it needs instead of
             running 58 agents to use them. Left empty, `regions` decides, which
             is what a client showing no region control relies on.
-        prediction_ID: Suffix used in output names, e.g. `scan_lm_Pred.mrk.json`.
         device: "cuda" or "cpu". CUDA falls back to CPU when no card is
             visible, with a warning.
         search_seconds: Seconds one agent may spend looking for its landmark
@@ -128,7 +156,7 @@ def run(
         output_dir=str(output_dir),
         regions=regions,
         landmarks=landmarks,
-        prediction_ID=prediction_ID,
+        prediction_ID=PREDICTION_ID,
         device=device,
         search_seconds=search_seconds,
         seed=seed,

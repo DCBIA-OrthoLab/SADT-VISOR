@@ -1,0 +1,25 @@
+[project]
+name = "sadt-naming"
+version = "0.1.0"
+description = "The naming vocabulary every tool must agree on: extensions, output markers, jaw and timepoint tokens."
+# The lowest any tool pins, so no tool is constrained by this package.
+requires-python = ">=3.9"
+# Deliberately empty, and it must stay that way. This installs into tool
+# environments whose pins are deliberately incompatible -- ALI_IOS needs torch
+# 2.11 for pytorch3d while AMASSS has no reason to move -- and anything pulled
+# in here would have to be satisfiable by all of them at once, which is the
+# constraint the split removed. The budget is `os`.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest==8.3.4"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sadt_naming"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

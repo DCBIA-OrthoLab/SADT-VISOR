@@ -243,8 +243,8 @@ def test_a_mixed_batch_splits_between_the_two_branches(tmp_path, stub_engine, mo
 
     assert report["summary"]["segmented"] == 1
     assert report["summary"]["already_segmented"] == 1
-    assert report["meshes"]["raw.vtk"]["status"] == "segmented"
-    assert report["meshes"]["done.vtk"]["status"] == "already_segmented"
+    assert report["cases"]["raw.vtk"]["status"] == "segmented"
+    assert report["cases"]["done.vtk"]["status"] == "already_segmented"
 
 
 def test_only_the_raw_meshes_are_listed_in_the_engine_csv(tmp_path, stub_engine, model_file):

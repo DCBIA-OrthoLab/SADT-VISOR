@@ -39,7 +39,8 @@ from .catalog import (
     STRUCTURE_CODES,
 )
 from .errors import ToolInputError
-from .scans import SCAN_EXTENSIONS, compressed_extension, split_scan_extension
+from sadt_naming import (VOLUME as SCAN_EXTENSIONS, compressed_extension,
+                          split_extension as split_scan_extension)
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +351,11 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
             "predicted_structures": [],
             "segmentations": [],
             "surfaces": [],
+            # The union of the two above, which is what a caller asking "what
+            # came out for this case" wants: the typed lists stay because a
+            # reader wanting only the meshes should not have to sort by
+            # extension.
+            "produced": [],
         }
         try:
             _convert_to_nifti(scan_path, os.path.join(nnunet_input, f"{case_id}_0000.nii.gz"))
@@ -449,7 +455,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
         # reported explicitly, next to the results.
         "structures_without_model": missing_structures,
         "structures_failed": failed_structures,
-        "scans": scan_records,
+        "cases": scan_records,
         "summary": {
             "total": len(scan_records),
             "processed": len(processed),
@@ -555,6 +561,7 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
     # the separate branch. Kept anyway -- the one time this happened, the run
     # was reported "ok" and the client received an archive holding nothing but
     # the report. A scan with no output must never count as processed.
+    record["produced"] = record["segmentations"] + record["surfaces"]
     if not record["segmentations"]:
         raise RuntimeError(
             f"No segmentation was written for {record['input']} (merge modes: {', '.join(merge)})."

@@ -18,6 +18,7 @@ import re
 
 import numpy as np
 import SimpleITK as sitk
+import sadt_naming
 
 from .. import catalogs, markups
 from . import icp as ios_icp
@@ -29,10 +30,12 @@ logger = logging.getLogger(__name__)
 # the substring "upper", and DEFAULTED TO LOWER when neither was found -- so a
 # maxillary scan named `patient1.vtk` was quietly registered against the
 # mandibular reference and returned as a success.
-_JAW_TOKENS = {
-    "u": "Upper", "up": "Upper", "upper": "Upper", "maxilla": "Upper", "max": "Upper",
-    "l": "Lower", "low": "Lower", "lower": "Lower", "mandible": "Lower", "mand": "Lower",
-}
+#
+# Shared, not local, and that is a widening: this tool knew ten spellings and
+# its neighbours knew thirteen and four, so `P1_MX.vtk` was read by AREG and
+# refused HERE. A clinician cannot be expected to know which tool learnt which
+# word. Nothing that worked stops working -- the table is the union.
+_JAW_TOKENS = sadt_naming.JAW_TOKENS
 
 _SPLIT = re.compile(r"[_\-.]+")
 
@@ -84,7 +87,11 @@ def patient_and_jaw(filename: str, output_suffix: str = "") -> tuple:
     stem = _strip_extension(filename)
     tokens = [token for token in _SPLIT.split(stem) if token]
     for index, token in enumerate(tokens):
-        jaw = _JAW_TOKENS.get(token.lower())
+        # `jaw_in_token`, not a lookup in the table: it also reads a jaw word
+        # with a timepoint glued to it, which is how upstream's published IOS
+        # test set is named (`A2_UpperT1.vtk`). A plain lookup found no jaw in
+        # that name and the mesh was refused.
+        jaw = sadt_naming.jaw_in_token(token)
         if jaw is None:
             continue
         before = tokens[:index]
@@ -93,7 +100,7 @@ def patient_and_jaw(filename: str, output_suffix: str = "") -> tuple:
         after = tokens[index + 1:]
         decoration = {output_suffix.lower()} if output_suffix else set()
         for offset, later in enumerate(after):
-            if _JAW_TOKENS.get(later.lower()) or later.lower() in decoration:
+            if sadt_naming.jaw_in_token(later) or later.lower() in decoration:
                 after = after[:offset]
                 break
         return "_".join(after) or stem, jaw
@@ -297,7 +304,7 @@ def orient_patient(
     rather than once per patient; without one, each call gets a fresh cache and
     still avoids re-reading a patient's own mesh.
     """
-    entry: dict = {"status": "ok", "jaws": {}, "outputs": []}
+    entry: dict = {"status": "ok", "jaws": {}, "produced": []}
     matrices: dict = {}
     cache = cache if cache is not None else FileCache()
 
@@ -341,7 +348,7 @@ def orient_patient(
                           else "landmarks")
                 ),
             }
-            entry["outputs"].extend(written)
+            entry["produced"].extend(written)
     finally:
         # This patient's meshes are of no further use, and the next one's are
         # the same size. Released even when a jaw raised something unexpected.
@@ -353,7 +360,7 @@ def orient_patient(
             f"{jaw}: {detail.get('reason', detail['status'])}"
             for jaw, detail in entry["jaws"].items()
         ) or "no jaw could be oriented"
-    entry["outputs"].sort()
+    entry["produced"].sort()
     return entry
 
 

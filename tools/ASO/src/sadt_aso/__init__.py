@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Literal
 
 
+# The argument holding one entry per case, so a caller may hand this tool
+# three patients of forty instead of all of them. Named rather than guessed:
+# it is `input` here and `scans` in the segmentation tools, and a server
+# picking the wrong one would silently drop patients from a run.
+CASE_INPUT = "input"
+
+
 def run(
     input: Path,
     reference: Path,

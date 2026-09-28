@@ -760,9 +760,14 @@ def test_the_landmark_request_asks_for_mucogingival_alone(tmp_path):
     tool, params = sup.calls[0]
     assert tool == "ALI_IOS"
     assert params["networks"] == ["Mucogingival"]
-    assert params["prediction_ID"] == "MG_Pred"
     # Not named, so ALI picks the bundle matching the input itself.
     assert "model" not in params
+    # NOT sent. This test and the caller beside it agreed with each other and
+    # not with ALI, which is why the suite stayed green while the call could
+    # only ever have failed: ALI fixed its marker at `Pred` and refuses the
+    # argument now. A test that pins a contract the callee has dropped is
+    # worse than no test -- it reports health.
+    assert "prediction_ID" not in params
 
 
 # Moved from the single AREG suite when AREG became three tools. These drive
@@ -908,3 +913,84 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
 
     assert sup.messages == []
     assert [event["message"] for event in _events(events_file)] == ["subject 1 of 1"]
+
+
+# ---------------------------------------------------------------------------
+# The bundles this deployment fills in
+# ---------------------------------------------------------------------------
+
+class TestTheModelFieldsThisEngineFillsItself:
+    """`models/` holds every AREG bundle together, around sixty checkpoints.
+
+    An unset `registration_model` arrived as that WHOLE folder, and the run died
+    on "has to name an entry holding exactly one" -- after it had segmented and
+    oriented both timepoints, so the failure cost the whole prediction. Neither
+    of these is a clinical choice, so neither is asked for any more.
+    """
+
+    def _data_root(self, tmp_path, *names):
+        for name in names:
+            (tmp_path / "AREG" / "models" / name).mkdir(parents=True)
+        return str(tmp_path)
+
+    def test_the_registration_checkpoint_is_found_under_the_data_root(self, tmp_path):
+        from sadt_areg_ios import dispatch
+
+        root = self._data_root(tmp_path, "AREG_model")
+        assert dispatch._own_bundle(root, dispatch._REGISTRATION_BUNDLE) == str(
+            tmp_path / "AREG" / "models" / "AREG_model")
+
+    def test_the_orientation_reference_is_found_the_same_way(self, tmp_path):
+        from sadt_areg_ios import dispatch
+
+        root = self._data_root(tmp_path, "IOS_Gold_files")
+        assert dispatch._own_bundle(root, dispatch._ORIENTATION_REFERENCE) == str(
+            tmp_path / "AREG" / "models" / "IOS_Gold_files")
+
+    def test_a_deployment_publishing_neither_gets_an_empty_string(self, tmp_path):
+        """Empty, not a path that does not exist: the checks downstream say what
+        is missing, and they can only do that if they are handed nothing."""
+        from sadt_areg_ios import dispatch
+
+        root = self._data_root(tmp_path)
+        assert dispatch._own_bundle(root, dispatch._REGISTRATION_BUNDLE) == ""
+        assert dispatch._own_bundle(None, dispatch._REGISTRATION_BUNDLE) == ""
+
+    def test_what_the_caller_named_wins_over_what_the_deployment_publishes(self, tmp_path):
+        """A deployment that ships a bundle must not override a caller who
+        deliberately sent another one."""
+        from sadt_areg_ios import dispatch
+
+        root = self._data_root(tmp_path, "AREG_model")
+        captured = {}
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop here")
+
+        original = dispatch.register
+        dispatch.register = spy
+        try:
+            dispatch.main(
+                automation="Semi-Automated", t1=str(tmp_path), t2=str(tmp_path),
+                registration_model="/somewhere/mine", output_dir=str(tmp_path),
+                data_root=root,
+            )
+        except RuntimeError:
+            pass
+        finally:
+            dispatch.register = original
+        assert captured.get("registration_model") == "/somewhere/mine"
+
+
+class TestTheModelFieldsAreNotOffered:
+    """Hidden, for the same reason the other two AREG engines hide theirs: a
+    field a clinician cannot answer correctly is a field that produces wrong
+    runs."""
+
+    @pytest.mark.parametrize(
+        "name", ["ios_reference", "registration_model", "mgl_model", "crown_model"])
+    def test_each_model_field_is_hidden(self, name):
+        from sadt_areg_ios.layout import LAYOUT
+
+        assert LAYOUT[name].get("hidden") is True, name

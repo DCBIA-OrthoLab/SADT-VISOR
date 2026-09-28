@@ -301,6 +301,7 @@ source = { editable = "." }
 dependencies = [
     { name = "dicom2nifti" },
     { name = "numpy" },
+    { name = "sadt-naming" },
     { name = "simpleitk" },
     { name = "vtk" },
 ]
@@ -315,6 +316,7 @@ dev = [
 requires-dist = [
     { name = "dicom2nifti", specifier = "==2.6.2" },
     { name = "numpy", specifier = "==2.3.2" },
+    { name = "sadt-naming", directory = "../../naming" },
     { name = "simpleitk", specifier = "==2.5.6" },
     { name = "vtk", specifier = "==9.6.2" },
 ]
@@ -324,6 +326,16 @@ dev = [
     { name = "pytest", specifier = "==8.3.4" },
     { name = "sadt-testkit", editable = "../../testkit" },
 ]
+
+[[package]]
+name = "sadt-naming"
+version = "0.1.0"
+source = { directory = "../../naming" }
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = "==8.3.4" }]
 
 [[package]]
 name = "sadt-testkit"

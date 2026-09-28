@@ -174,7 +174,7 @@ def test_a_batch_keeps_its_tree_so_two_patients_cannot_collide(
     )
 
     assert len(set(report["segmented_meshes"])) == 2
-    assert sorted(report["meshes"]) == [
+    assert sorted(report["cases"]) == [
         os.path.join("siteA", "arch.vtk"), os.path.join("siteB", "arch.vtk")
     ]
 
@@ -253,7 +253,7 @@ def test_a_single_mesh_lands_at_the_top_of_the_output(tmp_path, stub_engine, mod
     )
 
     assert report["segmented_meshes"] == [str(tmp_path / "out" / "arch_Seg.vtk")]
-    assert list(report["meshes"]) == ["arch.vtk"]
+    assert list(report["cases"]) == ["arch.vtk"]
 
 
 def test_writing_a_mesh_as_vtk_reads_an_stl_with_the_right_reader(tmp_path):
@@ -337,7 +337,7 @@ def test_the_report_carries_every_field_a_caller_reads(tmp_path, stub_engine, mo
     )
 
     assert set(report) == {
-        "tool", "array_name", "suffix", "numbering", "device", "meshes",
+        "tool", "array_name", "suffix", "numbering", "device", "cases",
         "segmented_meshes", "engine_available", "engine_error", "summary",
         "duration_seconds",
         # WHICH weights ran, by name: `model` may be a folder holding several,
@@ -364,7 +364,7 @@ def test_the_summary_counts_agree_with_the_per_mesh_statuses(
         output_dir=str(tmp_path / "out"),
     )
 
-    statuses = [record["status"] for record in report["meshes"].values()]
+    statuses = [record["status"] for record in report["cases"].values()]
     summary = report["summary"]
     assert summary["total"] == len(statuses)
     for status in ("segmented", "already_segmented", "engine_unavailable", "failed"):
@@ -453,9 +453,9 @@ def test_one_mesh_the_engine_could_not_write_does_not_cost_the_batch(
         "total": 2, "segmented": 1, "already_segmented": 0, "failed": 1,
         "engine_unavailable": 0,
     }
-    assert report["meshes"]["b.vtk"]["status"] == "failed"
-    assert "no output" in report["meshes"]["b.vtk"]["error"]
-    assert "output" not in report["meshes"]["b.vtk"]
+    assert report["cases"]["b.vtk"]["status"] == "failed"
+    assert "no output" in report["cases"]["b.vtk"]["error"]
+    assert "output" not in report["cases"]["b.vtk"]
 
 
 def test_a_run_that_produced_nothing_at_all_is_a_failure_not_an_empty_report(
@@ -493,7 +493,7 @@ def test_a_pass_through_batch_is_still_served_when_the_engine_is_absent(
 
     assert report["summary"]["engine_unavailable"] == 1
     assert report["summary"]["already_segmented"] == 0
-    assert report["meshes"]["arch.vtk"]["status"] == "engine_unavailable"
+    assert report["cases"]["arch.vtk"]["status"] == "engine_unavailable"
     assert len(report["segmented_meshes"]) == 1
 
 
@@ -524,7 +524,7 @@ def test_a_working_engine_reports_itself_available(tmp_path, stub_engine, model_
 
     assert report["engine_available"] is True
     assert report["engine_error"] is None
-    assert report["meshes"]["arch.vtk"]["status"] == "already_segmented"
+    assert report["cases"]["arch.vtk"]["status"] == "already_segmented"
 
 
 def test_a_raw_mesh_with_no_engine_fails_the_run_rather_than_reporting_success(

@@ -83,12 +83,15 @@ INJECTED = (SUPERVISOR, DATA_ROOT)
 # Arguments a tool never declares and the SERVER adds for it. `keep_intermediate`
 # appears on any tool that calls another (see `supervised_calls`): collecting what
 # a chain produced is the same operation every time, so it is done once in the
-# runner rather than written into each orchestrating tool.
+# runner rather than written into each orchestrating tool. `stop_after` is the
+# same shape -- the server builds it from the checkpoints a chain offers, and
+# reads a layout for it out of `injected_layout` exactly as it does for the
+# other, so a tool that has no business offering the section can say so.
 #
 # A layout may still name one. That is the whole point of publishing it here: the
 # argument is generic, but "Keep the predicted landmarks" and "Keep the labelled
 # meshes" are not, and only the tool knows which it produces.
-INJECTED_ARGUMENTS = ("keep_intermediate",)
+INJECTED_ARGUMENTS = ("keep_intermediate", "stop_after")
 
 # The docstring section that explains the arguments, in the Google style the
 # whole repository already writes. It is the ONLY place that text lives: the
@@ -453,6 +456,278 @@ def supervised_calls(src_dir):
                 )
     return sorted(names)
 
+# What a tool calls to offer a reader a place to stop. Read out of the source
+# the same way `sup.run` is, and for the same reason: the call sites are
+# inside branches only a real run reaches.
+QUALITY_CONTROL = "declareQualityControl"
+
+# What a reader may DO at a checkpoint, and therefore whether it is somewhere
+# to come BACK to. The three are the local module's, unchanged: it already
+# drew this distinction across two pipelines and it is the right one.
+#
+#   view          look at the result, then carry on. Nothing to edit here.
+#   landmarks     drag the points; they are saved back to their own file.
+#   registration  drag the scan; the move is folded into its matrix.
+#
+# `view` is the default, and that is the conservative direction: a checkpoint
+# nobody declared as editable never offers a reader a way back to it, so a
+# tool that says nothing cannot promise something it does not support.
+REVIEW_VIEW = "view"
+REVIEW_KINDS = (REVIEW_VIEW, "landmarks", "registration")
+
+
+# Which argument holds one entry per case, so a caller can hand this tool a
+# SUBSET of them.
+CASE_INPUT = "CASE_INPUT"
+
+
+def case_input(src_dir, arguments):
+    """The argument whose folder holds one entry per case, or "".
+
+    **What it is for.** A reader who marked three patients of forty wants
+    those three done again and the other thirty-seven left alone. Doing that
+    means handing the tool fewer inputs -- and which argument to narrow is
+    something no caller can work out: it is `input` here, `scans` there,
+    `meshes` elsewhere, and a registration tool has TWO. A server guessing it
+    would be guessing about every tool it serves.
+
+    So the tool says, beside the signature it belongs to:
+
+        CASE_INPUT = "scans"
+
+    Absent is the ordinary case and means "cannot be narrowed": the replay is
+    then the whole cohort, which is slower and never wrong. That is the
+    direction to fail in -- narrowing the wrong argument would silently drop
+    patients from a run.
+    """
+    for path in sorted(Path(src_dir).rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as error:
+            raise SchemaError("{}: {}".format(path, error))
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if CASE_INPUT not in [t.id for t in node.targets
+                                  if isinstance(t, ast.Name)]:
+                continue
+            if not isinstance(node.value, ast.Constant) or not isinstance(
+                    node.value.value, str):
+                raise SchemaError(
+                    "{}:{}: {} must be a string literal.".format(
+                        path.name, node.lineno, CASE_INPUT))
+            named = node.value.value
+            if named not in arguments:
+                raise SchemaError(
+                    "{}:{}: {} names {!r}, which run() does not take.".format(
+                        path.name, node.lineno, CASE_INPUT, named))
+            return named
+    return ""
+
+
+# What a reader may DO with what this tool produced, and therefore whether a
+# stop after a call to it is somewhere to come BACK to.
+REVIEW_KIND = "REVIEW_KIND"
+
+
+def review_kind(src_dir):
+    """What a reader may do with this tool's output, or "" if it says nothing.
+
+    **Why a tool declares this about ITSELF.** A checkpoint declared mid-run
+    carries its own kind -- `sup.declareQualityControl("lm", kind=...)` says
+    it on the spot. But most stops are the boundary after a CALL, named after
+    the callee, and nothing at that call site knows whether what came back can
+    be edited. The caller did not write it.
+
+    The tool that WROTE it did. ALI produces landmarks wherever it is called
+    from; ASO produces an orientation. So the fact belongs beside the code
+    that writes the files, exactly as `OUTPUT_SUFFIXES` does, and the server
+    composes `ASO/ALI_CBCT`'s kind out of ALI_CBCT's own declaration.
+
+    Declared as a module-level string literal anywhere under `src/`:
+
+        REVIEW_KIND = "landmarks"
+
+    Absent is the ordinary case and reads as `view`: a tool that says nothing
+    never offers a reader a way back to it, which is the conservative
+    direction.
+    """
+    for path in sorted(Path(src_dir).rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as error:
+            raise SchemaError("{}: {}".format(path, error))
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if REVIEW_KIND not in [t.id for t in node.targets
+                                   if isinstance(t, ast.Name)]:
+                continue
+            if (not isinstance(node.value, ast.Constant)
+                    or node.value.value not in REVIEW_KINDS):
+                raise SchemaError(
+                    "{}:{}: {} must be one of {}. Got {}.".format(
+                        path.name, node.lineno, REVIEW_KIND,
+                        ", ".join(REVIEW_KINDS), ast.dump(node.value)[:60])
+                )
+            return node.value.value
+    return ""
+
+
+# What a tool appends to the name of what it was given. ASO hands back
+# `P1_Or.nii.gz` for the `P1.nii.gz` it received; ALI hands back
+# `P1_lm_Pred.mrk.json`.
+OUTPUT_SUFFIXES = "OUTPUT_SUFFIXES"
+
+
+def output_suffixes(src_dir):
+    """The markers this tool adds to the name of the file it was handed.
+
+    **Why this is published rather than known.** The server has to work out,
+    from a folder of results, which of them are about the same patient -- to
+    replay a chain for the three cases a clinician marked and leave the other
+    thirty-seven alone. Deriving that means stripping the markers tools
+    append, and a table of those markers inside the server would be the
+    server knowing what ALI and ASO call their outputs. It knows no dental
+    tool, and that is the property the whole architecture is arranged around.
+
+    So the tool says. It is the one writing the name, it is the only place
+    the fact is not a guess, and a tool that renames its outputs updates one
+    tuple beside them instead of a table in another repository.
+
+    Declared as a module-level tuple of string literals anywhere under
+    `src/`:
+
+        OUTPUT_SUFFIXES = ("_Or", "_Or_transform", "_lm_Or")
+
+    Read by AST for the same reason `supervised_calls` is: importing a tool
+    to ask it a question costs a CUDA stack, and CI asks this on every push.
+    """
+    found = []
+    for path in sorted(Path(src_dir).rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as error:
+            raise SchemaError("{}: {}".format(path, error))
+        # Module-level sequences, so the declaration may POINT at the table a
+        # tool already keeps rather than repeat it. ASO derives the patient a
+        # file belongs to for its own pairing and has carried that tuple for
+        # as long as it has paired anything; making it write the same strings
+        # twice is how the two drift.
+        sequences = {
+            target.id: node.value
+            for node in tree.body if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+            and isinstance(node.value, (ast.Tuple, ast.List))
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if OUTPUT_SUFFIXES not in names:
+                continue
+            value = node.value
+            if isinstance(value, ast.Name):
+                value = sequences.get(value.id)
+                if value is None:
+                    raise SchemaError(
+                        "{}:{}: {} names {!r}, which is not a tuple or list "
+                        "declared at module level in this file.".format(
+                            path.name, node.lineno, OUTPUT_SUFFIXES, node.value.id)
+                    )
+            if not isinstance(value, (ast.Tuple, ast.List)):
+                raise SchemaError(
+                    "{}:{}: {} must be a tuple or list of string literals.".format(
+                        path.name, node.lineno, OUTPUT_SUFFIXES)
+                )
+            for element in value.elts:
+                if not isinstance(element, ast.Constant) or not isinstance(
+                        element.value, str):
+                    raise SchemaError(
+                        "{}:{}: every {} entry must be a string literal, so the "
+                        "server can publish it. Got {}.".format(
+                            path.name, node.lineno, OUTPUT_SUFFIXES,
+                            ast.dump(element)[:60])
+                    )
+                if not element.value.startswith("_"):
+                    # The marker is what SEPARATES it from the name, so it has
+                    # to carry the separator. Without it `Or` would cut inside
+                    # any patient whose name contains those two letters.
+                    raise SchemaError(
+                        "{}:{}: {} entry {!r} must begin with '_'.".format(
+                            path.name, node.lineno, OUTPUT_SUFFIXES, element.value)
+                    )
+                if element.value not in found:
+                    found.append(element.value)
+    # Longest first, so a caller stripping them cannot cut inside a compound:
+    # `_lm_Pred` has to be tried before `_lm`.
+    return sorted(found, key=len, reverse=True)
+
+
+def quality_controls(src_dir):
+    """Every checkpoint this tool offers a reader, in the order it declares them.
+
+    Each entry is `{"name": ..., "kind": ...}`. The kind says what a reader
+    may DO there, and therefore whether it is somewhere to come back to from
+    a later stop -- see REVIEW_KINDS.
+
+    `sup.declareQualityControl("landmarks")` says: here is a point where what
+    has been produced so far is worth looking at before the rest is built on
+    it. A chain already offers one per `sup.run()`; this is for the tool that
+    wants one in the MIDDLE of its own work, where no call boundary exists.
+
+    Sorted by nothing -- declaration order is the order they happen in, and a
+    reader picking where to stop is reading a sequence, not an index.
+
+    The name must be a literal. The same reasoning as `supervised_calls`: a
+    name this cannot see is a name the server cannot publish, and a checkbox
+    list with a hole in it reads as coverage.
+    """
+    found = []
+    for path in sorted(Path(src_dir).rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as error:
+            raise SchemaError("{}: {}".format(path, error))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if not isinstance(function, ast.Attribute) or function.attr != QUALITY_CONTROL:
+                continue
+            if not isinstance(function.value, ast.Name) or function.value.id != SUPERVISOR:
+                continue
+            if not node.args:
+                raise SchemaError(
+                    "{}:{}: {}.{}() is called with no name.".format(
+                        path.name, node.lineno, SUPERVISOR, QUALITY_CONTROL)
+                )
+            first = node.args[0]
+            if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+                raise SchemaError(
+                    "{}:{}: {}.{}()'s name must be a literal, so the server can "
+                    "publish it. Got {}.".format(
+                        path.name, node.lineno, SUPERVISOR, QUALITY_CONTROL,
+                        ast.dump(first)[:60])
+                )
+            kind = REVIEW_VIEW
+            for keyword in node.keywords:
+                if keyword.arg != "kind":
+                    continue
+                if (not isinstance(keyword.value, ast.Constant)
+                        or keyword.value.value not in REVIEW_KINDS):
+                    raise SchemaError(
+                        "{}:{}: {}.{}()'s kind must be one of {}. Got {}.".format(
+                            path.name, node.lineno, SUPERVISOR, QUALITY_CONTROL,
+                            ", ".join(REVIEW_KINDS), ast.dump(keyword.value)[:60])
+                    )
+                kind = keyword.value.value
+            if first.value not in [entry["name"] for entry in found]:
+                found.append({"name": first.value, "kind": kind})
+    return found
+
+
 def is_supervisor(name, parameter, hints):
     """Whether this parameter is the supervisor, refusing near-misses.
 
@@ -565,6 +840,62 @@ def argument_docs(doc, arguments):
             "parameters.".format(", ".join(undocumented), DOC_ARGUMENTS)
         )
     return entries
+
+
+# What a `Path` argument accepts, declared beside the layout: `ACCEPTS = {"ios":
+# SURFACE_EXTENSIONS, "cbct": catalogs.SCAN_EXTENSIONS}`.
+#
+# Not presentation, which is why it is NOT a LAYOUT key: the server carries it
+# to `ArgSpec.accepts` and refuses an upload that contradicts it. It is the
+# tool saying what it can read, in one place, and the client narrowing its file
+# dialog and its scene entries from the same sentence -- until this existed,
+# `ios` offered a folder of CBCT volumes as intraoral surfaces and the mistake
+# only surfaced as a refusal a minute into the run.
+#
+# DERIVED, never retyped: the tables already exist (`pipeline.SURFACE_EXTENSIONS`,
+# `catalogs.SCAN_EXTENSIONS`), and a second spelling of them is a second thing
+# to keep in step.
+ACCEPTS_NAME = "ACCEPTS"
+
+
+def accepts_for(module, arguments):
+    """`{argument: [".vtk", ".stl"]}` from the tool's own `ACCEPTS`, checked.
+
+    Absent is the ordinary case. Present, an argument that does not exist or is
+    not a path is a hard error: a filter naming the wrong argument narrows
+    nothing and nobody would notice.
+    """
+    declared = getattr(module, ACCEPTS_NAME, None)
+    if declared is None:
+        return {}
+    if not isinstance(declared, dict):
+        raise SchemaError("{} must be a dict of argument -> extensions.".format(ACCEPTS_NAME))
+
+    checked = {}
+    for name, extensions in declared.items():
+        where = "{}['{}']".format(ACCEPTS_NAME, name)
+        if name not in arguments:
+            raise SchemaError("{}: run() has no argument '{}'.".format(where, name))
+        if arguments[name].get("type") != "path":
+            raise SchemaError(
+                "{}: only a path argument accepts extensions; '{}' is declared as "
+                "{!r}.".format(where, name, arguments[name].get("type"))
+            )
+        if isinstance(extensions, str) or not extensions:
+            raise SchemaError(
+                "{}: expected a non-empty sequence of extensions, got {!r}.".format(
+                    where, extensions)
+            )
+        cleaned = []
+        for extension in extensions:
+            if not isinstance(extension, str) or not extension.startswith("."):
+                raise SchemaError(
+                    "{}: '{}' is not an extension -- they start with a dot.".format(
+                        where, extension)
+                )
+            cleaned.append(extension.lower())
+        checked[name] = sorted(set(cleaned))
+    return checked
 
 
 def layout_for(package, arguments):
@@ -722,6 +1053,11 @@ def describe_run(run, package=None):
     # second place to look is a second place to forget.
     for name, text in argument_docs(doc, arguments).items():
         arguments[name]["description"] = text
+    # The module `run` was defined in -- `describe_run` is handed the function,
+    # not the package, and `ACCEPTS` sits beside it.
+    for name, extensions in accepts_for(inspect.getmodule(run), arguments).items():
+        arguments[name]["extensions"] = extensions
+
     injected_layout = {}
     for name, hints in (layout_for(package, arguments).items() if package else []):
         if name in arguments:
@@ -828,6 +1164,22 @@ def main(argv=None):
             calls = supervised_calls(src_dir)
             if calls:
                 schema["calls"] = calls
+            stops = quality_controls(src_dir)
+            if stops:
+                schema["quality_controls"] = stops
+        # Outside that guard, unlike the two above: what a tool calls its
+        # outputs has nothing to do with whether it takes a supervisor, and
+        # the tool this matters most for is a LEAF. ALI drives nobody and it
+        # is its `_lm_Pred` that says which landmarks belong to which patient.
+        suffixes = output_suffixes(src_dir)
+        if suffixes:
+            schema["output_suffixes"] = suffixes
+        kind = review_kind(src_dir)
+        if kind:
+            schema["review_kind"] = kind
+        narrows = case_input(src_dir, schema.get("arguments") or {})
+        if narrows:
+            schema["case_input"] = narrows
         schema["source_hash"] = source_hash(src_dir)
     except SchemaError as error:
         sys.stderr.write("{}: {}\n".format(tool_dir.name, error))

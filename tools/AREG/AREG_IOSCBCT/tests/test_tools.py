@@ -119,8 +119,11 @@ def test_the_cbct_landmarks_are_asked_for_by_name_not_by_region(tmp_path):
     params = sup.asked("ALI_CBCT")
     assert params["landmarks"] == list(tools.CBCT_LANDMARKS)
     assert "regions" not in params
-    assert params["prediction_ID"] == "Pred"
     assert params["model"] == "/models/ali"
+    # NOT sent, and asserted rather than simply dropped: ALI fixed its marker
+    # at `Pred` precisely because a caller that moved it made the output file
+    # name unpredictable. Sending it again is an unexpected keyword now.
+    assert "prediction_ID" not in params
 
 
 def test_the_twelve_cbct_landmarks_are_three_per_quadrant():
@@ -146,8 +149,8 @@ def test_the_intraoral_request_asks_for_the_occlusal_family_alone(tmp_path):
 
     params = sup.asked("ALI_IOS")
     assert params["networks"] == ["Occlusal"]
-    assert params["prediction_ID"] == "Pred"
     assert "model" not in params
+    assert "prediction_ID" not in params
 
 
 def test_the_orientation_request_is_asos_fully_automated_cbct_mode(tmp_path):
@@ -164,9 +167,18 @@ def test_the_orientation_request_is_asos_fully_automated_cbct_mode(tmp_path):
     assert params["landmark_model"] == "/models/ali"
 
 
-def test_each_callee_writes_into_a_directory_of_its_own(tmp_path):
-    """One scratch directory shared by two callees is two tools' outputs in one
-    folder, and `find` picking whichever it reached first."""
+def test_no_callee_is_told_where_to_write(tmp_path):
+    """Where a supervised tool writes is the SUPERVISOR's business.
+
+    This used to name a scratch directory per callee, so that two of them could
+    not land in one folder. The supervisor already solves that -- it gives each
+    nested call its own slot -- and naming one instead pointed the callee AWAY
+    from that slot, which is the only place `keep_intermediate` collects from.
+    Every step then came back to the reader as "a call that wrote nowhere".
+
+    The directory each call RETURNS is what the caller reads from, so nothing
+    downstream needs the path to have been chosen here.
+    """
     sup = FakeSup(
         tmp_path,
         {
@@ -174,14 +186,14 @@ def test_each_callee_writes_into_a_directory_of_its_own(tmp_path):
             "ALI_IOS": lambda params: planted(tmp_path, "b"),
         },
     )
-    tools.label_crowns(sup, str(tmp_path / "ios"), "")
-    tools.predict_ios_landmarks(sup, str(tmp_path / "seg"), "")
+    crown = tools.label_crowns(sup, str(tmp_path / "ios"), "")
+    ios = tools.predict_ios_landmarks(sup, str(tmp_path / "seg"), "")
 
-    crown = sup.asked("Crown_Seg")["output_dir"]
-    ios = sup.asked("ALI_IOS")["output_dir"]
+    assert "output_dir" not in sup.asked("Crown_Seg")
+    assert "output_dir" not in sup.asked("ALI_IOS")
+    # And the caller still knows where each one put its files.
     assert crown != ios
     for directory in (crown, ios):
-        assert directory.startswith(str(sup.tmp))
         assert os.path.isdir(directory)
 
 

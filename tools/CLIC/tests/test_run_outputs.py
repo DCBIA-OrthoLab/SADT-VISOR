@@ -104,7 +104,7 @@ def test_two_scans_of_the_same_name_do_not_overwrite_each_other(tmp_path, stubbe
 
     report = json.loads((out / "CLIC_report.json").read_text())
     assert report["summary"] == "2/2 scan(s) segmented"
-    assert sorted(s["input"] for s in report["scans"]) == [
+    assert sorted(s["input"] for s in report["cases"].values()) == [
         "patient_A/scan.nii.gz", "patient_B/scan.nii.gz",
     ]
 
@@ -118,8 +118,9 @@ def test_the_output_mirrors_the_input_tree(tmp_path, stubbed, make_scan):
                         output_dir=tmp_path / "out", device="cpu")
 
     assert (out / "site1" / "p1" / "T1" / "scan_seg.nii.gz").exists()
-    entry = json.loads((out / "CLIC_report.json").read_text())["scans"][0]
-    assert entry["output"] == "site1/p1/T1/scan_seg.nii.gz"
+    entry = next(iter(json.loads(
+        (out / "CLIC_report.json").read_text())["cases"].values()))
+    assert entry["produced"][0] == "site1/p1/T1/scan_seg.nii.gz"
 
 
 def test_the_output_keeps_the_input_geometry(tmp_path, stubbed, make_scan):
@@ -301,7 +302,8 @@ def test_the_report_counts_the_slices(tmp_path, stubbed, make_scan):
     out = sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
                         output_dir=tmp_path / "out", device="cpu")
 
-    assert json.loads((out / "CLIC_report.json").read_text())["scans"][0]["slices"] == 11
+    assert next(iter(json.loads(
+        (out / "CLIC_report.json").read_text())["cases"].values()))["slices"] == 11
 
 
 def test_the_report_lists_the_labels_present(tmp_path, stub_network, make_scan, monkeypatch):
@@ -320,7 +322,8 @@ def test_the_report_lists_the_labels_present(tmp_path, stub_network, make_scan, 
     out = sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
                         output_dir=tmp_path / "out", device="cpu")
 
-    entry = json.loads((out / "CLIC_report.json").read_text())["scans"][0]
+    entry = next(iter(json.loads(
+        (out / "CLIC_report.json").read_text())["cases"].values()))
     assert entry["labels_present"] == [1, 3]
     assert entry["detections"] == 5
 
@@ -346,7 +349,7 @@ def test_a_four_dimensional_scan_is_a_per_scan_failure(tmp_path, stubbed, make_s
                         output_dir=tmp_path / "out", device="cpu")
 
     report = json.loads((out / "CLIC_report.json").read_text())
-    failed = [s for s in report["scans"] if s.get("status") == "failed"]
+    failed = [s for s in report["cases"].values() if s.get("status") == "failed"]
     assert [s["input"] for s in failed] == ["series.nii.gz"]
     assert "3D volume" in failed[0]["reason"]
     assert (out / "good_seg.nii.gz").exists()
@@ -373,7 +376,7 @@ def test_a_failure_reason_names_the_exception_type(tmp_path, stubbed, make_scan)
     out = sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
                         output_dir=tmp_path / "out", device="cpu")
 
-    failed = [s for s in json.loads((out / "CLIC_report.json").read_text())["scans"]
+    failed = [s for s in json.loads((out / "CLIC_report.json").read_text())["cases"].values()
               if s.get("status") == "failed"]
     assert ":" in failed[0]["reason"]
     assert failed[0]["reason"].split(":")[0].endswith("Error")

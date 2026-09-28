@@ -625,8 +625,8 @@ def test_two_concurrent_runs_do_not_share_a_temporary_file(tmp_path):
         thread.join()
 
     assert not errors
-    assert _report(jobs[0][1])["scans"]["P0_seg.nii.gz"]["surface_labels"] == [1]
-    assert _report(jobs[1][1])["scans"]["P1_seg.nii.gz"]["surface_labels"] == [2]
+    assert _report(jobs[0][1])["cases"]["P0_seg.nii.gz"]["surface_labels"] == [1]
+    assert _report(jobs[1][1])["cases"]["P1_seg.nii.gz"]["surface_labels"] == [2]
 
 
 # ===========================================================================
@@ -669,7 +669,7 @@ def test_an_empty_crop_is_reported_rather_than_left_as_a_missing_file(tmp_path):
 
     sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
 
-    entry = _report(out)["scans"]["A_seg.nii.gz"]
+    entry = _report(out)["cases"]["A_seg.nii.gz"]
     assert entry["surface"] is None and entry["surface_labels"] == []
 
 
@@ -1057,7 +1057,7 @@ def test_an_roi_larger_than_the_volume_is_clamped_and_says_so(tmp_path):
 
     sadt_autocrop3d.run(scans=scan, roi=box, output_dir=out)
 
-    entry = _report(out)["scans"]["A_scan.nii.gz"]
+    entry = _report(out)["cases"]["A_scan.nii.gz"]
     assert entry["clamped_to_the_volume"] is True
     assert entry["size"] == [20, 20, 20]
 
@@ -1188,7 +1188,7 @@ def test_a_rotated_roi_is_cropped_axis_aligned_and_the_report_says_so(tmp_path):
 
     sadt_autocrop3d.run(scans=scan, roi=box, output_dir=out)
 
-    assert _report(out)["scans"]["A_scan.nii.gz"]["roi_orientation_ignored"] is True
+    assert _report(out)["cases"]["A_scan.nii.gz"]["roi_orientation_ignored"] is True
 
 
 def test_an_unrotated_roi_is_not_flagged(tmp_path):
@@ -1199,7 +1199,7 @@ def test_an_unrotated_roi_is_not_flagged(tmp_path):
 
     sadt_autocrop3d.run(scans=scan, roi=box, output_dir=out)
 
-    assert _report(out)["scans"]["A_scan.nii.gz"]["roi_orientation_ignored"] is False
+    assert _report(out)["cases"]["A_scan.nii.gz"]["roi_orientation_ignored"] is False
 
 
 def test_a_signed_axis_permutation_is_not_flagged(tmp_path):
@@ -1213,7 +1213,7 @@ def test_a_signed_axis_permutation_is_not_flagged(tmp_path):
 
     sadt_autocrop3d.run(scans=scan, roi=box, output_dir=out)
 
-    assert _report(out)["scans"]["A_scan.nii.gz"]["roi_orientation_ignored"] is False
+    assert _report(out)["cases"]["A_scan.nii.gz"]["roi_orientation_ignored"] is False
 
 
 def test_an_roi_with_no_coordinate_system_field_is_read_as_lps(tmp_path):
@@ -1314,8 +1314,8 @@ def test_the_report_names_every_scan_and_the_roi_it_used(tmp_path):
     sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
 
     report = _report(out)
-    assert report["scans"]["A_scan.nii.gz"]["roi"] == "A_ROI.mrk.json"
-    assert report["scans"]["B_scan.nii.gz"]["roi"] == "B_ROI.mrk.json"
+    assert report["cases"]["A_scan.nii.gz"]["roi"] == "A_ROI.mrk.json"
+    assert report["cases"]["B_scan.nii.gz"]["roi"] == "B_ROI.mrk.json"
     assert report["summary"]["cropped"] == 2
 
 
@@ -1326,7 +1326,7 @@ def test_the_report_records_the_index_bounds_that_were_used(tmp_path):
 
     sadt_autocrop3d.run(scans=scan, roi=box, output_dir=out)
 
-    entry = _report(out)["scans"]["A_scan.nii.gz"]
+    entry = _report(out)["cases"]["A_scan.nii.gz"]
     # The box spans physical 3.5..7.5, truncated toward zero to 3..7.
     assert entry["index_lower"] == [3, 3, 3] and entry["index_upper"] == [7, 7, 7]
 
@@ -1435,7 +1435,7 @@ def test_the_report_names_outputs_relative_to_the_output_folder(tmp_path):
     sadt_autocrop3d.run(scans=scans, roi=roi, output_dir=output_dir)
 
     report = _report(output_dir)
-    for entry in report["scans"].values():
-        assert not os.path.isabs(entry["output"]), entry["output"]
-        assert (output_dir / entry["output"]).is_file()
+    for entry in report["cases"].values():
+        assert not os.path.isabs(entry["produced"][0]), entry["produced"][0]
+        assert (output_dir / entry["produced"][0]).is_file()
         assert "_absolute" not in entry

@@ -101,7 +101,7 @@ def run(
         "content": content,
         "reference": os.path.basename(str(reference)) if reference else None,
         "output_suffix": output_suffix,
-        "patients": {},
+        "cases": {},
         "without_a_transform": sorted(set(subjects) - set(by_patient)),
         "transforms_without_a_file": sorted(set(by_patient) - set(subjects)),
     }
@@ -121,7 +121,11 @@ def run(
             # whose patient had no transform without a word, so a run could
             # transform 3 of 40 and look complete.
             continue
-        entry = {"transforms": [os.path.basename(m) for m in matrices], "outputs": []}
+        # `outputs` keeps its per-file detail -- how many points each move
+        # touched -- and `produced` is the flat list of names beside it, which
+        # is what every tool of this catalogue now answers.
+        entry = {"transforms": [os.path.basename(m) for m in matrices],
+                 "outputs": [], "produced": []}
         subject_files = subjects[patient]
         for file_index, path in enumerate(subject_files, start=1):
             for matrix in matrices:
@@ -149,10 +153,10 @@ def run(
                     entry.setdefault("failed", []).append(
                         f"{os.path.basename(path)}: {type(exc).__name__}: {exc}"
                     )
-        report["patients"][patient] = entry
+        report["cases"][patient] = entry
 
     report["summary"] = {
-        "patients": len(report["patients"]),
+        "cases": len(report["cases"]),
         "files_written": len(written),
     }
     report["duration_seconds"] = round(time.monotonic() - started, 2)
@@ -164,7 +168,7 @@ def run(
         # could not read behind "0 file(s) had no transform".
         failures = [
             message
-            for detail in report["patients"].values()
+            for detail in report["cases"].values()
             for message in detail.get("failed", [])
         ]
         raise ValueError(
@@ -325,6 +329,7 @@ def _apply_one(path, matrix, input_root, output_dir, reference, content,
         destination = destination.parent / f"{_with_tail(stem, tail)}.mrk.json"
         moved = apply_to_landmarks(path, transform, str(destination))
         entry["outputs"].append({"file": destination.name, "points_moved": moved})
+        entry["produced"].append(destination.name)
         return str(destination)
 
     for extension in IMAGE_EXTENSIONS:

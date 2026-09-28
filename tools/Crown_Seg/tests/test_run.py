@@ -214,7 +214,7 @@ def test_a_batch_keeps_its_tree(tmp_path, stub_shapeaxi):
     # other and the caller would silently get half its cohort back.
     assert len(report["segmented_meshes"]) == 2
     assert len(set(report["segmented_meshes"])) == 2
-    assert sorted(report["meshes"]) == [
+    assert sorted(report["cases"]) == [
         os.path.join("siteA", "arch.vtk"), os.path.join("siteB", "arch.vtk")
     ]
 

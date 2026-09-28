@@ -344,7 +344,7 @@ def predict_landmarks(
             "status": "pending",
             "landmarks_found": [],
             "landmarks_failed": {},
-            "files": [],
+            "produced": [],
         }
         scan_reports[key] = record
         scan_started = time.monotonic()
@@ -458,7 +458,7 @@ def predict_landmarks(
         # Kept apart because the fix differs.
         "landmarks_without_model": without_model,
         "landmarks_ungrouped": ungrouped,
-        "scans": scan_reports,
+        "cases": scan_reports,
         "summary": {
             "total": len(scan_reports),
             "processed": len(processed),
@@ -571,4 +571,4 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
         os.path.dirname(key),
         f"{scan_stem(os.path.basename(scan_path))}_lm_{prediction_ID}{MARKUPS_EXTENSION}",
     )
-    record["files"].append(write_markups(positions, destination))
+    record["produced"].append(write_markups(positions, destination))

@@ -21,6 +21,15 @@ from typing import Literal
 from .dispatch import main
 
 
+# `t1`, `t2` and `t1_masks` deliberately declare NO extensions, and it is not
+# an omission. The AREG facade composes this engine with the intraoral one, and
+# `t1` there is a SURFACE: declaring volumes here made the two disagree about
+# what one name means, and the facade -- rightly -- refused to publish at all
+# ("'AREG' cannot publish 't1'"). Saying what this engine reads needs an
+# `accepts` the facade can vary per MODE, the same capability its file pickers
+# need to be scoped per mode. Until then the engine's own panel filters
+# nothing, and `pairing.is_scan_file` is what actually decides.
+
 def run(
     t1: Path,
     t2: Path,
@@ -36,6 +45,16 @@ def run(
         Literal["Cranial base", "Mandible", "Maxilla"]
     ] = ["Cranial base"],
     t1_masks: Path = "",
+    # The second group of boxes the original module shows, and it is NOT the
+    # regions above: those decide what the registration is masked to, these
+    # decide what comes back to look at. Spelled out for the same reason
+    # `regions` is -- `Literal` cannot be built from the catalog.
+    segmentations: list[
+        Literal[
+            "Cranial base", "Cervical vertebra", "Mandible", "Maxilla",
+            "Skin", "Upper airway",
+        ]
+    ] = [],
     segmentation_model: Path = "",
     segmentation_label: int = 0,
     reference: Path = "",
@@ -44,6 +63,7 @@ def run(
     output_suffix: str = "Reg",
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Register a follow-up CBCT onto its baseline, so the two can be compared.
 
@@ -60,7 +80,15 @@ def run(
             timepoints. The one argument a clinician must actually think about.
         t1_masks: Your own T1 segmentation masks, instead of having them
             segmented for you.
+        segmentations: Anatomy to segment and return beside the registration,
+            for the modes that segment. Independent of `regions`: ticking the
+            skin does not register on it, and registering on the mandible does
+            not return a mandible you can open. None by default -- a
+            registration run returns a registration.
         segmentation_model: The mask model bundle, for the modes that segment.
+            Left empty -- which is what a panel sends -- the AMASSS bundle this
+            deployment publishes for AREG is used, there being no second answer
+            to the question.
         segmentation_label: Which label value in the masks to register on.
         reference: The frame the scans are oriented onto before registering.
         landmark_model: The landmark bundle that orientation step predicts
@@ -80,6 +108,7 @@ def run(
         automation=automation,
         cbct_regions=regions,
         t1_masks=t1_masks,
+        segmentations=segmentations,
         segmentation_model=segmentation_model,
         segmentation_label=segmentation_label,
         cbct_reference=reference,
@@ -87,4 +116,5 @@ def run(
         dicom_input=dicom_input,
         output_suffix=output_suffix,
         sup=sup,
+        data_root=data_root,
     )

@@ -745,6 +745,169 @@ def test_a_required_tool_named_in_a_loop_is_published(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Quality control: where a reader may be stopped
+
+DECLARES_ONE = """
+    def run(scan: Path, *, sup=None) -> Path:
+        \"\"\"Segment a scan.
+
+        Args:
+            scan: The scan to segment.
+        \"\"\"
+        sup.declareQualityControl("after the crop")
+        return scan
+"""
+
+DECLARES_SEVERAL = """
+    def run(scan: Path, *, sup=None) -> Path:
+        \"\"\"Orient a scan.
+
+        Args:
+            scan: The scan to orient.
+        \"\"\"
+        sup.declareQualityControl("landmarks")
+        if scan.name:
+            sup.run("ASO", scan=scan)
+        sup.declareQualityControl("orientation")
+        sup.declareQualityControl("landmarks")
+        return scan
+"""
+
+DECLARES_A_VARIABLE = """
+    def run(scan: Path, name: str = "x", *, sup=None) -> Path:
+        \"\"\"Do something.
+
+        Args:
+            scan: The scan.
+            name: Where to stop.
+        \"\"\"
+        sup.declareQualityControl(name)
+        return scan
+"""
+
+
+def test_a_declared_checkpoint_is_published(tmp_path):
+    """A tool offering a stop in the MIDDLE of its own work, where no
+    `sup.run()` boundary exists. AMASSS segmenting five structures calls
+    nobody and still has a moment worth looking at."""
+    schema = json.loads(describe(make_tool(tmp_path, DECLARES_ONE)).stdout)
+    assert schema["quality_controls"] == [
+        {"name": "after the crop", "kind": "view"}
+    ], "a checkpoint that says nothing is somewhere to LOOK, not to come back to"
+
+
+def test_they_keep_declaration_order_and_do_not_repeat(tmp_path):
+    """Declaration order is the order they happen in; a reader choosing where
+    to stop is reading a sequence, not an index."""
+    schema = json.loads(describe(make_tool(tmp_path, DECLARES_SEVERAL)).stdout)
+    assert [entry["name"] for entry in schema["quality_controls"]] == [
+        "landmarks", "orientation"]
+    assert schema["calls"] == ["ASO"], "the two are published side by side"
+
+
+DECLARES_A_KIND = """
+    def run(scan: Path, *, sup=None) -> Path:
+        \"\"\"Segment a scan.
+
+        Args:
+            scan: The scan to segment.
+        \"\"\"
+        sup.declareQualityControl("the landmarks", kind="landmarks")
+        return scan
+"""
+
+DECLARES_A_BAD_KIND = """
+    def run(scan: Path, *, sup=None) -> Path:
+        \"\"\"Segment a scan.
+
+        Args:
+            scan: The scan to segment.
+        \"\"\"
+        sup.declareQualityControl("the landmarks", kind="editable")
+        return scan
+"""
+
+
+def test_a_checkpoint_says_what_may_be_edited_there(tmp_path):
+    """Which is what decides whether a reader can come BACK to it from a
+    later stop. Looking at a bad orientation is useless without a way back to
+    the landmarks that caused it."""
+    schema = json.loads(describe(make_tool(tmp_path, DECLARES_A_KIND)).stdout)
+    assert schema["quality_controls"] == [
+        {"name": "the landmarks", "kind": "landmarks"}
+    ]
+
+
+def test_a_kind_no_reviewer_implements_is_refused(tmp_path):
+    """The three kinds are what the reviewer knows how to put on screen. A
+    fourth would publish a checkpoint promising an edit nothing can make."""
+    completed = describe(make_tool(tmp_path, DECLARES_A_BAD_KIND))
+    assert completed.returncode != 0
+    assert "kind must be one of" in completed.stderr
+
+
+NAMES_ITS_OUTPUTS = """
+    OUTPUT_SUFFIXES = ("_Or", "_lm_Or", "_Or_transform")
+
+    def run(scan: Path) -> Path:
+        \"\"\"Orient a scan.
+
+        Args:
+            scan: The scan to orient.
+        \"\"\"
+        return scan
+"""
+
+NAMES_THEM_WITHOUT_A_SEPARATOR = """
+    OUTPUT_SUFFIXES = ("Or",)
+
+    def run(scan: Path) -> Path:
+        \"\"\"Orient a scan.
+
+        Args:
+            scan: The scan to orient.
+        \"\"\"
+        return scan
+"""
+
+
+def test_a_tool_says_what_it_appends_to_a_name(tmp_path):
+    """The server has to know which results are about one patient, to replay
+    a chain for the cases a clinician marked. It must not learn that from a
+    table of its own: it knows no dental tool. So the tool says."""
+    schema = json.loads(describe(make_tool(tmp_path, NAMES_ITS_OUTPUTS)).stdout)
+    assert schema["output_suffixes"] == ["_Or_transform", "_lm_Or", "_Or"], (
+        "longest first, or a caller strips `_Or` from inside `_Or_transform`"
+    )
+
+
+def test_a_marker_that_does_not_separate_is_refused(tmp_path):
+    """`Or` without its underscore cuts inside any patient whose name holds
+    those two letters."""
+    completed = describe(make_tool(tmp_path, NAMES_THEM_WITHOUT_A_SEPARATOR))
+    assert completed.returncode != 0
+    assert "must begin with" in completed.stderr
+
+
+def test_a_tool_that_names_nothing_publishes_no_key(tmp_path):
+    schema = json.loads(describe(make_tool(tmp_path, GOOD)).stdout)
+    assert "output_suffixes" not in schema
+
+
+def test_a_tool_that_declares_none_publishes_no_key(tmp_path):
+    schema = json.loads(describe(make_tool(tmp_path, SUPERVISED)).stdout)
+    assert "quality_controls" not in schema
+
+
+def test_a_name_the_generator_cannot_read_is_refused(tmp_path):
+    """The same rule as a call name: a name this cannot see is a name the
+    server cannot publish, and a list with a hole in it reads as coverage."""
+    completed = describe(make_tool(tmp_path, DECLARES_A_VARIABLE))
+    assert completed.returncode != 0
+    assert "literal" in completed.stderr
+
+
+# ---------------------------------------------------------------------------
 # vec2: two numbers set together
 
 VEC2 = """
@@ -803,3 +966,68 @@ def test_a_three_number_tuple_is_refused_rather_than_published(tmp_path):
 
     assert result.returncode != 0
     assert "tuple[float, float]" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# ACCEPTS: what a path argument can read
+# ---------------------------------------------------------------------------
+ACCEPTS_BODY = """
+    ACCEPTS = {"ios": (".VTK", ".stl", ".vtk")}
+
+
+    def run(ios: Path, output_dir: Path) -> Path:
+        \"\"\"One line.
+
+        Args:
+            ios: The surfaces.
+            output_dir: Where to write.
+
+        Returns:
+            The output directory.
+        \"\"\"
+        return output_dir
+"""
+
+
+def test_a_tool_says_what_each_path_argument_accepts(tmp_path):
+    """Until this existed, the intraoral picker offered a folder of CBCT
+    volumes: the tool knew what it could read and had no way to publish it."""
+    tool = make_tool(tmp_path, ACCEPTS_BODY)
+
+    result = describe(tool)
+
+    assert result.returncode == 0, result.stderr
+    # Normalised: lowercased, de-duplicated, sorted -- a filter is compared
+    # against a file name, not read aloud.
+    assert json.loads(result.stdout)["arguments"]["ios"]["extensions"] == [".stl", ".vtk"]
+
+
+def test_an_accepts_naming_an_unknown_argument_is_refused(tmp_path):
+    """A filter on an argument that does not exist narrows nothing, and nothing
+    would ever say so."""
+    tool = make_tool(tmp_path, ACCEPTS_BODY.replace('"ios":', '"nope":'))
+
+    result = describe(tool)
+
+    assert result.returncode != 0
+    assert "no argument 'nope'" in result.stderr, result.stderr
+
+
+def test_only_a_path_argument_accepts_extensions(tmp_path):
+    """The server carries this to `ArgSpec.accepts` and refuses an upload that
+    contradicts it, so it has to describe something uploadable."""
+    tool = make_tool(tmp_path, ACCEPTS_BODY.replace("run(ios: Path,", "run(ios: str,"))
+
+    result = describe(tool)
+
+    assert result.returncode != 0
+    assert "only a path argument" in result.stderr, result.stderr
+
+
+def test_something_that_is_not_an_extension_is_refused(tmp_path):
+    tool = make_tool(tmp_path, ACCEPTS_BODY.replace('".vtk"', '"vtk"'))
+
+    result = describe(tool)
+
+    assert result.returncode != 0
+    assert "not an extension" in result.stderr, result.stderr

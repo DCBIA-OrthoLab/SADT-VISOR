@@ -129,7 +129,7 @@ def test_a_batch_registers_every_pair(tmp_path, stubbed):
                              output_dir=tmp_path / "out")
 
     report = json.loads((out / "GreedyReg_report.json").read_text())
-    assert report["summary"] == {"patients": 2, "registered": 2, "failed": 0}
+    assert report["summary"] == {"cases": 2, "registered": 2, "failed": 0}
     assert (out / "A1_registered.nii.gz").exists()
     assert (out / "A1_transform.mat").exists()
 
@@ -159,10 +159,10 @@ def test_one_patient_failing_does_not_cost_the_others(tmp_path, stubbed, monkeyp
                              output_dir=tmp_path / "out")
 
     report = json.loads((out / "GreedyReg_report.json").read_text())
-    assert report["summary"] == {"patients": 2, "registered": 1, "failed": 1}
-    assert report["patients"]["B2"]["status"] == "failed"
-    assert "convergence" in report["patients"]["B2"]["reason"]
-    assert report["patients"]["A1"]["status"] == "ok"
+    assert report["summary"] == {"cases": 2, "registered": 1, "failed": 1}
+    assert report["cases"]["B2"]["status"] == "failed"
+    assert "convergence" in report["cases"]["B2"]["reason"]
+    assert report["cases"]["A1"]["status"] == "ok"
 
 
 def test_no_pair_at_all_is_refused(tmp_path, stubbed):
@@ -275,4 +275,4 @@ def test_a_failure_names_the_position_and_never_the_patient(
     assert not any("MAMP_0001" in m for m in messages), messages
 
     report = json.loads((tmp_path / "out" / "GreedyReg_report.json").read_text())
-    assert report["patients"]["MAMP_0001"]["status"] == "failed"
+    assert report["cases"]["MAMP_0001"]["status"] == "failed"

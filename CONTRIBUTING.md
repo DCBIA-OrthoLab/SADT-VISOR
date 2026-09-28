@@ -582,6 +582,24 @@ repository for convenience and share no dependency resolution. For the same
 reason there is no shared `sadt-core` package -- small helpers like `iter_scans`
 are copied between tools on purpose.
 
+**What IS shared is a contract, never a helper**, and the line between them is
+the one drawn above: a helper is internal and may drift without anyone being
+misled, while a contract is what the outside world sees. Two exist.
+`tools/<family>/common/` holds what one family must not disagree about, and
+`naming/` (`sadt-naming`) holds the file-format vocabulary -- which
+extensions are a volume, a surface, a markups file -- because that is a
+property of NIfTI and VTK rather than of any tool, and duplicating it is what
+let ALI advertise `.stl` and silently ignore it. Before it existed there were
+four byte-identical copies of the scan vocabulary and five different values of
+`SURFACE_EXTENSIONS` under one name, with nothing saying which difference was
+a decision.
+
+A tool that reads LESS than a format still says so beside itself -- the table
+states what the format is, not what a tool handles, and advertising more than
+you read is the original bug. What a tool must not do is write the list again.
+
+A shared package declares **no dependencies**; see below.
+
 Commit `uv.lock`. CI runs `uv sync --frozen`, which fails if it is stale.
 
 ## 6. Validate

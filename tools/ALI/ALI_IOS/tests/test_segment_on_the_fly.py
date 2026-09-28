@@ -140,11 +140,12 @@ def crown_seg(failed=(), seen=None):
                     os.path.splitext(os.path.basename(key))[0] + "_Seg.vtk",
                 )
                 write_surface(produced, labelled=True)
-                records[key] = {"status": "segmented", "output": produced}
+                records[key] = {"status": "segmented", "input": key,
+                                "produced": [produced]}
 
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "run_report.json"), "w", encoding="utf-8") as handle:
-            json.dump({"tool": "Crown_Seg", "meshes": records}, handle)
+            json.dump({"tool": "Crown_Seg", "cases": records}, handle)
         return output_dir
 
     return make
@@ -177,14 +178,14 @@ def stub_engine(monkeypatch):
             "networks": ["Occlusal"],
             "landmarks_without_model": [],
             "models_unrecognized": [],
-            "scans": {
+            "cases": {
                 key: {
                     "input": os.path.basename(path),
                     "status": "ok",
                     "landmarks_found": ["UR1O"],
                     "landmarks_failed": {},
                     "jaws_without_model": {},
-                    "files": [],
+                    "produced": [],
                     "duration_seconds": 0.1,
                 }
                 for path, key in meshes
@@ -293,7 +294,7 @@ def test_the_run_report_names_the_meshes_segmented_on_the_fly(tmp_path, stub_eng
 
     report = json.loads((output / dispatch.REPORT_NAME).read_text())
     assert report["segmented_on_the_fly"] == ["c_raw.vtk"]
-    assert sorted(report["scans"]) == ["a_ready.vtk", "b_ready.vtk", "c_raw.vtk"]
+    assert sorted(report["cases"]) == ["a_ready.vtk", "b_ready.vtk", "c_raw.vtk"]
     assert report["summary"] == {"total": 3, "processed": 3, "failed": 0}
 
 
@@ -358,9 +359,9 @@ def test_one_unsegmentable_mesh_does_not_sink_the_batch(tmp_path, stub_engine):
     assert report["segmented_on_the_fly"] == ["c_raw.vtk"]
     assert report["summary"] == {"total": 3, "processed": 2, "failed": 1}
     # Reported as that one mesh failing, with the reason its own tool gave.
-    assert report["scans"]["b_raw.vtk"]["status"] == "failed"
-    assert "no output" in report["scans"]["b_raw.vtk"]["error"]
-    assert report["scans"]["c_raw.vtk"]["status"] == "ok"
+    assert report["cases"]["b_raw.vtk"]["status"] == "failed"
+    assert "no output" in report["cases"]["b_raw.vtk"]["error"]
+    assert report["cases"]["c_raw.vtk"]["status"] == "ok"
 
 
 def test_a_failed_segmentation_keeps_the_landmarks_already_written(tmp_path, stub_engine):
@@ -381,7 +382,7 @@ def test_a_failed_segmentation_keeps_the_landmarks_already_written(tmp_path, stu
     assert report["summary"] == {"total": 3, "processed": 2, "failed": 1}
     assert report["segmented_on_the_fly"] == []
     # The reason travels to the mesh it cost, rather than to the server log.
-    assert "no crown-segmentation checkpoint" in report["scans"]["c_raw.vtk"]["error"]
+    assert "no crown-segmentation checkpoint" in report["cases"]["c_raw.vtk"]["error"]
 
 
 def test_a_batch_that_is_only_unsegmentable_meshes_fails_with_the_reason(tmp_path, stub_engine):
@@ -417,9 +418,9 @@ def test_a_pass_that_produces_nothing_does_not_cost_the_other(tmp_path, monkeypa
             "mode": "IOS", "device": device, "prediction_ID": prediction_ID,
             "networks": ["Occlusal"], "landmarks_without_model": [],
             "models_unrecognized": [],
-            "scans": {key: {"input": os.path.basename(path), "status": "ok",
+            "cases": {key: {"input": os.path.basename(path), "status": "ok",
                             "landmarks_found": ["UR1O"], "landmarks_failed": {},
-                            "jaws_without_model": {}, "files": [],
+                            "jaws_without_model": {}, "produced": [],
                             "duration_seconds": 0.1}
                       for path, key in meshes},
             "summary": {"total": len(meshes), "processed": len(meshes), "failed": 0},
@@ -433,7 +434,7 @@ def test_a_pass_that_produces_nothing_does_not_cost_the_other(tmp_path, monkeypa
         output_dir=output, sup=FakeSup(tmp_path, {"Crown_Seg": crown_seg()}))
 
     report = json.loads((output / dispatch.REPORT_NAME).read_text())
-    assert report["scans"]["c_raw.vtk"]["status"] == "ok"
+    assert report["cases"]["c_raw.vtk"]["status"] == "ok"
     assert report["summary"]["total"] == 1, "only the pass that produced anything is reported"
 
 
@@ -502,8 +503,8 @@ def test_one_unreadable_mesh_does_not_sink_the_batch(tmp_path, stub_engine):
     run(input=cohort, model=Path(a_bundle(tmp_path)), output_dir=output, sup=sup)
 
     report = json.loads((output / dispatch.REPORT_NAME).read_text())
-    assert report["scans"]["good.vtk"]["status"] == "ok"
-    assert report["scans"]["corrupt.vtk"]["status"] == "failed"
+    assert report["cases"]["good.vtk"]["status"] == "ok"
+    assert report["cases"]["corrupt.vtk"]["status"] == "failed"
     # The engine was asked about the readable mesh, and only about it.
     assert [key for _path, key in stub_engine[0]] == ["good.vtk"]
 

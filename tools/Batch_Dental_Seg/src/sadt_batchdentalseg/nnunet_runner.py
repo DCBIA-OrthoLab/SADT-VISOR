@@ -27,6 +27,7 @@ import inspect
 import logging
 import os
 
+from . import low_memory
 from .errors import ModelNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -181,6 +182,10 @@ def _enable_gpu_resampling(predictor, device: str) -> bool:
     for key in _RESAMPLING_KEYS:
         getattr(manager_class, key).fget.cache_clear()
 
+    # And then the probabilities end is narrowed further: same arithmetic,
+    # one class at a time, so the card never holds the whole block. See
+    # low_memory.py for why that is exact rather than approximate.
+    low_memory.install(predictor)
     return True
 
 

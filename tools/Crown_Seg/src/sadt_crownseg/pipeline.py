@@ -494,11 +494,14 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
         # been done". `engine_error` holds the reason.
         #
         # Putting it in the status rather than only in a field further down is
-        # the right PLACE, not a guarantee it is seen: nothing reads this
-        # report today, CrownSeg having no client module at all.
+        # the right PLACE, not a guarantee it is seen. `ALI_IOS` DOES read
+        # this report -- it is how it tells a mesh that was labelled from one
+        # that could not be -- so the vocabulary here is a contract, not a
+        # note for a human.
         records[relative] = {
             "status": "already_segmented" if engine_available else "engine_unavailable",
-            "output": destination,
+            "input": relative,
+            "produced": [destination],
         }
         produced.append(destination)
 
@@ -532,12 +535,15 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
             relative = os.path.relpath(mesh, input_root)
             predicted = _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
             if os.path.isfile(predicted):
-                records[relative] = {"status": "segmented", "output": predicted}
+                records[relative] = {"status": "segmented", "input": relative,
+                                     "produced": [predicted]}
                 produced.append(predicted)
             else:
                 # One mesh shapeaxi could not write must not cost the batch.
                 records[relative] = {
                     "status": "failed",
+                    "input": relative,
+                    "produced": [],
                     "error": "the segmentation produced no output for this mesh",
                 }
 
@@ -554,7 +560,7 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
         "suffix": suffix,
         "numbering": "FDI" if fdi else "Universal",
         "device": device if to_segment else None,
-        "meshes": records,
+        "cases": records,
         # Absolute paths of every mesh that now carries tooth labels, whether
         # this run produced them or found them already labelled. This is what a
         # caller sequencing CrownSeg before ALI reads.

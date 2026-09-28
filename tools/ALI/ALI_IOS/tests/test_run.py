@@ -254,12 +254,22 @@ def test_the_published_devices_are_the_two_the_engine_resolves():
     assert _choices("device") == ["cuda", "cpu"]
 
 
-def test_the_prediction_id_default_is_the_one_the_engine_falls_back_to():
-    """Declared twice -- in the signature and in `predict_landmarks` -- so a
-    direct API call and an HTTP one name their files the same way."""
+def test_the_marker_is_constant_and_no_caller_can_move_it():
+    """It was an argument, `prediction_ID`, defaulting to "Pred", and that
+    made the marker a property of the REQUEST: nothing downstream could
+    predict it, while pairing a scan with its landmarks and grouping results
+    by patient both have to strip a marker they can predict.
+
+    Both halves are asserted. The argument is gone, so no caller can move it;
+    and what the tool publishes is what it writes, so the two cannot drift.
+    """
     import inspect
 
-    assert inspect.signature(run).parameters["prediction_ID"].default == "Pred"
+    from sadt_ali_ios import OUTPUT_SUFFIXES, PREDICTION_ID
+
+    assert "prediction_ID" not in inspect.signature(run).parameters
+    assert PREDICTION_ID == "Pred"
+    assert "_lm_" + PREDICTION_ID in OUTPUT_SUFFIXES
 
 
 # What the SERVER adds to a tool that calls another, so the tool never declares

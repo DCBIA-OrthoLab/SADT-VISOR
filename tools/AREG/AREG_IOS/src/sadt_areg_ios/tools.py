@@ -11,7 +11,7 @@ different interpreters and irreconcilable dependency sets, which is the whole
 reason the split exists. `sup.run("AMASSS", ...)` starts that tool in its own
 venv and blocks until it is done.
 
-Three things worth knowing before changing anything here:
+Four things worth knowing before changing anything here:
 
 * **Tools are named by string, never by attribute.** `sup.run("ASO", ...)`, not
   `sup.ASO(...)`. A typo in a string is greppable and this file is the whole
@@ -19,6 +19,13 @@ Three things worth knowing before changing anything here:
 * **The arguments are the callee's published schema**, not AREG's vocabulary.
   When a tool renames an argument this file is what breaks, which is the point:
   it breaks in one place, with the name in it.
+* **No `output_dir` is passed to a callee.** Where a supervised tool writes is
+  the supervisor's business, the same way it is the server's over HTTP. Naming
+  one pointed the callee into this run's scratch and left the slot the
+  supervisor reserves for it -- `<job>/sup/<NN>_<tool>/output` -- empty, which
+  is the ONLY place `keep_intermediate` collects from: the step ran, wrote its
+  files, and came back to the caller as "a call that wrote nowhere". The
+  directory the call returns is what to read from.
 * **A missing supervisor is not a bad request.** Nothing about the caller's
   arguments is wrong -- there is simply no way to reach the other tool. Each
   `require_*` below says which mode to use instead, because that is a real
@@ -65,12 +72,6 @@ def require(sup, tool: str, mode: str) -> None:
     )
 
 
-def _output(sup, tool: str) -> str:
-    """A directory of the supervisor's scratch for one callee's results."""
-    destination = os.path.join(str(sup.tmp), "tools", tool)
-    os.makedirs(destination, exist_ok=True)
-    return destination
-
 
 def _returned(produced) -> str:
     """A tool returns a Path, or a dict of named ones; AREG wants a directory."""
@@ -95,7 +96,6 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     parameters = {
         "input": scan_dir,
         "reference": reference_path,
-        "output_dir": _output(sup, "ASO"),
         "modality": modality,
         "automation": "Fully-Automated",
         "output_suffix": "Or",
@@ -123,7 +123,6 @@ def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
     logger.info("AREG: asking 'Crown_Seg' for tooth-labelled meshes")
     parameters = {
         "meshes": mesh_dir,
-        "output_dir": _output(sup, "Crown_Seg"),
         "suffix": "Seg",
     }
     if model_path:
@@ -147,7 +146,6 @@ def predict_mucogingival(sup, mesh_dir: str, model_path: str = "") -> str:
     logger.info("AREG: asking 'ALI_IOS' for mucogingival landmarks")
     parameters = {
         "input": mesh_dir,
-        "output_dir": _output(sup, "ALI_IOS"),
         # No `modality` any more, and that is the split showing through: this
         # used to pass "IOS" explicitly because ALI was one tool serving both,
         # defaulted to CBCT, and would have been handed surfaces. ALI_IOS takes
@@ -159,7 +157,12 @@ def predict_mucogingival(sup, mesh_dir: str, model_path: str = "") -> str:
         # only ever applied to one modality stopped needing the prefix that told
         # them apart.
         "networks": ["Mucogingival"],
-        "prediction_ID": "MG_Pred",
+        # No `prediction_ID` either, and for a third time the same reason: ALI
+        # fixed its marker at `Pred` because a caller that moved it made the
+        # output file name unpredictable -- nothing downstream could then find
+        # the landmarks it had just asked for. Passing it fails on an
+        # unexpected keyword. This call kept it three days longer than its
+        # siblings because no test here reads the parameters it sends.
     }
     if model_path:
         parameters["model"] = model_path

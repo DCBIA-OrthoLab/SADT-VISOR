@@ -141,7 +141,7 @@ def run(
         "label_colors": catalogs.colors_for(classes),
         "device": device,
         "score_threshold": score_threshold,
-        "scans": [],
+        "cases": {},
     }
     if report["labels"] is None:
         # Named wrongly is worse than not named: a class count these names do
@@ -183,7 +183,7 @@ def run(
             logger.exception("CLIC failed on scan %d of %d", index, len(found))
             entry["status"] = "failed"
             entry["reason"] = f"{type(exc).__name__}: {exc}"
-        report["scans"].append(entry)
+        report["cases"][entry["input"]] = entry
 
     report["summary"] = f"{len(written)}/{len(found)} scan(s) segmented"
     report["duration_seconds"] = round(time.monotonic() - started, 2)
@@ -194,7 +194,7 @@ def run(
             "CLIC segmented none of the scans it was given. "
             + "; ".join(
                 f"{s['input']}: {s.get('reason', 'unknown')}"
-                for s in report["scans"] if s.get("status") == "failed"
+                for s in report["cases"].values() if s.get("status") == "failed"
             )
         )
 
@@ -241,7 +241,7 @@ def _segment_one(network, path, output_dir, relative, device, score_threshold,
     # carries the patient's sub-folder, so `.name` would throw it away and two
     # homonyms would report the identical output -- the very defect the tree
     # mirroring was added to fix.
-    entry["output"] = destination.relative_to(output_dir).as_posix()
+    entry["produced"] = [destination.relative_to(output_dir).as_posix()]
     if not detections:
         # Reported rather than swallowed: a volume the network found nothing in
         # is a legitimate answer AND the signature of a wrong checkpoint, and

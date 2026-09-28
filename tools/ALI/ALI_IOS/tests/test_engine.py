@@ -248,7 +248,7 @@ def test_two_meshes_of_the_same_name_do_not_overwrite_each_other(tmp_path, stubs
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
 
     assert len(tree_of(str(tmp_path / "out"))) == 3
-    assert len(report["scans"]) == 2
+    assert len(report["cases"]) == 2
 
 
 def test_the_prediction_id_reaches_the_file_name(tmp_path, stubs):
@@ -355,7 +355,7 @@ def test_the_report_lists_the_landmarks_found_per_scan(tmp_path, stubs):
     bundle = write_bundle(tmp_path / "b", BOTH_JAWS)
 
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
-    scan = report["scans"]["a.vtk"]
+    scan = report["cases"]["a.vtk"]
     assert scan["status"] == "ok"
     assert scan["input"] == "a.vtk"
     assert scan["landmarks_found"] == sorted(catalog.LABELS["O"]["8"])
@@ -382,7 +382,7 @@ def test_a_jaw_whose_checkpoint_is_missing_is_reported_not_swallowed(tmp_path, s
     bundle = write_bundle(tmp_path / "b", ["Upper_O_model.pth"])
 
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
-    assert report["scans"]["a.vtk"]["jaws_without_model"] == {"Occlusal": ["Lower"]}
+    assert report["cases"]["a.vtk"]["jaws_without_model"] == {"Occlusal": ["Lower"]}
 
 
 def test_a_checkpoint_it_could_not_read_is_named_in_the_report(tmp_path, stubs):
@@ -418,8 +418,8 @@ def test_one_mesh_failing_does_not_cost_the_others(tmp_path, stubs):
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
 
     assert report["summary"] == {"total": 2, "processed": 1, "failed": 1}
-    assert report["scans"]["good.vtk"]["status"] == "ok"
-    failed = report["scans"]["odd.vtk"]
+    assert report["cases"]["good.vtk"]["status"] == "ok"
+    failed = report["cases"]["odd.vtk"]
     assert failed["status"] == "failed"
     assert "no known tooth number" in failed["error"]
     assert "good_lm_Pred.mrk.json" in tree_of(str(tmp_path / "out"))
@@ -439,7 +439,7 @@ def test_one_tooth_failing_does_not_cost_the_rest_of_the_arch(tmp_path, stubs, m
     monkeypatch.setattr(engine, "_predict_one_tooth", flaky)
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
 
-    scan = report["scans"]["a.vtk"]
+    scan = report["cases"]["a.vtk"]
     assert scan["status"] == "ok"
     assert scan["landmarks_failed"] == {
         "Upper-8": "RuntimeError: rasterizer said no"
@@ -505,7 +505,7 @@ def test_mucogingival_on_a_maxilla_produces_nothing_and_fails_nothing(tmp_path, 
 
     report = identify(tmp_path, tmp_path / "in", bundle,
                       ios_networks=["Occlusal", "Mucogingival"])
-    scan = report["scans"]["upper.vtk"]
+    scan = report["cases"]["upper.vtk"]
 
     assert scan["status"] == "ok"
     assert scan["jaws_without_model"] == {}
@@ -518,7 +518,7 @@ def test_a_missing_mucogingival_checkpoint_is_reported_against_the_lower_jaw(tmp
 
     report = identify(tmp_path, tmp_path / "in", bundle,
                       ios_networks=["Occlusal", "Mucogingival"])
-    assert report["scans"]["lower.vtk"]["jaws_without_model"] == {"Mucogingival": ["Lower"]}
+    assert report["cases"]["lower.vtk"]["jaws_without_model"] == {"Mucogingival": ["Lower"]}
 
 
 def test_a_mucogingival_run_places_the_positional_names(tmp_path, stubs):
@@ -529,7 +529,7 @@ def test_a_mucogingival_run_places_the_positional_names(tmp_path, stubs):
     bundle = write_bundle(tmp_path / "b", ["Lower_MG_model.pth"])
 
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Mucogingival"])
-    found = report["scans"]["lower.vtk"]["landmarks_found"]
+    found = report["cases"]["lower.vtk"]["landmarks_found"]
     assert found == sorted(catalog.MG_OUTPUT_NAME)
     assert "L0MG" in found and "LR1MG" in found
 
@@ -544,7 +544,7 @@ def test_a_forced_mucogingival_point_carries_its_caveat_into_the_file(tmp_path, 
     bundle = write_bundle(tmp_path / "b", ["Lower_MG_model.pth"])
 
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Mucogingival"])
-    degraded = report["scans"]["lower.vtk"]["landmarks_degraded"]
+    degraded = report["cases"]["lower.vtk"]["landmarks_degraded"]
     assert set(degraded) == set(catalog.MG_OUTPUT_NAME)
     assert all(note.startswith("forced (confidence") for note in degraded.values())
 
@@ -566,7 +566,7 @@ def test_a_tooth_the_segmentation_missed_is_aimed_from_the_arch_and_says_so(tmp_
     bundle = write_bundle(tmp_path / "b", ["Lower_MG_model.pth"])
 
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Mucogingival"])
-    scan = report["scans"]["lower.vtk"]
+    scan = report["cases"]["lower.vtk"]
 
     assert "L0MG" in scan["landmarks_found"]
     assert scan["landmarks_degraded"]["L0MG"] == (
@@ -581,7 +581,7 @@ def test_a_won_mucogingival_point_carries_no_caveat_at_all(tmp_path, stubs):
     bundle = write_bundle(tmp_path / "b", ["Lower_MG_model.pth"])
 
     report = identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Mucogingival"])
-    assert "landmarks_degraded" not in report["scans"]["lower.vtk"]
+    assert "landmarks_degraded" not in report["cases"]["lower.vtk"]
 
 
 # ---------------------------------------------------------------------------

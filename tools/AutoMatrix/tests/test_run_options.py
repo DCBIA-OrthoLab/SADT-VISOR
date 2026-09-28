@@ -238,7 +238,7 @@ def test_two_transforms_of_one_patient_never_write_the_same_name(
     assert len(written) == 2, f"one transform's result was lost: {written}"
     report = _report(out)
     assert report["summary"]["files_written"] == 2
-    assert sorted(entry["file"] for entry in report["patients"]["P1"]["outputs"]) == written
+    assert sorted(entry["file"] for entry in report["cases"]["P1"]["outputs"]) == written
 
 
 def test_the_two_outputs_of_two_transforms_really_differ(tmp_path, volume,
@@ -384,7 +384,7 @@ def test_transforms_are_found_in_the_tree_areg_writes_them_in(
                               output_dir=tmp_path / "out")
 
     assert _outputs(out) == ["P1_T1_Reg.nii.gz"]
-    assert _report(out)["patients"]["P1"]["transforms"] == ["P1_CB_transform.tfm"]
+    assert _report(out)["cases"]["P1"]["transforms"] == ["P1_CB_transform.tfm"]
 
 
 def test_no_jaw_table_decides_which_transform_a_file_gets(tmp_path, volume,
@@ -443,7 +443,7 @@ def test_a_file_that_is_not_a_transform_is_ignored_in_the_transform_folder(
     out = sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
                               output_dir=tmp_path / "out")
 
-    assert _report(out)["patients"]["P1"]["transforms"] == ["P1_transform.tfm"]
+    assert _report(out)["cases"]["P1"]["transforms"] == ["P1_transform.tfm"]
 
 
 def test_scans_segmentations_and_landmarks_of_one_patient_go_through_together(
@@ -462,7 +462,7 @@ def test_scans_segmentations_and_landmarks_of_one_patient_go_through_together(
         "P1_T1_lm_Reg.mrk.json",
         "P1_T1_scan_Reg.nii.gz",
     ]
-    assert list(_report(out)["patients"]) == ["P1"]
+    assert list(_report(out)["cases"]) == ["P1"]
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +489,10 @@ def test_the_report_carries_everything_a_caller_has_to_read(tmp_path, volume,
     assert report["output_suffix"] == "Reg"
     assert report["without_a_transform"] == ["P2"]
     assert report["transforms_without_a_file"] == ["P9"]
-    assert report["summary"] == {"patients": 1, "files_written": 2}
+    assert report["summary"] == {"cases": 1, "files_written": 2}
     assert isinstance(report["duration_seconds"], float)
-    assert report["patients"]["P1"]["transforms"] == ["P1_transform.tfm"]
-    assert report["patients"]["P1"]["outputs"] == [
+    assert report["cases"]["P1"]["transforms"] == ["P1_transform.tfm"]
+    assert report["cases"]["P1"]["outputs"] == [
         # `detected` is what "Automatic" decided for THIS file. Which
         # interpolator ran is not visible in the result and is the difference
         # between a label map that survived and one that grew labels nobody
@@ -517,7 +517,7 @@ def test_a_landmark_file_reports_how_many_points_moved(tmp_path, transform_file)
     out = sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
                               output_dir=tmp_path / "out")
 
-    assert _report(out)["patients"]["P1"]["outputs"][0]["points_moved"] == 1
+    assert _report(out)["cases"]["P1"]["outputs"][0]["points_moved"] == 1
 
 
 def test_a_patient_with_no_transform_produces_no_entry_and_no_file(
@@ -568,8 +568,8 @@ def test_a_patient_that_fails_does_not_take_the_ones_that_work_with_it(
     assert _outputs(out) == ["P1_T1_Reg.nii.gz"]
     report = _report(out)
     assert report["summary"]["files_written"] == 1
-    assert report["patients"]["P2"]["outputs"] == []
-    failure = report["patients"]["P2"]["failed"][0]
+    assert report["cases"]["P2"]["outputs"] == []
+    failure = report["cases"]["P2"]["failed"][0]
     assert "P2_T1.nii.gz" in failure and "P2_transform.tfm" in failure
 
 
@@ -583,7 +583,7 @@ def test_one_bad_file_of_a_patient_does_not_lose_the_others(tmp_path, volume,
                               output_dir=tmp_path / "out")
 
     assert _outputs(out) == ["P1_T1_Reg.nii.gz"]
-    assert "P1_T2.nii.gz" in _report(out)["patients"]["P1"]["failed"][0]
+    assert "P1_T2.nii.gz" in _report(out)["cases"]["P1"]["failed"][0]
 
 
 def test_when_everything_fails_the_refusal_carries_the_reason(tmp_path, volume):

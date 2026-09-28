@@ -196,12 +196,12 @@ def stub_engine(monkeypatch):
                 "landmarks_failed": {},
                 "landmarks_degraded": dict(DEGRADED),
                 "jaws_without_model": {},
-                "files": [destination],
+                "produced": [destination],
             }
         return {
             "mode": "IOS",
             "networks": list(networks),
-            "scans": scans,
+            "cases": scans,
             "summary": {"total": len(scans), "processed": len(scans), "failed": 0},
         }
 
@@ -262,7 +262,7 @@ def test_a_selection_filters_what_is_written_not_what_is_computed(tmp_path, stub
     assert stub_engine["networks"] == ("O", "MG")
     assert _written_labels(output_dir) == ["UR1O", "L0MG"]
     assert report["landmarks_selected"] == ["UR1O", "L0MG"]
-    assert report["scans"]["arch.vtk"]["landmarks_found"] == ["L0MG", "UR1O"]
+    assert report["cases"]["arch.vtk"]["landmarks_found"] == ["L0MG", "UR1O"]
 
 
 def test_the_shifted_mucogingival_label_survives_the_filter(tmp_path, stub_engine):
@@ -296,7 +296,7 @@ def test_a_kept_landmark_keeps_the_caveat_it_was_written_with(tmp_path, stub_eng
     with open(path, encoding="utf-8") as handle:
         point = json.load(handle)["markups"][0]["controlPoints"][0]
     assert point["description"] == DEGRADED["L0MG"]
-    assert report["scans"]["arch.vtk"]["landmarks_degraded"] == DEGRADED
+    assert report["cases"]["arch.vtk"]["landmarks_degraded"] == DEGRADED
 
 
 def test_a_scan_left_with_nothing_loses_its_file_rather_than_gaining_an_empty_one(
@@ -312,8 +312,8 @@ def test_a_scan_left_with_nothing_loses_its_file_rather_than_gaining_an_empty_on
         landmarks=["UL7CL"],
     )
 
-    assert report["scans"]["arch.vtk"]["files"] == []
-    assert report["scans"]["arch.vtk"]["landmarks_found"] == []
+    assert report["cases"]["arch.vtk"]["produced"] == []
+    assert report["cases"]["arch.vtk"]["landmarks_found"] == []
     assert not os.path.exists(os.path.join(output_dir, "arch_lm_Pred.mrk.json"))
 
 

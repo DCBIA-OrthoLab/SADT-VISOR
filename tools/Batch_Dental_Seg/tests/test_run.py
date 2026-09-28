@@ -21,7 +21,7 @@ from sadt_batchdentalseg.errors import ToolInputError
 
 
 def segmentation_files(report):
-    return [path for scan in report["scans"] for path in scan.get("segmentations", [])]
+    return [path for scan in report["cases"].values() for path in scan.get("produced", [])]
 
 
 def _write_scan(path: str, size=(8, 8, 8), value: int = 40) -> str:
@@ -395,7 +395,7 @@ def test_an_unreadable_scan_does_not_lose_the_others(tmp_path, stub_nnunet, monk
         input_path=str(tmp_path / "in"), model_path=str(tmp_path / "models" / "DentalSegmentator")
     )
 
-    statuses = {entry["input"]: entry["status"] for entry in report["scans"]}
+    statuses = {entry["input"]: entry["status"] for entry in report["cases"].values()}
     assert statuses == {"p1.nii.gz": "ok", "p2.nii.gz": "failed"}
     assert report["summary"] == "1/2 scan(s) segmented"
     assert len(segmentation_files(report)) == 1
@@ -831,3 +831,330 @@ def test_gpu_resampling_agrees_with_the_scipy_pipeline(tmp_path):
             continue
         dice = 2.0 * int((in_reference & in_test).sum()) / total
         assert dice > 0.97, f"{name}: Dice {dice:.4f} against the scipy pipeline"
+
+
+# ---------------------------------------------------------------------------
+# Export formats
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def stub_blobs(monkeypatch):
+    """An nnUNet stand-in that writes a solid cube per label, clear of the
+    volume border.
+
+    The shared `stub_nnunet` fills whole z-slices spanning the whole image.
+    That is fine for everything that only reads voxels, and useless here:
+    marching cubes returns nothing for a slab with no interior and none for a
+    face pressed against the image boundary, so every mesh came out EMPTY
+    while the file names still looked exactly right.
+    """
+
+    def _install(labels_present=(1, 2, 3)):
+        def predict_folder(model_folder, input_dir, output_dir, device, **kwargs):
+            os.makedirs(output_dir, exist_ok=True)
+            for name in sorted(os.listdir(input_dir)):
+                if not name.endswith("_0000.nii.gz"):
+                    continue
+                case_id = name[: -len("_0000.nii.gz")]
+                reference = sitk.ReadImage(os.path.join(input_dir, name))
+                shape = sitk.GetArrayViewFromImage(reference).shape
+                array = np.zeros(shape, dtype=np.uint8)
+                for index, value in enumerate(labels_present):
+                    start = 2 + index * 7
+                    array[start:start + 6, 2:8, 2:8] = value
+                mask = sitk.GetImageFromArray(array)
+                mask.CopyInformation(reference)
+                sitk.WriteImage(mask, os.path.join(output_dir, f"{case_id}.nii.gz"))
+
+        monkeypatch.setattr(nnunet_runner, "predict_folder", predict_folder)
+        monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested=None: "cpu")
+
+    return _install
+
+
+def _segment(tmp_path, **kwargs):
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"), size=(24, 24, 24))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+    return pipeline.segment(
+        output_dir=str(tmp_path / "out"),
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        **kwargs,
+    )
+
+
+def _produced(report):
+    return sorted(os.path.basename(path) for path in segmentation_files(report))
+
+
+def test_the_default_is_the_label_volume_and_nothing_else(tmp_path, stub_blobs):
+    """Every call made before export formats existed meant exactly this, and
+    has to go on meaning it."""
+    stub_blobs(labels_present=(1, 2))
+    report = _segment(tmp_path)
+
+    assert _produced(report) == ["p1_Seg.nii.gz"]
+
+
+def test_a_mesh_is_written_per_label_actually_present(tmp_path, stub_blobs):
+    stub_blobs(labels_present=(1, 3))
+    report = _segment(tmp_path, export_formats=["STL"])
+
+    assert _produced(report) == ["p1_Seg_Upper-Skull.stl", "p1_Seg_Upper-Teeth.stl"]
+
+
+def test_unticking_the_volume_writes_no_volume(tmp_path, stub_blobs):
+    """A caller who wants meshes must not be made to carry a cohort of label
+    volumes to get them."""
+    stub_blobs(labels_present=(1,))
+    report = _segment(tmp_path, export_formats=["VTK"])
+
+    assert not [name for name in _produced(report) if name.endswith(".nii.gz")]
+
+
+def test_separate_segments_follows_the_volume(tmp_path, stub_blobs):
+    """It splits the VOLUME. One binary NIfTI per label is still a volume, so
+    asking for meshes only must not bring forty of them back."""
+    stub_blobs(labels_present=(1, 2))
+    report = _segment(tmp_path, export_formats=["STL"], separate_segments=True)
+
+    assert not [name for name in _produced(report) if name.endswith(".nii.gz")]
+
+
+def test_the_merged_vtk_is_one_file_holding_every_label(tmp_path, stub_blobs):
+    stub_blobs(labels_present=(1, 2, 3))
+    report = _segment(tmp_path, export_formats=["VTK (merged)"])
+    assert _produced(report) == ["p1_Seg_merged.vtk"]
+
+    import vtk
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(segmentation_files(report)[0])
+    reader.ReadAllScalarsOn()
+    reader.Update()
+    labels = reader.GetOutput().GetCellData().GetArray("Label")
+    assert labels is not None, "the merged mesh cannot be separated again"
+    seen = {int(labels.GetTuple1(i)) for i in range(labels.GetNumberOfTuples())}
+    assert seen == {1, 2, 3}
+
+
+def test_two_formats_at_once_write_both(tmp_path, stub_blobs):
+    """And cost ONE marching-cubes pass: the surface is built per label and
+    handed to every writer that was asked for."""
+    stub_blobs(labels_present=(1,))
+    report = _segment(tmp_path, export_formats=["NIFTI", "STL", "OBJ"])
+
+    assert _produced(report) == [
+        "p1_Seg.nii.gz", "p1_Seg_Upper-Skull.obj", "p1_Seg_Upper-Skull.stl",
+    ]
+
+
+def test_reduction_actually_removes_triangles(tmp_path, stub_blobs):
+    """Marching cubes runs on the scan grid, so without this a cohort's meshes
+    are a triangle per voxel face."""
+    import vtk
+
+    def triangles(root, decimation):
+        stub_blobs(labels_present=(1,))
+        report = _segment(root, export_formats=["VTK"], surface_decimation=decimation)
+        reader = vtk.vtkPolyDataReader()
+        reader.SetFileName(segmentation_files(report)[0])
+        reader.Update()
+        return reader.GetOutput().GetNumberOfCells()
+
+    raw = triangles(tmp_path / "a", 0)
+    reduced = triangles(tmp_path / "b", 90)
+    assert raw > 0
+    assert reduced < raw, "surface_decimation moved nothing"
+
+
+def test_the_report_says_what_was_asked_for(tmp_path, stub_blobs):
+    """A mesh is a lossy view of the mask it came from, so whoever opens one
+    has to be able to see how much was thrown away."""
+    stub_blobs(labels_present=(1,))
+    report = _segment(tmp_path, export_formats=["NIFTI", "STL"], surface_decimation=50)
+
+    assert report["export_formats"] == ["NIFTI", "STL"]
+    assert report["surface_decimation"] == 50
+
+
+def test_every_format_the_panel_offers_can_be_written(tmp_path, stub_blobs):
+    """The layout renders `mesh_export.FORMATS`; a name in that tuple that no
+    writer knows would be a chip that produces nothing."""
+    from sadt_batchdentalseg import mesh_export
+
+    stub_blobs(labels_present=(1,))
+    report = _segment(tmp_path, export_formats=list(mesh_export.FORMATS))
+    extensions = {os.path.splitext(name)[1] for name in _produced(report)}
+    assert extensions == {".gz", ".stl", ".obj", ".vtk"}
+
+
+def test_a_surface_is_wound_consistently_and_carries_no_normals(tmp_path, stub_blobs):
+    """Two claims, and the first is the one that was got wrong.
+
+    Marching cubes already returns a consistently wound mesh, so every facet
+    of a solid blob faces AWAY from its centre with no orienting filter in
+    the pipeline at all. A `vtkPolyDataNormals` stage was added on the
+    strength of a measurement that appeared to show the winding disagreeing;
+    that measurement was an artefact of `SplittingOn` duplicating points and
+    hiding a third of the shared edges from the metric. Geometry identical,
+    with and without.
+
+    And nothing writes normals: a reader computes them, and the file stays
+    triangles and vertices.
+    """
+    import numpy as np
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    stub_blobs(labels_present=(1,))
+    report = _segment(tmp_path, export_formats=["VTK"])
+
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(segmentation_files(report)[0])
+    reader.ReadAllNormalsOn()
+    reader.Update()
+    surface = reader.GetOutput()
+
+    assert surface.GetPointData().GetNormals() is None, "normals were written"
+    assert surface.GetCellData().GetNormals() is None, "cell normals were written"
+
+    # Read the facets' own orientation WITHOUT letting the filter correct it:
+    # consistency and auto-orient off, or this could not tell a well-wound
+    # mesh from one the measurement had just fixed.
+    facing = vtk.vtkPolyDataNormals()
+    facing.SetInputData(surface)
+    facing.ComputeCellNormalsOn()
+    facing.ComputePointNormalsOff()
+    facing.SplittingOff()
+    facing.ConsistencyOff()
+    facing.AutoOrientNormalsOff()
+    facing.Update()
+    oriented = facing.GetOutput()
+
+    centres = vtk.vtkCellCenters()
+    centres.SetInputData(oriented)
+    centres.Update()
+    points = vtk_to_numpy(centres.GetOutput().GetPoints().GetData())
+    normals = vtk_to_numpy(oriented.GetCellData().GetNormals())
+    outward = np.sum((points - points.mean(axis=0)) * normals, axis=1) > 0
+    assert outward.mean() > 0.95, (
+        "%.0f%% of the facets face inwards" % (100 * (1 - outward.mean()))
+    )
+
+
+def test_the_default_keeps_every_triangle_marching_cubes_made(tmp_path, stub_blobs):
+    """Parity with the module this replaces, which exports Slicer's closed
+    surface representation with `Decimation factor = 0.0`. An earlier default
+    of 90 was borrowed from AMASSS without being remeasured and cost a factor
+    of ten in detail -- on one real segmentation, 11852 triangles against
+    1184 for the same tooth."""
+    import vtk
+
+    stub_blobs(labels_present=(1,))
+    default = _segment(tmp_path / "a", export_formats=["VTK"])
+    asked = _segment(tmp_path / "b", export_formats=["VTK"], surface_decimation=90)
+
+    def cells(report):
+        reader = vtk.vtkPolyDataReader()
+        reader.SetFileName(segmentation_files(report)[0])
+        reader.Update()
+        return reader.GetOutput().GetNumberOfCells()
+
+    assert cells(default) > cells(asked), "the default is decimating something"
+
+
+def test_a_surface_does_not_keep_the_voxel_staircase():
+    """`FeatureEdgeSmoothingOn` preserves edges sharper than the feature
+    angle, and on a raw marching-cubes mesh every voxel step is one -- so it
+    protected the staircase it was there to remove. A sphere has no genuine
+    edge, so anything left is the staircase.
+    """
+    import numpy as np
+    import SimpleITK as sitk
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+    from sadt_batchdentalseg import mesh_export
+
+    size, radius, spacing = 48, 14, 0.33
+    z, y, x = np.mgrid[0:size, 0:size, 0:size]
+    ball = (((z - 24) ** 2 + (y - 24) ** 2 + (x - 24) ** 2) < radius ** 2)
+    reference = sitk.GetImageFromArray(ball.astype(np.uint8))
+    reference.SetSpacing((spacing, spacing, spacing))
+
+    surface = mesh_export._surface(ball, reference, 30, 0)
+
+    facets = vtk.vtkPolyDataNormals()
+    facets.SetInputData(surface)
+    facets.ComputeCellNormalsOn()
+    facets.ComputePointNormalsOff()
+    facets.SplittingOff()
+    facets.ConsistencyOn()
+    facets.Update()
+    built = facets.GetOutput()
+    normals = vtk_to_numpy(built.GetCellData().GetNormals())
+
+    angles = []
+    for index in range(built.GetNumberOfCells()):
+        cell = built.GetCell(index)
+        for edge in range(cell.GetNumberOfEdges()):
+            ends = cell.GetEdge(edge)
+            neighbours = vtk.vtkIdList()
+            built.GetCellEdgeNeighbors(
+                index, ends.GetPointId(0), ends.GetPointId(1), neighbours)
+            for k in range(neighbours.GetNumberOfIds()):
+                other = neighbours.GetId(k)
+                if other > index:
+                    angles.append(np.degrees(np.arccos(
+                        np.clip(np.dot(normals[index], normals[other]), -1, 1))))
+
+    # 12.9 degrees with the flag on, 3.9 with it off, on a real tooth.
+    assert np.mean(angles) < 8.0, (
+        "mean angle between adjacent facets is %.1f degrees: the staircase is "
+        "still there" % np.mean(angles)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-class resampling
+# ---------------------------------------------------------------------------
+
+def test_resampling_class_by_class_gives_the_same_labels():
+    """The whole claim, and it is an equality rather than a tolerance.
+
+    Resampling is purely spatial: every class is interpolated independently
+    of the others, so doing them together or one after another is the same
+    arithmetic and the argmax over the results is the same argmax. What it
+    buys is that the block of 55 classes -- 19.6 GiB at full scale -- is
+    never built.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("nnunetv2")
+    from nnunetv2.preprocessing.resampling.resample_torch import resample_torch_fornnunet
+    from sadt_batchdentalseg import low_memory
+
+    classes, source, target = 12, (20, 22, 18), [26, 28, 23]
+    current, new = (0.4, 0.4, 0.4), (0.33, 0.33, 0.33)
+    torch.manual_seed(0)
+    data = torch.rand((classes,) + source, dtype=torch.float32)
+    options = {"is_seg": False, "device": torch.device("cpu"), "mode": "linear"}
+
+    stock = resample_torch_fornnunet(data, target, current, new, **options).argmax(0)
+    ours = low_memory._take_labels(
+        low_memory._per_class(data, target, current, new, **options))
+
+    assert ours.shape == stock.shape
+    assert torch.equal(ours.to(stock.dtype), stock), (
+        "%d of %d voxels differ" % ((ours != stock).sum().item(), stock.numel())
+    )
+
+
+def test_both_halves_are_installed_or_neither():
+    """The resampler returns ONE channel holding the argmax. nnUNet's own
+    argmax asserts one channel per class, so installing the resampler without
+    the replacement would fail that assert on the first patient."""
+    from sadt_batchdentalseg import low_memory
+
+    class _NoLabelManager:
+        configuration_manager = None
+
+    assert low_memory.install(_NoLabelManager()) is False

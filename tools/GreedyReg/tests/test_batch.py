@@ -107,7 +107,7 @@ def test_the_report_records_the_choices_the_run_was_made_with(tmp_path, greedy):
 def test_the_report_counts_what_happened(tmp_path, greedy):
     out = run_batch(tmp_path, ["A1", "B2", "C3"])
 
-    assert report_of(out)["summary"] == {"patients": 3, "registered": 3, "failed": 0}
+    assert report_of(out)["summary"] == {"cases": 3, "registered": 3, "failed": 0}
 
 
 def test_the_report_times_the_run(tmp_path, greedy):
@@ -120,7 +120,7 @@ def test_the_report_times_the_run(tmp_path, greedy):
 def test_a_patient_entry_names_the_two_scans_it_registered(tmp_path, greedy):
     out = run_batch(tmp_path)
 
-    entry = report_of(out)["patients"]["A1"]
+    entry = report_of(out)["cases"]["A1"]
     assert entry["t1"] == "A1_T1.nii.gz"
     assert entry["t2"] == "A1_T2.nii.gz"
     assert entry["status"] == "ok"
@@ -129,7 +129,7 @@ def test_a_patient_entry_names_the_two_scans_it_registered(tmp_path, greedy):
 def test_a_patient_entry_lists_the_files_it_produced(tmp_path, greedy):
     out = run_batch(tmp_path)
 
-    assert report_of(out)["patients"]["A1"]["outputs"] == [
+    assert report_of(out)["cases"]["A1"]["produced"] == [
         "A1_registered.nii.gz", "A1_transform.mat"]
 
 
@@ -138,14 +138,14 @@ def test_the_report_says_which_way_the_transform_maps(tmp_path, greedy):
     backwards; greedy's own `-r` consumes it in this direction."""
     out = run_batch(tmp_path)
 
-    assert "T2" in report_of(out)["patients"]["A1"]["transform_maps"]
-    assert "-r" in report_of(out)["patients"]["A1"]["transform_maps"]
+    assert "T2" in report_of(out)["cases"]["A1"]["transform_maps"]
+    assert "-r" in report_of(out)["cases"]["A1"]["transform_maps"]
 
 
 def test_the_report_keys_patients_by_the_shared_patient_key(tmp_path, greedy):
     out = run_batch(tmp_path, ["A1", "B2"])
 
-    assert sorted(report_of(out)["patients"]) == ["A1", "B2"]
+    assert sorted(report_of(out)["cases"]) == ["A1", "B2"]
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +234,7 @@ def test_without_an_initial_transform_the_search_starts_from_the_nudged_identity
 def test_without_an_initial_transform_the_report_names_none(tmp_path, greedy):
     out = run_batch(tmp_path)
 
-    assert "initial_transform" not in report_of(out)["patients"]["A1"]
+    assert "initial_transform" not in report_of(out)["cases"]["A1"]
 
 
 @pytest.mark.parametrize("transform_name", [
@@ -258,7 +258,7 @@ def test_an_initial_transform_is_passed_to_greedy_and_reported(
 
     command = greedy.registration_for("A1")
     assert command[command.index("-ia") + 1].endswith(transform_name)
-    assert report_of(out)["patients"]["A1"]["initial_transform"] == transform_name
+    assert report_of(out)["cases"]["A1"]["initial_transform"] == transform_name
 
 
 def test_a_transform_carrying_an_unknown_token_is_a_different_patient(tmp_path, greedy):
@@ -273,7 +273,7 @@ def test_a_transform_carrying_an_unknown_token_is_a_different_patient(tmp_path, 
                              initial_transforms=tmp_path / "init")
 
     assert report_of(out)["unused_initial_transforms"] == ["A1_start"]
-    assert "initial_transform" not in report_of(out)["patients"]["A1"]
+    assert "initial_transform" not in report_of(out)["cases"]["A1"]
 
 
 def test_an_initial_transform_that_matches_nobody_is_reported(tmp_path, greedy):
@@ -285,7 +285,7 @@ def test_an_initial_transform_that_matches_nobody_is_reported(tmp_path, greedy):
                              initial_transforms=tmp_path / "init")
 
     assert report_of(out)["unused_initial_transforms"] == ["Z9"]
-    assert "initial_transform" not in report_of(out)["patients"]["A1"]
+    assert "initial_transform" not in report_of(out)["cases"]["A1"]
 
 
 def test_files_that_are_not_transforms_are_not_read_as_transforms(tmp_path, greedy):
@@ -296,7 +296,7 @@ def test_files_that_are_not_transforms_are_not_read_as_transforms(tmp_path, gree
     out = sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
                              initial_transforms=tmp_path / "init")
 
-    assert "initial_transform" not in report_of(out)["patients"]["A1"]
+    assert "initial_transform" not in report_of(out)["cases"]["A1"]
     assert report_of(out)["unused_initial_transforms"] == []
 
 
@@ -310,7 +310,7 @@ def test_a_nested_initial_transform_follows_the_patient_into_its_subfolder(tmp_p
                              output_dir=tmp_path / "out",
                              initial_transforms=tmp_path / "init")
 
-    assert report_of(out)["patients"]["site_a/A1"]["initial_transform"] == "A1_transform.mat"
+    assert report_of(out)["cases"]["site_a/A1"]["initial_transform"] == "A1_transform.mat"
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +321,7 @@ def test_without_masks_no_metric_mask_is_passed(tmp_path, greedy):
     out = run_batch(tmp_path)
 
     assert "-gm" not in greedy.registration_for("A1")
-    assert "mask" not in report_of(out)["patients"]["A1"]
+    assert "mask" not in report_of(out)["cases"]["A1"]
 
 
 @pytest.mark.parametrize("mask_name", [
@@ -342,7 +342,7 @@ def test_a_mask_is_found_however_it_names_itself(tmp_path, greedy, mask_name):
                              masks=tmp_path / "masks")
 
     assert "-gm" in greedy.registration_for("A1")
-    assert report_of(out)["patients"]["A1"]["mask"] == mask_name
+    assert report_of(out)["cases"]["A1"]["mask"] == mask_name
     assert report_of(out)["unused_masks"] == []
 
 
@@ -407,7 +407,7 @@ def test_one_patients_mask_does_not_become_anothers(tmp_path, greedy):
 
     assert "-gm" in greedy.registration_for("A1")
     assert "-gm" not in greedy.registration_for("B2")
-    assert "mask" not in report_of(out)["patients"]["B2"]
+    assert "mask" not in report_of(out)["cases"]["B2"]
 
 
 def test_the_unused_lists_are_present_even_when_nothing_was_given(tmp_path, greedy):
@@ -426,9 +426,9 @@ def test_a_failing_patient_leaves_the_others_registered(tmp_path, failing_greedy
     out = run_batch(tmp_path, ["A1", "B2", "C3"])
 
     report = report_of(out)
-    assert report["summary"] == {"patients": 3, "registered": 2, "failed": 1}
-    assert report["patients"]["A1"]["status"] == "ok"
-    assert report["patients"]["C3"]["status"] == "ok"
+    assert report["summary"] == {"cases": 3, "registered": 2, "failed": 1}
+    assert report["cases"]["A1"]["status"] == "ok"
+    assert report["cases"]["C3"]["status"] == "ok"
 
 
 def test_a_failure_is_named_by_its_exception_and_its_message(tmp_path, failing_greedy):
@@ -437,7 +437,7 @@ def test_a_failure_is_named_by_its_exception_and_its_message(tmp_path, failing_g
     failing_greedy("B2")
     out = run_batch(tmp_path, ["A1", "B2"])
 
-    entry = report_of(out)["patients"]["B2"]
+    entry = report_of(out)["cases"]["B2"]
     assert entry["status"] == "failed"
     assert entry["reason"] == "RuntimeError: greedy: convergence failed"
 
@@ -446,7 +446,7 @@ def test_a_failing_patient_still_names_the_scans_it_was_given(tmp_path, failing_
     failing_greedy("A1")
     out = run_batch(tmp_path, ["A1", "B2"])
 
-    entry = report_of(out)["patients"]["A1"]
+    entry = report_of(out)["cases"]["A1"]
     assert entry["t1"] == "A1_T1.nii.gz" and entry["t2"] == "A1_T2.nii.gz"
     assert "outputs" not in entry
 
@@ -460,9 +460,9 @@ def test_a_case_that_times_out_is_one_failed_patient(tmp_path, failing_greedy):
     out = run_batch(tmp_path, ["A1", "B2", "C3"])
 
     report = report_of(out)
-    assert report["summary"] == {"patients": 3, "registered": 2, "failed": 1}
-    assert report["patients"]["B2"]["reason"].startswith("TimeoutExpired:")
-    assert "600" in report["patients"]["B2"]["reason"]
+    assert report["summary"] == {"cases": 3, "registered": 2, "failed": 1}
+    assert report["cases"]["B2"]["reason"].startswith("TimeoutExpired:")
+    assert "600" in report["cases"]["B2"]["reason"]
 
 
 def test_every_patient_failing_raises_rather_than_reporting_success(tmp_path, failing_greedy):
@@ -524,7 +524,7 @@ def test_a_nested_patient_lists_its_outputs_relative_to_the_output_folder(tmp_pa
     out = sadt_greedyreg.run(t1=tmp_path / "t1", t2=tmp_path / "t2",
                              output_dir=tmp_path / "out")
 
-    assert report_of(out)["patients"]["site_a/A1"]["outputs"] == [
+    assert report_of(out)["cases"]["site_a/A1"]["produced"] == [
         "site_a/A1_registered.nii.gz", "site_a/A1_transform.mat"]
 
 
@@ -540,7 +540,7 @@ def test_a_nested_patient_does_not_take_the_batch_down(tmp_path, greedy):
     out = sadt_greedyreg.run(t1=tmp_path / "t1", t2=tmp_path / "t2",
                              output_dir=tmp_path / "out")
 
-    assert report_of(out)["summary"] == {"patients": 2, "registered": 2, "failed": 0}
+    assert report_of(out)["summary"] == {"cases": 2, "registered": 2, "failed": 0}
 
 
 def test_no_scratch_directory_survives_a_successful_run(tmp_path, greedy):

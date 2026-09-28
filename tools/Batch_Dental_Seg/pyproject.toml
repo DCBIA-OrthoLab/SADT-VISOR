@@ -6,13 +6,21 @@ description = "Segment teeth and jaw structures on a dental CT or CBCT scan."
 # where every BatchDentalSeg result to date was produced.
 requires-python = ">=3.11,<3.12"
 # Same stack as AMASSS and for the same reason: pinned to what the deployed
-# server runs, not to upstream's declared versions. See README. No vtk here --
-# the mesh exports are deliberately not ported.
+# server runs, not to upstream's declared versions. See README. vtk is at
+# AMASSS's pin because it does the same job here -- the surface exports, which
+# the local module could only do inside Slicer and which were left unported
+# until they were written for the server in `mesh_export.py`. It pulls no
+# torch of its own, so it cannot shadow the image's CUDA build.
 dependencies = [
+    # The naming vocabulary every tool must agree on: extensions, output
+    # markers, jaw and timepoint tokens. A DIRECT dependency, not merely a `tool.uv.sources` entry:
+    # a source only applies to a package that is actually depended on.
+    "sadt-naming",
     "torch==2.8.0",
     "nnunetv2==2.8.1",
     "SimpleITK==2.5.6",
     "numpy==2.3.2",
+    "vtk==9.6.2",
 ]
 
 # What makes this directory a tool. A directory holding a pyproject.toml
@@ -45,6 +53,12 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
+# Which extensions count as a volume, a surface, a set of landmarks. Shared
+# rather than copied because it is a contract with the outside world, not an
+# internal helper -- see CONTRIBUTING.md, and the `.stl` ALI advertised and
+# never read. It has no dependencies of its own and cannot perturb the
+# resolution above.
+sadt-naming = { path = "../../naming" }
 # Development only: lets this tool's tests run ANOTHER tool through that tool's
 # own venv, as a subprocess, the way the server does. It has no dependencies of
 # its own, so it cannot perturb the resolution above. Never move it into

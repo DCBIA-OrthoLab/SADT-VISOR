@@ -372,7 +372,7 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
         f"{os.path.splitext(os.path.basename(mesh_path))[0]}_lm_{prediction_ID}"
         f"{MARKUPS_EXTENSION}",
     )
-    record["files"].append(write_markups(positions, destination, descriptions=notes))
+    record["produced"].append(write_markups(positions, destination, descriptions=notes))
 
 
 def _predict_one_tooth(unet, renderer, mesh, network, jaw, tooth_number, label_names,
@@ -579,7 +579,7 @@ def predict_landmarks(
             "landmarks_found": [],
             "landmarks_failed": {},
             "jaws_without_model": {},
-            "files": [],
+            "produced": [],
         }
         scan_reports[key] = record
         scan_started = time.monotonic()
@@ -650,7 +650,7 @@ def predict_landmarks(
             if code not in weights
         ],
         "models_unrecognized": unrecognized,
-        "scans": scan_reports,
+        "cases": scan_reports,
         "summary": {
             "total": len(scan_reports),
             "processed": len(processed),

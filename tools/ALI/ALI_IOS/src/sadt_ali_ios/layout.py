@@ -75,5 +75,4 @@ LAYOUT = {
             name: list(labels) for name, labels in catalog.LANDMARK_GROUPS.items()
         },
     },
-    "prediction_ID": {"section": _OUTPUTS, "label": "Prediction ID"},
 }

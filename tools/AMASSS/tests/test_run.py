@@ -49,7 +49,7 @@ def _make_model_bundle(root, codes):
 
 
 def segmentation_files(report):
-    return [path for scan in report["scans"] for path in scan.get("segmentations", [])]
+    return [path for scan in report["cases"] for path in scan.get("segmentations", [])]
 
 
 @pytest.fixture
@@ -683,7 +683,7 @@ def test_surfaces_are_produced_alongside_the_segmentations(tmp_path, stub_predic
         generate_surface=True,
     )
 
-    surfaces = [path for scan in report["scans"] for path in scan["surfaces"]]
+    surfaces = [path for scan in report["cases"] for path in scan["surfaces"]]
     assert [os.path.basename(p) for p in surfaces] == ["patient01_Pred_MAND.vtk"]
     assert os.path.getsize(surfaces[0]) > 0
     assert report["surface_decimation"] == 90
@@ -845,7 +845,7 @@ def test_a_scan_that_cannot_be_read_is_logged_by_position(
     assert any(m.startswith("Could not read scan ") and m.endswith(" of 2")
                for m in messages), messages
     assert not any("Smith_John" in m or "Jones_Mary" in m for m in messages), messages
-    assert [scan["input"] for scan in report["scans"] if scan["status"] == "failed"] \
+    assert [scan["input"] for scan in report["cases"] if scan["status"] == "failed"] \
         == ["Jones_Mary_T2.nii.gz"], "the report still names it"
 
 
