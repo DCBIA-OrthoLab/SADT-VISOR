@@ -23,6 +23,12 @@ _MEASURES = {"outputs": [catalogs.OUTPUT_BOTH, catalogs.OUTPUT_QUANTITATIVE]}
 _DRAWS = {"outputs": [catalogs.OUTPUT_BOTH, catalogs.OUTPUT_VISUALISATION]}
 
 LAYOUT = {
+    # Injected by the server, not published by this tool, and hidden until
+    # there is a review workflow to justify them: `keep_intermediate` offers a
+    # section VFACE's panel never asked for, and `stop_after` is a box that
+    # stops a cohort halfway with nothing yet built to resume it.
+    "keep_intermediate": {"hidden": True},
+    "stop_after": {"hidden": True},
     "t1": {"section": _INPUTS, "label": "CBCT volumes"},
     "t2": {
         "section": _INPUTS, "label": "Follow-up CBCT volumes",
@@ -34,10 +40,12 @@ LAYOUT = {
     "regions": {"section": _INPUTS, "label": "Regions to measure"},
 
     "measurements": {
+        "hidden": True,
         "section": _LISTS, "label": "Measurement lists (one per region)",
         "visible_when": _MEASURES,
     },
     "feature_template": {
+        "hidden": True,
         "section": _LISTS, "label": "Feature list the classifier was trained on",
         "visible_when": _MEASURES,
     },
@@ -47,31 +55,38 @@ LAYOUT = {
     },
 
     "cranial_base_reference": {
+        "hidden": True,
         "section": _REFERENCES, "label": "Cranial base orientation reference",
         "visible_when": _ORIENTS,
     },
     "maxilla_reference": {
+        "hidden": True,
         "section": _REFERENCES, "label": "Maxilla orientation reference",
         "visible_when": _ORIENTS,
     },
     "mirror_reference": {
+        "hidden": True,
         "section": _REFERENCES, "label": "Mirror transform",
         "visible_when": _ASYMMETRY,
     },
 
     "segmentation_model": {
+        "hidden": True,
         "section": _MODELS, "label": "Bone segmentation bundle",
         "visible_when": _REGISTERS,
     },
     "landmark_model": {
+        "hidden": True,
         "section": _MODELS, "label": "CBCT landmark bundle",
         "visible_when": _MEASURES,
     },
     "classifier_model": {
+        "hidden": True,
         "section": _MODELS, "label": "Asymmetry classifier bundle",
         "visible_when": _MEASURES,
     },
     "surface_model": {
+        "hidden": True,
         "section": _MODELS, "label": "Surface segmentation bundle",
         "visible_when": _DRAWS,
     },
