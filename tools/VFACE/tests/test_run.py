@@ -275,8 +275,24 @@ def test_the_request_is_refused_before_a_single_volume_is_read(tmp_path):
     hour of registration."""
     sup = PipelineSup(tmp_path)
     with pytest.raises(ToolInputError):
-        run(sup=sup, **request(tmp_path, landmark_model=""))
+        run(sup=sup, **request(tmp_path, measurements=""))
     assert sup.calls == []
+
+
+def test_no_landmark_bundle_named_is_a_request_not_an_omission(tmp_path):
+    """Which weights the landmark tool predicts with is that tool's business.
+
+    ALI_CBCT resolves its own from the deployment's data folder, and ASO --
+    which reaches it for the orientation -- asks only for a supervisor. VFACE
+    demanded a name anyway, so a panel that had stopped showing the field
+    refused every run it sent. AREG_CBCT dropped the same requirement for the
+    same reason.
+    """
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(tmp_path, landmark_model=""))
+    asked = [params for name, params in sup.calls if name == "ASO"]
+    assert asked, "the orientation never ran"
+    assert not [params for params in asked if params.get("landmark_model")]
 
 
 # ---------------------------------------------------------------------------

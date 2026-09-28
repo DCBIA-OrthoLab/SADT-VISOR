@@ -136,8 +136,10 @@ def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
         "cbct_landmarks": list(landmarks),
         "output_suffix": suffix,
     }
-    # ASO needs the bundle NAMED: a tool no longer resolves paths, and
-    # forgetting it is a failure two tools down.
+    # Sent only when the caller named one. ASO reaches the landmark tool
+    # itself and asks only for a supervisor, and ALI_CBCT resolves its own
+    # weights from the data folder -- so an omitted bundle is the right
+    # request, not a forgotten one.
     if landmark_model:
         parameters["landmark_model"] = landmark_model
     return _returned(sup.run("ASO", **parameters))

@@ -442,11 +442,12 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
                 "'measurements' names the folder holding one measurement list per "
                 "region -- one file per CB, MAND and MAX -- and none was sent."
             )
-        if not landmark_model:
-            raise ToolInputError(
-                "Measuring needs the landmarks every measurement is computed from, "
-                "and 'landmark_model' names the bundle that predicts them."
-            )
+        # `landmark_model` is NOT required. Which weights the landmark tool
+        # predicts with is that tool's business: ALI_CBCT resolves its own from
+        # the deployment's data folder, and ASO -- which reaches it for the
+        # orientation -- asks only for a supervisor. Demanding a name here made
+        # VFACE hold a name for its neighbour's storage, and it is the reason
+        # AREG_CBCT dropped the same requirement. An explicit one is still obeyed.
     if wants_heat_maps:
         tools.require(sup, "Batch_Dental_Seg", "Heat maps")
         if not surface_model:
