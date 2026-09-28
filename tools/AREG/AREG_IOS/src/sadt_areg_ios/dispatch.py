@@ -71,6 +71,32 @@ class RegistrationRun:
 
 
 
+# Which DATA folder this engine's bundles live in, and the two it needs by
+# name. Written rather than derived, as the other two AREG engines write their
+# own: which folder serves which engine is a deployment fact -- the three AREG
+# engines share `DATA/AREG/` -- and the bundle names are the ones the manifest
+# unpacks those archives to.
+#
+# Resolved here rather than asked of the caller. `models/` holds every AREG
+# bundle together, around sixty checkpoints, so an unset field arrived as the
+# WHOLE folder and the run died on "has to name an entry holding exactly one"
+# after it had already segmented and oriented both timepoints. Neither of these
+# is a clinical choice: `AREG_model` holds exactly one checkpoint and
+# `IOS_Gold_files` is the frame the published test data is oriented into. A
+# deployment that wants another still names it, and what it names wins.
+_DATA_NAME = "AREG"
+_REGISTRATION_BUNDLE = "AREG_model"
+_ORIENTATION_REFERENCE = "IOS_Gold_files"
+
+
+def _own_bundle(data_root, name):
+    """The bundle this deployment publishes under that name, or ""."""
+    if not data_root:
+        return ""
+    candidate = os.path.join(str(data_root), _DATA_NAME, "models", name)
+    return candidate if os.path.isdir(candidate) else ""
+
+
 def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, height,
                sup=None) -> None:
     if patch not in catalogs.PATCH_CHOICES:
@@ -401,6 +427,7 @@ def main(
     output_suffix="Reg",
     output_dir=None,
     sup=None,
+    data_root=None,
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -423,7 +450,13 @@ def main(
         )
 
     patch = str(ios_patch or catalogs.PATCH_PALATE)
-    reference = ios_reference
+    # What the caller named wins; what it left empty this deployment fills. The
+    # checks below then see a real bundle and their message stays about what is
+    # missing from the DEPLOYMENT rather than about a field the panel no longer
+    # shows.
+    registration_model = registration_model or _own_bundle(
+        data_root, _REGISTRATION_BUNDLE)
+    reference = ios_reference or _own_bundle(data_root, _ORIENTATION_REFERENCE)
     _check_ios(automation, patch, registration_model, reference,
                mgl_landmarks, mgl_patch_height, sup)
 

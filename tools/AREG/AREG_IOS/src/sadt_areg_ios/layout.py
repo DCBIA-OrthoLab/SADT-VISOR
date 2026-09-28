@@ -52,10 +52,19 @@ LAYOUT = {
     "automation": {"section": _INPUTS, "label": "Automation"},
 
     "patch": {"section": _REGISTRATION, "label": "Registration patch"},
+    # Not offered: one frame the chain expects (dispatch._own_bundle), so there
+    # is nothing here for a clinician to decide and a wrong pick is a chain
+    # oriented into the wrong reference.
     "reference": {
+        "hidden": True,
         "section": _REGISTRATION, "label": "Orientation reference", "visible_when": _FULLY,
     },
+    # Not offered: `AREG_model` holds exactly one checkpoint, and this field
+    # left empty arrived as the whole `models/` folder -- sixty checkpoints --
+    # which killed the run on "has to name an entry holding exactly one" AFTER
+    # it had segmented and oriented both timepoints.
     "registration_model": {
+        "hidden": True,
         "section": _REGISTRATION, "label": "Patch model", "visible_when": _PREDICTED,
     },
     # Not offered: Crown_Seg resolves its own weights, and this name has to
@@ -63,7 +72,10 @@ LAYOUT = {
     "crown_model": {"hidden": True, 
         "section": _REGISTRATION, "label": "Crown segmentation model", "visible_when": _FULLY,
     },
+    # Not offered: ALI_IOS finds its own weights, as it does for every other
+    # landmark bundle in this family.
     "mgl_model": {
+        "hidden": True,
         "section": _REGISTRATION, "label": "Mucogingival landmark bundle", "visible_when": _MGL,
     },
     "mgl_landmarks": {

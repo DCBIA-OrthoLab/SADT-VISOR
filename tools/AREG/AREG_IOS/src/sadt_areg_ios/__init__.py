@@ -37,6 +37,7 @@ def run(
     output_suffix: str = "Reg",
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Register a follow-up intraoral scan onto its baseline, so the two compare.
 
@@ -85,4 +86,5 @@ def run(
         mgl_patch_height=mgl_patch_height,
         output_suffix=output_suffix,
         sup=sup,
+        data_root=data_root,
     )
