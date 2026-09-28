@@ -989,7 +989,7 @@ class TestTheModelFieldsAreNotOffered:
     runs."""
 
     @pytest.mark.parametrize(
-        "name", ["reference", "registration_model", "mgl_model", "crown_model"])
+        "name", ["ios_reference", "registration_model", "mgl_model", "crown_model"])
     def test_each_model_field_is_hidden(self, name):
         from sadt_areg_ios.layout import LAYOUT
 

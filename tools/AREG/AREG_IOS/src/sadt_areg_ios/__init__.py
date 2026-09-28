@@ -25,7 +25,7 @@ def run(
     t2: Path,
     output_dir: Path,
     automation: Literal["Semi-Automated", "Fully-Automated"] = "Fully-Automated",
-    reference: Path = "",
+    ios_reference: Path = "",
     patch: Literal[
         "Palate (upper arch)", "Mucogingival line (lower arch)"
     ] = "Palate (upper arch)",
@@ -50,7 +50,7 @@ def run(
         automation: Semi-Automated takes meshes that already carry their tooth
             labels and orientation; Fully-Automated labels and orients them
             first, through the crown-segmentation and orientation tools.
-        reference: The frame the arches are oriented onto before registering.
+        ios_reference: The frame the arches are oriented onto before registering.
         patch: Which part of the arch to match on -- the palate for an upper
             arch, the band around the mucogingival line for a lower one.
         registration_model: The model that finds the palatal patch. Not used by
@@ -77,7 +77,7 @@ def run(
         t2=t2,
         output_dir=output_dir,
         automation=automation,
-        ios_reference=reference,
+        ios_reference=ios_reference,
         ios_patch=patch,
         registration_model=registration_model,
         crown_model=crown_model,

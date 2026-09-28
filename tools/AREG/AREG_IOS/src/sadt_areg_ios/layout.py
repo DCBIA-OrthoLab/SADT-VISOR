@@ -52,10 +52,17 @@ LAYOUT = {
     "automation": {"section": _INPUTS, "label": "Automation"},
 
     "patch": {"section": _REGISTRATION, "label": "Registration patch"},
+    # `ios_reference`, NOT `reference`: AREG_CBCT publishes a `reference` that is
+    # a real clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown.
+    # One name has to mean one thing across the engines the AREG facade
+    # composes, so this engine opting its own out of the hosted-model convention
+    # under the shared name would have made the facade refuse to publish at all.
+    # AREG_IOSCBCT names its own `cbct_reference` for exactly this reason.
+    #
     # Not offered: one frame the chain expects (dispatch._own_bundle), so there
     # is nothing here for a clinician to decide and a wrong pick is a chain
     # oriented into the wrong reference.
-    "reference": {
+    "ios_reference": {
         "hidden": True,
         "section": _REGISTRATION, "label": "Orientation reference", "visible_when": _FULLY,
     },
