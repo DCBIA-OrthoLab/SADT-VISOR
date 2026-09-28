@@ -298,3 +298,48 @@ class TestTheBundlesVfaceResolvesItself:
         from sadt_vface import dispatch
 
         assert "surface_model" not in dispatch._BUNDLES
+
+
+class TestWhereTheRegistrationPutItsMatrices:
+    """AREG_CBCT groups its results by region, so the directory it returns holds
+    no transform at all -- the matrices are one level down, beside its report.
+
+    Nothing caught this until the chain was run for the first time: AutoMatrix,
+    handed that directory next, refused with "No transform found", after the
+    segmentation and the three registrations had already been paid for.
+    """
+
+    def test_the_region_subfolder_is_what_comes_back(self, sup, tmp_path):
+        from sadt_vface import tools
+
+        produced = tools.register(sup, str(tmp_path / "t1"), str(tmp_path / "t2"),
+                                  "Cranial base", str(tmp_path / "masks"))
+        # The fake supervisor hands back its slot; plant AREG's shape in it.
+        assert produced
+
+    def test_one_subfolder_is_descended_into(self, tmp_path):
+        from sadt_vface import tools
+
+        root = tmp_path / "output"
+        (root / "CB").mkdir(parents=True)
+        (root / "AREG_report.json").write_text("{}")
+        assert tools._region_folder(str(root)) == str(root / "CB")
+
+    def test_several_subfolders_are_left_alone(self, tmp_path):
+        """Only a single-region call can be descended into unambiguously. Two
+        means the caller asked for two, and picking one would be a guess."""
+        from sadt_vface import tools
+
+        root = tmp_path / "output"
+        for name in ("CB", "MAND"):
+            (root / name).mkdir(parents=True)
+        assert tools._region_folder(str(root)) == str(root)
+
+    def test_a_flat_output_is_left_alone(self, tmp_path):
+        """A tool that writes its matrices at the top level needs no descent."""
+        from sadt_vface import tools
+
+        root = tmp_path / "output"
+        root.mkdir()
+        (root / "C_0001_Reg_transform.tfm").write_text("")
+        assert tools._region_folder(str(root)) == str(root)

@@ -222,7 +222,7 @@ def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "") ->
     the original's frame.
     """
     logger.info("VFACE: asking 'AREG_CBCT' to register on the %s", region)
-    return _returned(sup.run(
+    return _region_folder(_returned(sup.run(
         "AREG_CBCT",
         t1=t1,
         t2=t2,
@@ -230,7 +230,27 @@ def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "") ->
         regions=[region],
         t1_masks=masks,
         output_suffix="Reg",
-    ))
+    )))
+
+
+def _region_folder(produced: str) -> str:
+    """Where AREG_CBCT actually put the matrices, one level down.
+
+    It groups its results by region -- `CB/`, `MAND/`, `MAX/` beside its report
+    -- so the directory it returns holds no transform at all. AutoMatrix, handed
+    that directory next, refused with "No transform found", after the whole
+    segmentation and registration had been paid for.
+
+    The subfolder is found rather than named: VFACE asks for ONE region per
+    call, so there is exactly one, and looking it up in AREG's own vocabulary
+    would put that table in two places. `REGION_TABLE`'s `areg` column exists
+    precisely because the two vocabularies are not the same.
+    """
+    try:
+        inside = [entry for entry in os.scandir(produced) if entry.is_dir()]
+    except OSError:
+        return produced
+    return inside[0].path if len(inside) == 1 else produced
 
 
 def predict_landmarks(sup, scans: str, landmarks, model: str = "",
