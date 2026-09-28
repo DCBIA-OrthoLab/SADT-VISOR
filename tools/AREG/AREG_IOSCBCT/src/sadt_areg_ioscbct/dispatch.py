@@ -32,39 +32,56 @@ REPORT_NAME = "AREG_report.json"
 WORK_DIRNAME = ".areg_work"
 
 
-def _surface_points(path: str):
-    """The mesh's points, and the mesh, read once."""
-    import vtk
-    from vtk.util.numpy_support import vtk_to_numpy
+def _read_mesh(path: str):
+    """The intraoral mesh with its point data, as pyvista reads it.
 
-    reader = vtk.vtkPolyDataReader() if path.lower().endswith(".vtk") else vtk.vtkSTLReader()
-    reader.SetFileName(path)
-    if hasattr(reader, "ReadAllScalarsOn"):
-        reader.ReadAllScalarsOn()
-    reader.Update()
-    surface = reader.GetOutput()
-    return surface, vtk_to_numpy(surface.GetPoints().GetData())
+    pyvista rather than raw vtk, for two things the registration needs and a
+    bare `vtkPolyDataReader` does not hand over as usefully: the `Universal_ID`
+    tooth labels, which say which points are crowns, and `compute_normals`,
+    which the point-to-plane step measures along. It also transforms the mesh
+    with its arrays attached, so the registered file keeps the labels the
+    unregistered one carried.
+    """
+    import pyvista as pv
+
+    return pv.read(path)
 
 
-def _write_surface(surface, points, path: str) -> None:
-    import vtk
-    from vtk.util.numpy_support import numpy_to_vtk
-
-    moved = vtk.vtkPolyData()
-    moved.DeepCopy(surface)
-    array = numpy_to_vtk(np.ascontiguousarray(points, dtype=float), deep=True)
-    vtk_points = vtk.vtkPoints()
-    vtk_points.SetData(array)
-    moved.SetPoints(vtk_points)
-
+def _write_mesh(mesh, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    writer = vtk.vtkPolyDataWriter()
-    writer.SetFileName(path)
-    writer.SetInputData(moved)
-    # Binary, not the writer's ASCII default: it round-trips float32 exactly
-    # while ASCII prints six significant digits, and it parses far faster.
-    writer.SetFileTypeToBinary()
-    writer.Write()
+    # Binary, not ASCII: it round-trips float32 exactly, while ASCII prints six
+    # significant digits, and it parses far faster.
+    mesh.save(path, binary=True)
+
+
+def _cbct_surface(scan_path: str, landmark_sets: dict):
+    """The CBCT contoured as a surface, plus its verdict on the landmarks.
+
+    Once per patient, not once per arch: contouring a 2.8 million point surface
+    is the expensive half of the run, and both arches query the same one. The
+    level is read off all of that patient's CBCT landmarks together -- it
+    describes the scan, not one jaw, and twelve points make a steadier median
+    than six.
+
+    Returns `(None, {}, reason)` when the volume cannot be read. The caller then
+    registers on the landmarks alone and the report says the ICP did not run,
+    which is worse than refining but better than stopping -- and it is written
+    down either way rather than looking like a run that simply had no ICP.
+    """
+    from . import volume
+
+    merged = {}
+    for points in landmark_sets.values():
+        merged.update(points)
+    try:
+        surface, on_enamel = volume.read(scan_path, merged)
+    except Exception as exc:  # noqa: BLE001 - a landmark-only run is still a run
+        # The class name, not `str(exc)`: readers carry the server's own paths in
+        # their messages, and the report goes back to the client. The full
+        # traceback stays in the log, where paths belong.
+        logger.exception("Could not contour the CBCT of %s", scan_path)
+        return None, {}, f"the CBCT could not be contoured ({type(exc).__name__})"
+    return surface, on_enamel, None
 
 
 def _landmarks_by_jaw(directory: str) -> dict:
@@ -214,6 +231,9 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
         # Narrowed to this patient BEFORE the jaw is looked at: see _for_patient.
         own_ios = _for_patient(ios_landmarks, patient, sole_patient)
         own_cbct = _for_patient(cbct_landmarks, patient, sole_patient)
+        cbct_surface, on_enamel, surface_error = _cbct_surface(data["cbct"], own_cbct)
+        if surface_error:
+            entry["cbct_surface_error"] = surface_error
         for mesh_path in data["ios"]:
             name = os.path.basename(mesh_path)
             try:
@@ -224,14 +244,14 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
                         f"No landmark file matches patient '{patient}' and this mesh's "
                         f"jaw on {'the intraoral' if not moving else 'the CBCT'} side."
                     )
-                surface, points = _surface_points(mesh_path)
+                mesh = _read_mesh(mesh_path)
                 matrix, detail = pipeline.register_one(
-                    points, moving, fixed, max_dist=max_dist
+                    mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
                 )
                 destination = os.path.join(
                     output_dir, patient, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
                 )
-                _write_surface(surface, geometry.apply(points, matrix), destination)
+                _write_mesh(mesh.transform(matrix, inplace=False), destination)
                 # splitext, not `destination.replace(".vtk", ...)`: str.replace
                 # rewrites EVERY occurrence, so a mesh whose own stem carries
                 # `.vtk` produced a mangled matrix name beside a correct mesh.
@@ -329,7 +349,7 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
             ios_dir=ios_root, cbct_dir=cbct_root,
             ios_landmark_dir=ios_lm, cbct_landmark_dir=cbct_lm,
             output_dir=output_dir, suffix=suffix, report=report,
-            max_dist=float(max_dist) if max_dist else geometry.DEFAULT_MAX_DIST,
+            max_dist=float(max_dist) if max_dist else geometry.ICP_MAX_DIST_MM,
             # The last waypoint `tools.py` writes is 0.5; the registration has
             # the rest. Registration mode wrote none of them and starts at 0.
             progress_start=0.0 if automation == catalogs.AUTOMATION_REGISTRATION else 0.6,

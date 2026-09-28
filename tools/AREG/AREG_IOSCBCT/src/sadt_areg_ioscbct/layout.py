@@ -75,9 +75,12 @@ LAYOUT = {
         "hidden": True, "section": _MODELS, "label": "Orientation reference", "visible_when": _ORIENTED,
     },
 
-    # The ICP refinement it tunes never runs: `pipeline.register_one` refines
-    # only when handed points sampled from the CBCT, and the one production
-    # call site passes none. A knob wired to nothing is worse than no knob.
+    # Not offered, and no longer for the reason it once was: this used to tune
+    # an ICP that never ran, and now it tunes the one that does. Still hidden,
+    # because 1.0 mm is not a clinical choice -- it is the capture radius the
+    # whole chain was measured at, upstream included, and a clinician reading
+    # "ICP match distance" has no way to know that widening it lets the arch
+    # match the opposing one.
     "max_dist": {"section": _OUTPUTS, "label": "ICP match distance (mm)", "hidden": True},
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
 }
