@@ -407,6 +407,44 @@ def test_the_orientation_request_is_the_nested_one(tmp_path):
     assert params["output_suffix"] == "Or"
 
 
+def test_aso_is_asked_for_the_landmarks_the_reference_defines(tmp_path):
+    """Left out, ASO used its own defaults -- the Frankfurt set -- and every
+    run oriented on the occlusal reference was refused before ALI was asked."""
+    import json as _json
+    reference = tmp_path / "CBCT_Gold_Occlusal_Midsagittal_Plane"
+    reference.mkdir()
+    (reference / "UP01_Or.mrk.json").write_text(_json.dumps({"markups": [{"controlPoints": [
+        {"label": label} for label in ("IF", "ANS", "UR6O", "UL6O", "UR1O", "PNS")]}]}))
+    planted = tmp_path / "oriented"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
+
+    tools.orient_scans(sup, str(tmp_path / "scans"), str(reference), "CBCT")
+
+    assert sup.calls[0][1]["cbct_landmarks"] == ["IF", "ANS", "UR6O", "UL6O", "UR1O", "PNS"]
+
+
+def test_a_reference_without_markups_leaves_aso_its_own_choice(tmp_path):
+    planted = tmp_path / "oriented"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
+    tools.orient_scans(sup, str(tmp_path / "scans"), str(tmp_path / "nothing"), "CBCT")
+    assert "cbct_landmarks" not in sup.calls[0][1]
+
+
+def test_the_real_shipped_references_name_their_own_landmarks():
+    """Read from the bundles this deployment stages, when they are here."""
+    import os as _os
+    root = _os.environ.get("AREG_REFERENCE_ROOT", "/home/luciacev/code/VISOR-serve/DATA/AREG/models")
+    occlusal = _os.path.join(root, "CBCT_Gold_Occlusal_Midsagittal_Plane")
+    frankfurt = _os.path.join(root, "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane")
+    if not (_os.path.isdir(occlusal) and _os.path.isdir(frankfurt)):
+        import pytest
+        pytest.skip("the reference bundles are not staged here")
+    assert set(tools.reference_landmarks(occlusal)) == {"ANS", "IF", "PNS", "UL6O", "UR1O", "UR6O"}
+    assert set(tools.reference_landmarks(frankfurt)) == {"Ba", "S", "N", "RPo", "LPo", "ROr", "LOr"}
+
+
 # Moved from the single AREG suite when AREG became three tools. These drive
 # `main()` with t1/t2, which is this tool's signature, not the orchestrator's;
 # they were sitting in AREG_IOSCBCT's file only because the three used to share
