@@ -32,6 +32,7 @@ Four things worth knowing before changing anything here:
   answer and "deploy a tool" usually is not.
 """
 
+import json
 import logging
 import os
 
@@ -103,8 +104,47 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     # three tools down, so it is passed explicitly and required by _check_cbct.
     if modality == "CBCT" and landmark_model:
         parameters["landmark_model"] = landmark_model
+    # The landmarks to orient on are the ones the REFERENCE defines. Left out,
+    # ASO falls back to its own defaults -- the Frankfurt set -- which only
+    # happen to match the Frankfurt reference: the occlusal one defines none of
+    # them, and every run with it was refused before ALI was even asked.
+    if modality == "CBCT" and "cbct_landmarks" not in extra:
+        labels = reference_landmarks(reference_path)
+        if labels:
+            parameters["cbct_landmarks"] = labels
     parameters.update(extra)
     return _returned(sup.run("ASO", **parameters))
+
+
+def reference_landmarks(reference_path: str) -> list:
+    """The landmark labels the reference's markups file defines, in its order,
+    or [] when there is none to read.
+
+    Read from the reference itself rather than listed per reference here, so a
+    new reference orients on its own landmarks without this file changing.
+    """
+    candidates = []
+    if os.path.isfile(reference_path):
+        candidates = [reference_path]
+    elif os.path.isdir(reference_path):
+        for directory, _subdirs, names in sorted(os.walk(reference_path)):
+            candidates += [os.path.join(directory, name) for name in sorted(names)
+                           if name.endswith(".mrk.json") and not name.startswith(".")]
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        labels = []
+        for markup in document.get("markups") or []:
+            for point in markup.get("controlPoints") or []:
+                label = point.get("label")
+                if isinstance(label, str) and label and label not in labels:
+                    labels.append(label)
+        if labels:
+            return labels
+    return []
 
 
 def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
