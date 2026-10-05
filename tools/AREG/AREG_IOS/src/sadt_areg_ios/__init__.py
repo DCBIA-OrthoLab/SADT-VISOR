@@ -20,6 +20,31 @@ from typing import Literal
 from .dispatch import main
 
 
+# Which inputs hold the same patients, for a client splitting a cohort into
+# batches. See AREG_CBCT for the contract.
+PAIRED = {"axes": ["t1", "t2"]}
+
+
+def pairs(t1: list, t2: list) -> dict:
+    """Which of these meshes go together, by NAME only. A patient travels with
+    every arch it has at each timepoint; which arch is registered is decided by
+    `run()`, as it is for a cohort sent whole."""
+    from sadt_areg_common import batching
+
+    from .pipeline import discover
+    from .surfaces import SURFACE_EXTENSIONS
+
+    def match(roots):
+        sides = {"t1": discover(roots["t1"], ""), "t2": discover(roots["t2"], "")}
+        both = set(sides["t1"]) & set(sides["t2"])
+        matched = {key: {side: sorted(sides[side][key].values()) for side in sides} for key in both}
+        unmatched = {side: {key: sorted(found[key].values()) for key in found if key not in both}
+                     for side, found in sides.items()}
+        return dict(roots), matched, unmatched
+
+    return batching.pairs_by_name({"t1": t1, "t2": t2}, match, known_extensions=SURFACE_EXTENSIONS)
+
+
 def run(
     t1: Path,
     t2: Path,
