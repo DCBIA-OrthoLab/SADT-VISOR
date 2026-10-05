@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from conftest import cohort, displaced, full_mask, phantom, tree_of, write
+from conftest import FakeSup, cohort, displaced, full_mask, phantom, tree_of, write
 from sadt_areg_cbct import dispatch
 from sadt_areg_common import catalogs, pairing
 from sadt_areg_common.errors import ToolInputError
@@ -136,9 +136,9 @@ def test_the_working_directory_does_not_survive_the_run(semi_run):
 
 
 def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
-    """Resampled on the MOVING image's grid, as the original did: the result
-    keeps the T2's resolution and field of view, in the T1's frame. Resampling
-    onto the T1 grid instead would crop the T2 to the T1's field of view."""
+    """The T2's own size and spacing, placed where the T2 landed in the T1's
+    frame. Resampling onto the T1 grid instead would crop the T2 to the T1's
+    field of view."""
     run, root = semi_run
     moving = sitk.ReadImage(os.path.join(root, "T2", "P1_T2_scan.nii.gz"))
     registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"))
@@ -146,6 +146,76 @@ def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
     assert registered.GetSize() == moving.GetSize()
     assert registered.GetSpacing() == pytest.approx(moving.GetSpacing())
     assert registered.GetPixelID() == sitk.sitkInt16
+
+
+def _oriented_run(tmp_path):
+    """An Oriented + Fully-Automated run, ASO and AMASSS planted, elastix real.
+
+    The T1 comes back from 'ASO' centred on the origin, as the real one does; the
+    T2 keeps the far-off origin of a scan straight from the machine. That gap is
+    the whole point: it is what the original's recentring of the T2 hid.
+    """
+    fixed = phantom(origin=(-18.8, -18.8, -18.8))
+    moving, _truth = displaced(fixed)
+    moving.SetOrigin((60.0, 40.0, -110.0))
+    write(phantom(origin=(0.0, 0.0, -38.0)), tmp_path / "T1" / "P1_T1_scan.nii.gz")
+    write(moving, tmp_path / "T2" / "P1_T2_scan.nii.gz")
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        (out / "P1_T1_lm_Or.mrk.json").write_text('{"markups": []}')
+        sitk.WriteTransform(sitk.Euler3DTransform(), str(out / "P1_T1_Or_transform.tfm"))
+        (out / "ASO_report.json").write_text("{}")
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    run = dispatch.register(
+        t1_path=str(tmp_path / "T1"),
+        t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_ORIENTED,
+        regions=["Cranial base"],
+        segmentation_model="/models/AMASSS",
+        orientation_reference=str(reference),
+        output_dir=str(tmp_path / "out"),
+        sup=FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss}),
+    )
+    return run, fixed
+
+
+def test_an_oriented_run_returns_the_t1_the_t2_was_registered_onto(tmp_path):
+    """The registered T2 is in the ORIENTED T1's frame, so it can only be read
+    next to that T1 -- which used to be thrown away with the supervisor's
+    scratch, leaving the caller a result and nothing to lay it over."""
+    run, _fixed = _oriented_run(tmp_path)
+    oriented = os.path.join(run.output_dir, dispatch.ORIENTED_DIRNAME)
+
+    assert sorted(os.listdir(oriented)) == [
+        "ASO_report.json", "P1_T1_Or.nii.gz", "P1_T1_Or_transform.tfm", "P1_T1_lm_Or.mrk.json",
+    ]
+    report = json.load(open(os.path.join(run.output_dir, dispatch.REPORT_NAME), encoding="utf-8"))
+    assert os.path.join(dispatch.ORIENTED_DIRNAME, "P1_T1_Or.nii.gz") in report["oriented"]
+
+
+def test_a_t2_far_from_the_oriented_t1_comes_back_whole_and_on_it(tmp_path):
+    """Resampled on the T2's grid as it stood, a T2 whose box does not surround
+    the oriented T1's overlapped it on a corner, and the rest came back empty --
+    on a clinical pair, seven eighths of the volume. The grid now goes where the
+    T2 landed: same size and spacing, and the T2 sits on the T1 it was
+    registered onto."""
+    run, fixed = _oriented_run(tmp_path)
+    registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"), sitk.sitkFloat32)
+
+    on_t1 = sitk.GetArrayFromImage(sitk.Resample(registered, fixed, sitk.Transform(), sitk.sitkLinear, 0.0))
+    t1 = sitk.GetArrayFromImage(fixed)
+    assert (on_t1 != 0).mean() > 0.9
+    assert np.corrcoef(t1.ravel(), on_t1.ravel())[0, 1] > 0.9
 
 
 # ---------------------------------------------------------------------------

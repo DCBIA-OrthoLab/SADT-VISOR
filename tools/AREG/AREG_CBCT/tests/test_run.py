@@ -232,11 +232,11 @@ class TestSemiAutomatedCBCT:
         registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"))
         moving = sitk.ReadImage(str(tmp_path / "T2" / "P1_T2_scan.nii.gz"))
 
-        # Resampling the ORIGINAL T2 with the written transform reproduces the
-        # registered volume the archive holds. It could only do that if the
-        # transform lives in the space of the file the caller sent.
+        # Resampling the ORIGINAL T2 with the written transform, onto the grid
+        # the registered file carries, reproduces that file. It could only do
+        # that if the transform lives in the space of the file the caller sent.
         resampler = sitk.ResampleImageFilter()
-        resampler.SetReferenceImage(moving)
+        resampler.SetReferenceImage(registered)
         resampler.SetTransform(transform)
         resampler.SetInterpolator(sitk.sitkLinear)
         reproduced = sitk.Cast(resampler.Execute(moving), sitk.sitkInt16)
