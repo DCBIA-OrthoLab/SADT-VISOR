@@ -25,6 +25,27 @@ logger = logging.getLogger("GreedyReg")
 
 __all__ = ["run"]
 
+
+# Which inputs hold the same patients, for a client splitting a cohort into
+# batches. See AREG_CBCT for the contract.
+PAIRED = {"axes": ["t1", "t2"]}
+
+
+def pairs(t1: list, t2: list) -> dict:
+    """Which of these files go together, by NAME only, exactly as `run()` pairs
+    them. See sadt_areg_common.batching."""
+    from sadt_areg_common import batching
+
+    def match(roots):
+        found = pairing.pair(roots["t1"], roots["t2"], "")
+        every = {"t1": pairing.discover(roots["t1"], ""), "t2": pairing.discover(roots["t2"], "")}
+        matched = {key: {"t1": [entry["t1"]], "t2": [entry["t2"]]} for key, entry in found.matched.items()}
+        unmatched = {"t1": {key: [every["t1"][key]] for key in found.t1_only},
+                     "t2": {key: [every["t2"][key]] for key in found.t2_only}}
+        return dict(roots), matched, unmatched
+
+    return batching.pairs_by_name({"t1": t1, "t2": t2}, match)
+
 # Every token a mask name may carry on top of the patient's own, so
 # `P1_T1_MAND_seg.nii.gz` keys to the `P1` its scan keys to. The same set
 # `pairing.discover_masks` builds, and applied under the same guard: only to a
