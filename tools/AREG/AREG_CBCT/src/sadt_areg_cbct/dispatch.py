@@ -262,6 +262,32 @@ def _collect_segmentations(amasss_dir, codes, output_dir, report) -> None:
     report["segmentations"] = sorted(collected)
 
 
+# Where the oriented T1 lands in the caller's output, with ASO's landmarks and
+# transform beside it.
+ORIENTED_DIRNAME = "T1_Oriented"
+
+
+def _collect_oriented(oriented_dir, output_dir, report) -> None:
+    """Copy ASO's oriented T1 tree into the caller's output.
+
+    The registered T2 is written in the ORIENTED T1's frame, so it is only
+    readable next to that T1 -- laid over the T1 the caller sent, it sits as far
+    off as the orientation moved it. The oriented scans live in the
+    supervisor's scratch and were thrown away with it, so the one volume the
+    result has to be read against never reached anyone. Copied whole: the
+    scan, `<name>_lm_Or.mrk.json` and `<name>_Or_transform.tfm` each say
+    something the other two do not, and ASO's own report says how it went.
+    """
+    if not oriented_dir or not os.path.isdir(oriented_dir):
+        return
+    destination = os.path.join(output_dir, ORIENTED_DIRNAME)
+    shutil.copytree(oriented_dir, destination, dirs_exist_ok=True)
+    report["oriented"] = sorted(
+        os.path.relpath(os.path.join(root, name), output_dir)
+        for root, _dirs, files in os.walk(destination) for name in files
+    )
+
+
 def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
@@ -311,6 +337,7 @@ def _run_cbct(
             landmark_model=landmark_model or "",
         )
         report["oriented_t1"] = True
+        _collect_oriented(oriented, output_dir, report)
         t1_root = oriented
 
     # Step 2 -- the masks the registration is confined to.

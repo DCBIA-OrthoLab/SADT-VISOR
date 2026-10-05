@@ -27,6 +27,7 @@ Three behaviours are deliberately different from the original:
 import logging
 import os
 
+import numpy as np
 import SimpleITK as sitk
 
 from sadt_areg_common import catalogs, pairing
@@ -57,13 +58,19 @@ def register_patient(
     moving = sitk.ReadImage(t2_path)
     transform = elastix.register(masked, moving)
 
-    # Resampled on the MOVING image's own grid, as the original did: the result
-    # keeps the T2's resolution and field of view, in the T1's coordinate frame.
-    # (Resampling onto the T1 grid instead would crop the T2 to the T1's field
-    # of view and re-sample it to the T1's spacing -- a different, and lossier,
-    # answer to "where is the T2 now".)
+    # The T2's own size, spacing and direction, in the T1's frame -- placed where
+    # the T2 now IS. (Resampling onto the T1 grid instead would crop the T2 to the
+    # T1's field of view and re-sample it to the T1's spacing.)
+    #
+    # Not the T2's grid as it stands: the original could use that only because
+    # it had recentred the T2 first, so the T2's box and the oriented T1's both
+    # sat around the origin. Without the recentring, a T2 whose box runs from 0
+    # to +197 mm against a T1 oriented around the origin overlaps it on one
+    # octant, and seven eighths of the registered volume came back empty --
+    # measured on a clinical pair, 12.5 % of its voxels nonzero.
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(moving)
+    resampler.SetOutputOrigin(_origin_in_fixed_frame(moving, transform))
     resampler.SetTransform(transform)
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0)
@@ -97,6 +104,24 @@ def register_patient(
     if note:
         entry["note"] = note
     return entry
+
+
+def _origin_in_fixed_frame(moving: sitk.Image, transform: sitk.Transform) -> tuple:
+    """The origin that puts the T2's grid, unchanged in size, spacing and
+    direction, centred on where the T2's centre lands in the T1's frame.
+
+    `transform` maps the T1 frame to the T2 frame, so its inverse is what
+    carries the T2's centre over.
+    """
+    middle = (np.array(moving.GetSize()) - 1) / 2.0
+    centre = np.array(transform.GetInverse().TransformPoint(
+        moving.TransformContinuousIndexToPhysicalPoint(middle.tolist())))
+    direction = np.array(moving.GetDirection()).reshape(3, 3)
+    origin = centre - direction @ (middle * np.array(moving.GetSpacing()))
+    # Rounded to what a NIfTI header can hold (float32), so the file written
+    # describes the very grid that was sampled: resampling the T2 again with
+    # the written transform onto the written file's grid reproduces it exactly.
+    return tuple(float(value) for value in origin.astype(np.float32))
 
 
 def find_masks(mask_roots: list, region: str, scan_keys=()) -> dict:
