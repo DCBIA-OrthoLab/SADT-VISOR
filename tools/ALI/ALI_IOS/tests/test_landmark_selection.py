@@ -175,7 +175,7 @@ def stub_engine(monkeypatch):
     calls = {}
 
     def predict_landmarks(meshes, model_path, networks, prediction_ID, output_dir,
-                          device):
+                          device, span=(0.0, 1.0)):
         calls["networks"] = tuple(networks)
         scans = {}
         for mesh_path, key in meshes:

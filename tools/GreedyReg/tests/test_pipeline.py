@@ -232,7 +232,7 @@ def test_a_silent_failure_falls_back_to_what_was_printed(monkeypatch):
 def test_a_failure_with_nothing_printed_at_all_still_raises(monkeypatch):
     monkeypatch.setattr(pipeline, "_CHILD", "import sys; sys.exit(3)")
 
-    with pytest.raises(RuntimeError, match="greedy failed"):
+    with pytest.raises(RuntimeError, match="exit code 3, nothing printed"):
         pipeline.run_greedy(["-d", "3"])
 
 
@@ -244,7 +244,7 @@ def test_a_case_that_runs_too_long_is_abandoned(monkeypatch):
     have held a concurrency slot for ever."""
     monkeypatch.setattr(pipeline, "_CHILD", "import time; time.sleep(30)")
 
-    with pytest.raises(subprocess.TimeoutExpired):
+    with pytest.raises(TimeoutError):
         pipeline.run_greedy(["-d", "3"], timeout=0.5)
 
 
@@ -253,11 +253,11 @@ def test_the_timeout_is_reported_as_a_timeout(monkeypatch):
     different images -- so they must not arrive as the same exception."""
     monkeypatch.setattr(pipeline, "_CHILD", "import time; time.sleep(30)")
 
-    with pytest.raises(subprocess.TimeoutExpired) as expired:
+    with pytest.raises(TimeoutError) as expired:
         pipeline.run_greedy(["-d", "3"], timeout=0.5)
 
-    assert expired.value.timeout == 0.5
     assert not isinstance(expired.value, RuntimeError)
+    assert str(expired.value) == "greedy call did not finish within 0.5s"
 
 
 def test_the_default_bound_is_upstreams_ten_minutes(monkeypatch):
@@ -319,3 +319,78 @@ def test_the_output_of_greedy_is_captured_rather_than_inherited(monkeypatch):
 
     assert seen["capture_output"] is True
     assert seen["text"] is True
+
+
+# ---------------------------------------------------------------------------
+# What a failing greedy says
+# ---------------------------------------------------------------------------
+
+def test_a_failure_carries_only_the_last_line_of_a_traceback(monkeypatch):
+    """The child is a Python interpreter, so greedy throwing leaves a whole
+    traceback on stderr. Only its last line says why, and it is put after the
+    step so a cut message still keeps the cause."""
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "<string>", line 4, in <module>\n'
+        "RuntimeError: Image dimensions do not match\n\n"
+    )
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda command, **kw: subprocess.CompletedProcess(command, 1, stdout="", stderr=traceback),
+    )
+    command = pipeline.registration_command("f", "m", "o.mat", "i.mat", "NCC", "Rigid")
+
+    with pytest.raises(RuntimeError) as failure:
+        pipeline.run_greedy(command)
+
+    assert str(failure.value) == (
+        "greedy registration (NCC, 6 dof) failed: RuntimeError: Image dimensions do not match")
+
+
+def test_a_failing_resample_says_it_was_the_resample(monkeypatch):
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda command, **kw: subprocess.CompletedProcess(command, 1, stdout="", stderr="boom\n"),
+    )
+
+    with pytest.raises(RuntimeError, match="^greedy resample failed: boom$"):
+        pipeline.run_greedy(pipeline.resample_command("f", "m", "o", "t"))
+
+
+def test_a_timeout_names_the_step_and_the_bound_and_no_path(monkeypatch):
+    """TimeoutExpired's own message is the whole command line -- the child
+    script and every scan path -- so it is replaced, not chained."""
+    def expire(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", expire)
+    command = pipeline.registration_command(
+        "/scans/A1_T1.nii.gz", "/scans/A1_T2.nii.gz", "o.mat", "i.mat", "NCC", "Rigid")
+
+    with pytest.raises(TimeoutError) as expired:
+        pipeline.run_greedy(command)
+
+    assert str(expired.value) == "greedy registration did not finish within 600s"
+    assert expired.value.__cause__ is None and expired.value.__suppress_context__
+
+
+@pytest.mark.parametrize("command,expected", [
+    (pipeline.registration_command("f", "m", "o", "i", "NMI", "Affine"),
+     "registration (NMI, 12 dof)"),
+    (pipeline.registration_command("f", "m", "o", "i", "NCC", "Rigid", "mask.nii.gz"),
+     "registration (NCC, 6 dof, masked)"),
+    (pipeline.resample_command("f", "m", "o", "t"), "resample"),
+])
+def test_a_command_is_described_in_words(command, expected):
+    assert pipeline.describe(command) == expected
+
+
+def test_the_final_metric_is_the_last_levels():
+    printed = (
+        "Level   0  LastIter   Metrics  -8762.396413  Energy = -8762.396413\n"
+        "Level   0  Final RAS Transform:\n"
+        "Level   1  LastIter   Metrics  -7929.584809  Energy = -7929.584809\n"
+    )
+    assert pipeline.final_metric(printed) == pytest.approx(-7929.584809)
+    assert pipeline.final_metric("nothing of the kind") is None
+    assert pipeline.final_metric("") is None

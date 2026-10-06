@@ -78,10 +78,15 @@ class FakeSup:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.outputs = outputs or {}
         self.calls = []
+        self.spans = []
         self.messages = []
+        self.logs = []
         self.call_index = 0
 
     def run(self, tool, **params):
+        # The caller's span of its own bar. The server's supervisor removes it
+        # before the callee sees it, so it is recorded apart, never passed on.
+        self.spans.append((tool, params.pop("_progress", None)))
         self.calls.append((tool, params))
         maker = self.outputs.get(tool)
         if maker is None:
@@ -101,8 +106,9 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
+        self.logs.append((level, user, message))
 
 
 def crown_seg(failed=(), seen=None):
@@ -167,8 +173,9 @@ def stub_engine(monkeypatch):
     monkeypatch.setattr(engine, "check_dependencies", lambda: None)
 
     def fake(meshes, model_path, networks=None, prediction_ID="Pred",
-             output_dir=None, device=None):
+             output_dir=None, device=None, span=(0.0, 1.0)):
         passes.append(list(meshes))
+        fake.spans.append(tuple(span))
         return {
             "mode": "IOS",
             "device": device,
@@ -194,6 +201,7 @@ def stub_engine(monkeypatch):
             "duration_seconds": 0.1,
         }
 
+    fake.spans = []
     monkeypatch.setattr(engine, "predict_landmarks", fake)
     return passes
 
@@ -233,6 +241,48 @@ def test_the_ready_meshes_are_processed_before_the_raw_ones(tmp_path, stub_engin
     assert [key for _path, key in stub_engine[0]] == ["a_ready.vtk", "b_ready.vtk"]
     assert [key for _path, key in stub_engine[1]] == ["c_raw.vtk"]
     assert [tool for tool, _params in sup.calls] == ["Crown_Seg"]
+
+
+def test_the_two_passes_and_the_segmentation_tile_one_bar(tmp_path, stub_engine):
+    """Each phase fills its own slice, in the order they run, so the bar never
+    goes back. Two labelled meshes cost two units, the raw one a unit of
+    segmentation and a unit of landmarks: 0..1/2, 1/2..3/4, 3/4..1."""
+    sup = FakeSup(tmp_path, {"Crown_Seg": crown_seg()})
+
+    run(input=Path(a_mixed_cohort(tmp_path)), model=Path(a_bundle(tmp_path)),
+        output_dir=tmp_path / "out", sup=sup)
+
+    spans = engine.predict_landmarks.spans
+    assert spans == [(0.0, 0.5), (0.75, 1.0)]
+    assert sup.spans == [("Crown_Seg", (0.5, 0.75))]
+    assert all("_progress" not in params for _tool, params in sup.calls)
+    # The waypoint before the segmentation is where its slice begins.
+    assert (0.5, "labelling 1 mesh(es) with Crown_Seg") in sup.messages
+
+
+def test_a_fully_labelled_batch_fills_the_whole_bar_in_one_pass(tmp_path, stub_engine):
+    write_surface(tmp_path / "cohort" / "arch.vtk", labelled=True)
+
+    run(input=tmp_path / "cohort", model=Path(a_bundle(tmp_path)),
+        output_dir=tmp_path / "out", sup=FakeSup(tmp_path))
+
+    assert engine.predict_landmarks.spans == [(0.0, 1.0)]
+
+
+def test_meshes_the_segmentation_could_not_label_are_told_to_the_clinician(
+        tmp_path, stub_engine):
+    """A count, at warning level and for the clinician: their result is short
+    of those meshes. Never a name."""
+    sup = FakeSup(tmp_path, {"Crown_Seg": crown_seg(failed=("c_raw.vtk",))})
+
+    run(input=Path(a_mixed_cohort(tmp_path)), model=Path(a_bundle(tmp_path)),
+        output_dir=tmp_path / "out", sup=sup)
+
+    warnings = [(level, user, message) for level, user, message in sup.logs
+                if level == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0][1] is True
+    assert "c_raw" not in warnings[0][2]
 
 
 def test_a_fully_labelled_batch_never_reaches_for_the_other_tool(tmp_path, stub_engine):
@@ -410,10 +460,10 @@ def test_a_pass_that_produces_nothing_does_not_cost_the_other(tmp_path, monkeypa
     passes = []
 
     def fake(meshes, model_path, networks=None, prediction_ID="Pred",
-             output_dir=None, device=None):
+             output_dir=None, device=None, span=(0.0, 1.0)):
         passes.append(list(meshes))
         if len(passes) == 1:
-            raise RuntimeError("ALI produced no landmarks for any mesh. First error: x")
+            raise RuntimeError("0 of 1 meshes processed; most common failure: x (1 of 1)")
         return {
             "mode": "IOS", "device": device, "prediction_ID": prediction_ID,
             "networks": ["Occlusal"], "landmarks_without_model": [],

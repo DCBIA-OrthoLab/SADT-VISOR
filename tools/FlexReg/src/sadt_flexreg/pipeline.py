@@ -17,6 +17,8 @@ convention SimpleITK expects, which is what upstream's `flip @ M @ flip` did.
 import logging
 import os
 
+from .errors import ToolInputError, ToolUnavailableError  # noqa: F401  (re-exported)
+
 logger = logging.getLogger(__name__)
 
 SURFACE_EXTENSIONS = (".vtk", ".vtp", ".stl")
@@ -25,10 +27,6 @@ SURFACE_EXTENSIONS = (".vtk", ".vtp", ".stl")
 # with a `type` string; naming them here keeps the choice in one place.
 BUTTERFLY_ARRAY = "Butterfly"
 MUCOGINGIVAL_ARRAY = "Bottom_MGL"
-
-
-class ToolInputError(ValueError):
-    """The request cannot work, and the message says why to whoever sent it."""
 
 
 def _flip_lps_ras(surface):
@@ -47,15 +45,24 @@ def _flip_lps_ras(surface):
     return flip.GetOutput()
 
 
-def read_surface(path):
+def read_surface(path, argument=None):
     """A `.vtk`/`.vtp`/`.stl` surface, in RAS.
 
     Upstream read `.vtk` only, through `vtkPolyDataReader`, and a `.stl` handed
     to it returned an empty mesh that failed much later with no mention of the
     file. The reader is chosen by extension and an empty result is refused here.
+
+    `argument` names the request argument the path came from, so a refusal
+    says which input it is about: the server redacts file names, and
+    "'<file>' holds no surface points" told nobody which input was empty.
     """
     import vtk
 
+    # Never the file name: it is patient metadata, and the position in the
+    # batch already says which surface a refusal is about.
+    label = "'{}'".format(argument) if argument else "the surface"
+    if argument and not os.path.isfile(path):
+        raise ToolInputError("{} path does not exist or is not a file.".format(label))
     suffix = os.path.splitext(path)[1].lower()
     if suffix == ".vtp":
         reader = vtk.vtkXMLPolyDataReader()
@@ -65,15 +72,14 @@ def read_surface(path):
         reader = vtk.vtkPolyDataReader()
     else:
         raise ToolInputError(
-            "'{}' is not a surface ({}).".format(
-                os.path.basename(path), ", ".join(SURFACE_EXTENSIONS))
+            "{} is not a surface ({}).".format(label, ", ".join(SURFACE_EXTENSIONS))
         )
     reader.SetFileName(path)
     reader.Update()
     surface = reader.GetOutput()
     if surface is None or surface.GetNumberOfPoints() == 0:
         raise ToolInputError(
-            "'{}' holds no surface points.".format(os.path.basename(path))
+            "{} holds no surface points.".format(label)
         )
     return _flip_lps_ras(surface)
 
@@ -106,7 +112,7 @@ def surfaces_in(path):
     if os.path.isfile(path):
         return [path]
     if not os.path.isdir(path):
-        raise ToolInputError("Input path does not exist: {}".format(os.path.basename(path)))
+        raise ToolInputError("'surfaces' path does not exist.")
 
     found = []
     for root, _, files in os.walk(path):
@@ -115,7 +121,7 @@ def surfaces_in(path):
                 found.append(os.path.join(root, name))
     if not found:
         raise ToolInputError(
-            "No surface ({}) found in the input.".format(", ".join(SURFACE_EXTENSIONS))
+            "No surface ({}) found under 'surfaces'.".format(", ".join(SURFACE_EXTENSIONS))
         )
     return sorted(found)
 
@@ -128,7 +134,7 @@ def build_butterfly(surface, teeth, ratios, adjustments, index, shift_lr, shift_
     reason a caller gets a named error instead of an empty patch.
     """
     from .make_butterfly import butterflyPatch
-    from .util import ToothNoExist
+    from .util import NoSegmentationSurf, ToothNoExist
 
     try:
         butterflyPatch(
@@ -159,6 +165,14 @@ def build_butterfly(surface, teeth, ratios, adjustments, index, shift_lr, shift_
             "{}. Pick teeth this surface's label array actually carries -- a "
             "lower arch has none of the palate teeth.".format(str(missing).strip())
         )
+    except NoSegmentationSurf:
+        # The engine's sentence is "This surf doesnt have this property
+        # Universal_ID", which reads as a tool bug. It is the input that is
+        # wrong: an unsegmented scan has no teeth to place the corners on.
+        raise ToolInputError(
+            "the surface has no 'Universal_ID' labels, so its teeth cannot be "
+            "located: segment it first."
+        )
     return surface
 
 
@@ -188,26 +202,59 @@ def merge_patches(surface):
     return surface
 
 
+def require_patch(surface, patch_array, who):
+    """Refuse a surface whose `patch_array` is missing or marks no point.
+
+    The ICP selects the points where the array equals 1, through
+    `vtkMeshTeeth(list_teeth=[1])`. Without this check a missing array came out
+    as "This surf doesnt have this property Butterfly" and an empty one as
+    "This tooth UR8 is not segmented or doesnt exist" -- label 1 read as a tooth
+    number -- neither of which says which input lacks the patch.
+    """
+    import numpy as np
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    array = surface.GetPointData().GetArray(patch_array)
+    if array is None:
+        raise ToolInputError(
+            "{} carries no '{}' patch array, so there is nothing to register "
+            "on: build a patch on it first.".format(who, patch_array)
+        )
+    if not np.any(vtk_to_numpy(array) == 1):
+        raise ToolInputError(
+            "{}'s '{}' patch array marks no point, so there is nothing to "
+            "register on.".format(who, patch_array)
+        )
+
+
 def register(source, target, patch_array):
     """Rigid registration of `source` onto `target`, computed on `patch_array`.
 
-    Returns `(registered surface, 4x4 matrix)`. The matrix is the one applied to
-    the source, in the same RAS convention the surfaces are held in.
+    Returns `(registered surface, 4x4 matrix, residual)`. The matrix is the one
+    applied to the source, in the same RAS convention the surfaces are held in;
+    the residual is the ICP's RMS closest-point distance between the two
+    patches in millimetres, or None when the engine did not report one.
     """
     import numpy as np
     import vtk
 
     from .ICP import ICP, vtkICP
-    from .vtkSegTeeth import vtkMeshTeeth
+    from .vtkSegTeeth import NoSegmentationSurf, ToothNoExist, vtkMeshTeeth
 
-    if not source.GetPointData().HasArray(patch_array):
-        raise ToolInputError(
-            "The moving surface carries no '{}' array, so there is nothing to "
-            "register on. Build a patch first.".format(patch_array)
-        )
+    require_patch(source, patch_array, "the moving surface")
+    require_patch(target, patch_array, "'reference'")
 
     option = vtkMeshTeeth(list_teeth=[1], property=patch_array)
-    result = ICP([vtkICP()], option=option).run(source, target)
+    try:
+        result = ICP([vtkICP()], option=option).run(source, target)
+    except (NoSegmentationSurf, ToothNoExist) as unusable:
+        # Unreachable after the two checks above, unless the engine changes how
+        # it selects points; kept so that case still names the patch rather
+        # than a tooth.
+        raise ToolInputError(
+            "the '{}' patch could not be selected on both surfaces ({})".format(
+                patch_array, str(unusable).strip())
+        ) from unusable
     matrix = np.asarray(result["matrix"])
 
     vtk_matrix = vtk.vtkMatrix4x4()
@@ -221,7 +268,7 @@ def register(source, target, patch_array):
     applied.SetInputData(source)
     applied.SetTransform(transform)
     applied.Update()
-    return applied.GetOutput(), matrix
+    return applied.GetOutput(), matrix, result.get("residual")
 
 
 def write_transform(matrix, path):

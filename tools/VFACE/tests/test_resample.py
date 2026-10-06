@@ -191,5 +191,35 @@ def test_a_cohort_where_nothing_could_be_read_is_refused_not_reported_empty(tmp_
     for name in ("P001_T1.nii.gz", "P002_T1.nii.gz"):
         (tmp_path / "in" / name).write_bytes(b"\x1f\x8b not a volume")
 
-    with pytest.raises(ToolInputError, match="None of the 2 volume"):
+    # A RuntimeError, not a 422: SimpleITK's reader failing is not something
+    # the error can pin on the caller. The cause travels in the message itself,
+    # because the run report is deleted with the job when the run fails.
+    with pytest.raises(RuntimeError, match=r"0 of 2 volume\(s\) resampled; most common "
+                                           r"failure: RuntimeError: .* \(2 of 2\)"):
         resample.resample_cohort(str(tmp_path / "in"), str(tmp_path / "out"))
+
+
+def test_an_unreadable_volume_is_logged_by_position_and_cause_never_by_name(tmp_path, caplog):
+    cohort(tmp_path, patients=("P001",))
+    (tmp_path / "t1" / "P002_T1.nii.gz").write_bytes(b"\x1f\x8b not a volume")
+
+    with caplog.at_level("WARNING", logger="sadt_vface"):
+        resample.resample_cohort(str(tmp_path / "t1"), str(tmp_path / "out"))
+
+    failed = [r.getMessage() for r in caplog.records if "resample failed" in r.getMessage()]
+    assert len(failed) == 1
+    assert "scan 2 of 2" in failed[0]
+    assert "RuntimeError" in failed[0]
+    assert "P002" not in failed[0]
+    assert any("1 of 2 volume(s) resampled" in r.getMessage() and r.levelname == "WARNING"
+               for r in caplog.records)
+
+
+def test_each_scan_is_announced_before_it_is_resampled(tmp_path):
+    """So a failure in the middle of the step is reported with the scan it was on."""
+    cohort(tmp_path, patients=("P001", "P002"))
+    seen = []
+    resample.resample_cohort(str(tmp_path / "t1"), str(tmp_path / "out"),
+                             on_progress=lambda done, total, message: seen.append(
+                                 (done, total, message)))
+    assert seen == [(0, 2, "resampling scan 1 of 2"), (1, 2, "resampling scan 2 of 2")]

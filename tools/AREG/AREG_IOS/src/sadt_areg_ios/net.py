@@ -20,6 +20,7 @@ needs none of this.
 """
 
 import logging
+import os
 
 from sadt_areg_common.errors import ToolUnavailableError
 
@@ -196,19 +197,42 @@ def load(checkpoint_path: str, device: str):
     torch = _import_torch()
 
     model = build(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Said BEFORE the call: torch's own error for a truncated or foreign file is
+    # a pickle traceback that names neither the step nor the device.
+    logger.info("AREG IOS: loading the palate patch checkpoint on %s", device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except Exception as exc:  # noqa: BLE001 -- any failure here is the bundle's
+        # A RuntimeError, never a ValueError: the checkpoint is the deployment's,
+        # so an unreadable one is a server fault and must not reach the caller
+        # as a 422 about their request.
+        raise RuntimeError(
+            f"loading the palate patch checkpoint failed ({type(exc).__name__}: "
+            f"{_last_line(exc)}); the hosted bundle is unreadable on device {device}"
+        ) from exc
     state = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     # The checkpoint was written by a LightningModule that held the same UNet
     # under the same name, plus buffers this inference-only copy does not have.
     missing, unexpected = model.load_state_dict(state, strict=False)
     trained = [name for name in state if name.startswith("model.")]
     if not trained:
-        raise ToolUnavailableError(
-            f"'{checkpoint_path}' holds no 'model.*' weights: it is not an AREG IOS "
-            f"registration checkpoint."
+        # The deployment's bundle, not the caller's request, and nothing is
+        # missing from the image either: a RuntimeError, so neither a 422 nor a
+        # 503 that suggests retrying later.
+        raise RuntimeError(
+            "the palate patch checkpoint holds no 'model.*' weights: the hosted "
+            f"bundle is not an AREG IOS registration checkpoint "
+            f"('{os.path.basename(checkpoint_path)}')"
         )
     if missing:
         logger.warning("AREG IOS: %d weight(s) not present in the checkpoint", len(missing))
     logger.debug("AREG IOS: %d unused key(s) in the checkpoint", len(unexpected))
     model.eval()
     return model
+
+
+def _last_line(exc: BaseException) -> str:
+    """The last non-empty line of a third-party message, which is where torch
+    and pickle put the cause; the lines above it are context nobody reads."""
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return lines[-1] if lines else "no message"

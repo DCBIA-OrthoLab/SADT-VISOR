@@ -20,6 +20,7 @@ is now its own process, so an in-process limit would cap nothing. Capping GPU
 work across concurrent jobs is the server's, and it has to be across tools.
 """
 
+from collections import Counter
 from concurrent import futures
 import logging
 import multiprocessing
@@ -217,11 +218,21 @@ def discover_weights(model_path: str) -> dict:
     # A landmark needs a checkpoint at EVERY scale: the agent walks the coarse
     # one and then the fine one. Filtering here means a half-copied bundle is
     # reported up front rather than failing in the middle of the run.
-    return {
+    complete = {
         label: scales
         for label, scales in weights.items()
         if all(scale in scales for scale in catalog.SCALE_KEYS)
     }
+    incomplete = sorted(set(weights) - set(complete))
+    if incomplete:
+        # Said out loud because the landmark then surfaces as "no model in this
+        # bundle", which reads as the wrong bundle rather than a half-copied one.
+        logger.warning(
+            "%d landmark(s) in the bundle lack a checkpoint at every scale (%s) "
+            "and are not offered: %s",
+            len(incomplete), ", ".join(catalog.SCALE_KEYS), ", ".join(incomplete),
+        )
+    return complete
 
 
 def requested_landmarks(weights: dict, regions, landmarks=()):
@@ -374,6 +385,14 @@ def _agent_padding():
     return np.array(AGENT_FOV) / 2 + 1
 
 
+# What `_walk_one` says about a landmark it could not place. The two need
+# opposite fixes -- a scan the agent cannot read versus a run that cannot work
+# at all -- and a worker process cannot log, so the kind travels with the
+# result for the parent to report.
+NOT_FOUND = "not_found"
+RAISED = "raised"
+
+
 def _walk_one(label, environment, weights, device, budget, seed):
     """One agent's whole search, and the ONLY implementation of it.
 
@@ -381,9 +400,18 @@ def _walk_one(label, environment, weights, device, budget, seed):
     executes the same lines in the same order -- which is what makes "the
     width does not move a coordinate" a property of the code rather than a
     claim about it.
+
+    Returns `(voxel position, error, kind)`: the position and two Nones, or
+    None, the reason and NOT_FOUND / RAISED. Nothing is logged here for the
+    operator, because in a pool this runs in a spawned child whose log lines
+    reach no one -- `_note_landmark` does it in the parent.
     """
-    brain = Brain(catalog.SCALE_KEYS, device, out_channels=MOVEMENT_COUNT)
+    brain = None
     try:
+        # Built inside the `try`: building the networks is where a CUDA
+        # context is first touched, and an out-of-memory there is this
+        # landmark's failure like any other, not an escape from the scan.
+        brain = Brain(catalog.SCALE_KEYS, device, out_channels=MOVEMENT_COUNT)
         brain.load(weights[label])
         agent = Agent(
             target=label,
@@ -395,20 +423,70 @@ def _walk_one(label, environment, weights, device, budget, seed):
             # depending on which OTHER landmarks were asked for.
             rng=rng_for(label, seed),
         )
-        return agent.search(budget), None
+        return agent.search(budget), None, None
     except NotFound as exc:
-        # At INFO, not DEBUG: these are rare (6 of 119 on the reference scan)
-        # and they are exactly what someone watching the log wants to see,
-        # without having to open the archive to find out.
-        logger.info("  %s: not found -- %s", label, exc)
-        return None, str(exc)
+        return None, str(exc), NOT_FOUND
     except Exception as exc:  # noqa: BLE001 - one landmark, not the scan
         # A broken checkpoint, an out-of-memory, anything: this landmark is
-        # lost, the rest of the scan is not.
-        logger.exception("Landmark search raised for '%s'", label)
-        return None, f"{type(exc).__name__}: {exc}"
+        # lost, the rest of the scan is not. The traceback is kept at DEBUG for
+        # a developer running the tool by hand; the server shows none.
+        logger.debug("Landmark search raised for '%s'", label, exc_info=True)
+        return None, f"{type(exc).__name__}: {exc}", RAISED
     finally:
-        brain.release()
+        if brain is not None:
+            brain.release()
+
+
+def _note_landmark(label, outcome, scan_index, scan_total) -> None:
+    """Log, in the PARENT, a landmark that came back without a position.
+
+    A NotFound is at INFO: these are rare (6 of 119 on the reference scan) and
+    they are what someone watching the log wants to see, but they are the
+    search working as designed. An exception is a WARNING with its class and
+    message, because a bad checkpoint or an out-of-memory says nothing about
+    the scan and everything about the run.
+    """
+    _position, error, kind = outcome
+    if kind == NOT_FOUND:
+        logger.info(
+            "scan %d of %d: landmark %s not found (%s)",
+            scan_index, scan_total, label, error,
+        )
+    elif kind == RAISED:
+        logger.warning(
+            "scan %d of %d: landmark %s failed (%s)",
+            scan_index, scan_total, label, error,
+        )
+
+
+def _short(text, limit: int = 160) -> str:
+    """The first line of an error, cut to fit in front of a count.
+
+    A CUDA out-of-memory message alone is longer than the reason the server
+    keeps, and what follows it -- how many landmarks it cost -- would be cut.
+    """
+    first = str(text).strip().splitlines()[0] if str(text).strip() else ""
+    return first if len(first) <= limit else first[: limit - 3] + "..."
+
+
+def _no_landmark_reason(outcomes: dict, requested: int) -> str:
+    """Why a scan placed nothing, led by the error that dominated.
+
+    "No landmark converged" is only the truth when every agent gave up; when
+    they RAISED -- an out-of-memory, an unreadable checkpoint -- saying so
+    sends the operator to the scan when the fault is the run's.
+    """
+    raised = [error for _position, error, kind in outcomes.values() if kind == RAISED]
+    if raised:
+        error, count = Counter(raised).most_common(1)[0]
+        return (
+            f"0 of {requested} landmarks placed; most common failure: "
+            f"{_short(error)} ({count} of {requested})"
+        )
+    return (
+        f"0 of {requested} landmarks placed: every agent stopped without "
+        f"converging on this scan"
+    )
 
 
 # **The agents walk in separate PROCESSES, and threads are not an oversight.**
@@ -482,7 +560,8 @@ def _worker_walk(task):
     )
 
 
-def _walk_in_pool(pool, images, key, runnable, announce):
+def _walk_in_pool(pool, images, key, runnable, announce,
+                  scan_index: int = 1, scan_total: int = 1):
     """Hand every landmark to the workers; return what came back, and whether
     the pool survived.
 
@@ -513,11 +592,15 @@ def _walk_in_pool(pool, images, key, runnable, announce):
             # walked again below, in this process, and only a real NotFound
             # should ever reach the run report.
             broken = True
+            continue
         except Exception as exc:  # noqa: BLE001 - one landmark, not the scan
             # `_walk_one` catches everything a search itself can raise, so
             # reaching here means the call did not survive the trip.
-            logger.exception("Landmark search did not come back for '%s'", label)
-            results[label] = (None, f"{type(exc).__name__}: {exc}")
+            results[label] = (None, f"{type(exc).__name__}: {exc}", RAISED)
+        # Here, in the parent, and not in `_walk_one`: a spawned worker's log
+        # lines are never forwarded, so an out-of-memory in every worker used
+        # to leave the operator with a scan that "placed nothing" and no why.
+        _note_landmark(label, results[label], scan_index, scan_total)
         announce(len(results))
     return results, broken
 
@@ -597,6 +680,15 @@ def predict_landmarks(
             f"{asked}. It provides: {', '.join(sorted(weights)) or 'nothing'}."
         )
 
+    if without_model:
+        # Asked for and not deliverable by this bundle. The report names them;
+        # the panel says how many, at the start, so a clinician waiting on a
+        # point that will never come knows it now rather than after the run.
+        progress.log(
+            f"{len(without_model)} of the requested landmarks have no model in "
+            f"this bundle and will not be placed", "warning", user=True,
+        )
+
     preprocessed_dir = os.path.join(work_dir, "preprocessed")
     logger.info(
         "ALI CBCT: %d scan(s), %d landmark(s), device=%s", len(scans), len(runnable), device
@@ -643,18 +735,15 @@ def predict_landmarks(
 
     processed = [record for record in scan_reports.values() if record["status"] == "ok"]
     if not processed:
-        first_error = next(
-            (record.get("error") for record in scan_reports.values() if record.get("error")),
-            "unknown",
+        # Led by the count and the error that dominated, not by the first one:
+        # the job directory and this report are deleted when a run fails, so
+        # this message is all the operator will have.
+        errors = [record.get("error") or "unknown" for record in scan_reports.values()]
+        error, count = Counter(errors).most_common(1)[0] if errors else ("no scan", 0)
+        raise RuntimeError(
+            f"0 of {len(scan_reports)} scans processed; most common failure: "
+            f"{_short(error, 200)} ({count} of {len(scan_reports)})"
         )
-        raise RuntimeError(f"ALI produced no landmarks for any scan. First error: {first_error}")
-    processed = [record for record in scan_reports.values() if record["status"] == "ok"]
-    if not processed:
-        first_error = next(
-            (record.get("error") for record in scan_reports.values() if record.get("error")),
-            "unknown",
-        )
-        raise RuntimeError(f"ALI produced no landmarks for any scan. First error: {first_error}")
 
     written = sum(len(record["landmarks_found"]) for record in scan_reports.values())
     # The guard above counts SCANS; this one counts what the tool claims to
@@ -673,9 +762,13 @@ def predict_landmarks(
     never_found = sorted(
         {label for record in scan_reports.values() for label in record["landmarks_failed"]}
     )
-    logger.info(
-        "ALI CBCT done: %d/%d scan(s), %d landmark(s) written, %.0fs",
-        len(processed), len(scan_reports), written, time.monotonic() - started_at,
+    failed = len(scan_reports) - len(processed)
+    # WARNING when partial: a run that lost scans still returns 200, and this
+    # line is the only place the operator sees that it did.
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "%d of %d scans processed, %d failed; %d landmark(s) written in %.0fs",
+        len(processed), len(scan_reports), failed, written, time.monotonic() - started_at,
     )
     if without_model:
         logger.info("  not in this bundle (%d): %s", len(without_model), ", ".join(without_model))
@@ -735,6 +828,9 @@ def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
         }
         scan_reports[key] = record
         scan_started = time.monotonic()
+        # What the scan was doing when it failed, so the warning below can say
+        # which step went wrong and not only that one did.
+        step = {"step": "preprocessing"}
         # Position in the batch, never the scan's name: a file name is patient
         # metadata and this server does not write it to a log -- and the same
         # rule is why the progress event carries the counter and nothing else.
@@ -757,6 +853,7 @@ def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
                 scan_total=len(scans),
                 seed=seed,
                 pool=pool,
+                step=step,
             )
             if broken:
                 # A broken executor never recovers: every later `submit`
@@ -764,24 +861,24 @@ def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
                 # width, and saves it the scan-long fallback this one just
                 # paid.
                 pool = None
-            # NOT unconditionally "ok". A per-landmark failure is recorded in
-            # `landmarks_failed` and does not raise -- deliberately, since a
-            # truncated field of view legitimately misses points and one hard
-            # landmark must not cost the other 57. But a scan on which EVERY
-            # agent failed placed nothing at all, and calling that a success is
-            # how a run that produced no coordinates reports 200.
-            if record["landmarks_found"]:
-                record["status"] = "ok"
-            else:
-                record["status"] = "failed"
-                record["error"] = (
-                    "no landmark could be placed on this scan: "
-                    f"{len(record['landmarks_failed'])} of "
-                    f"{len(runnable)} agent(s) failed to converge."
-                )
+            # `_predict_one_scan` raises when nothing was placed, so reaching
+            # here means at least one landmark is in the file. A per-landmark
+            # failure is recorded in `landmarks_failed` and does not raise --
+            # a truncated field of view legitimately misses points and one
+            # hard landmark must not cost the other 57.
+            record["status"] = "ok"
         except Exception as exc:
             # One unreadable or hopeless scan must not cost the other 199.
-            logger.exception("ALI CBCT failed on one scan")
+            # Position, step, class and message -- never the scan's name, and
+            # no traceback the server would not show anyway.
+            logger.warning(
+                "scan %d of %d: %s failed (%s: %s)",
+                scan_index, len(scans), step["step"], type(exc).__name__, exc,
+            )
+            progress.log(
+                f"scan {scan_index} of {len(scans)} could not be processed "
+                f"({step['step']} failed)", "warning", user=True,
+            )
             record["status"] = "failed"
             record["error"] = str(exc)
         record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
@@ -800,7 +897,7 @@ def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
 def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
                       preprocessed_dir, output_dir, prediction_ID,
                       scan_index: int = 1, scan_total: int = 1,
-                      seed: int = 0, pool=None) -> bool:
+                      seed: int = 0, pool=None, step=None) -> bool:
     """Preprocess one scan, run every requested landmark on it, write its file.
 
     Returns whether the agent pool broke under it, so the cohort stops handing
@@ -810,9 +907,14 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
     minutes of it -- and without a line in between, a run is indistinguishable
     from a hang. Everything logged here is a COUNT or an anatomical label:
     never a file name, which is patient metadata.
+
+    `step`, when given, is a dict whose "step" this keeps naming the stage
+    under way, so the caller's warning can say where a scan failed.
     """
     from .environment import Environment
 
+    step = step if step is not None else {}
+    step["step"] = "preprocessing"
     scan_work_dir = os.path.join(preprocessed_dir, key.replace(os.sep, "_"))
     started_at = time.monotonic()
     images = _prepare_scan(scan_path, scan_work_dir)
@@ -834,7 +936,9 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
 
     positions = {}
     try:
+        step["step"] = "loading the preprocessed volumes"
         environment.load_images(images)
+        step["step"] = "landmark search"
 
         search_started = time.monotonic()
 
@@ -858,7 +962,15 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
         # networks per worker is resident whatever the number of agents.
 
         def announce(index):
-            """One line every tenth of the batch, wherever the workers are."""
+            """One line every tenth of the batch, wherever the workers are.
+
+            And one progress event at the same cadence. `index` is the number
+            of landmark searches that have come BACK, in whatever order the
+            workers returned them, so the bar's position is (scan, landmark)
+            pairs finished across the cohort -- a count, not an estimate. A
+            search is about a minute, so a scan of 119 landmarks no longer
+            holds the bar still for the length of it.
+            """
             if index % progress_every and index != len(runnable):
                 return
             elapsed = time.monotonic() - search_started
@@ -867,16 +979,35 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
                 scan_index, scan_total, index, len(runnable), elapsed,
                 (elapsed / index) * (len(runnable) - index),
             )
+            # Not for the scan's last landmark: the next scan's own event
+            # stands at that same point, and after the cohort's last one the
+            # bar would claim a finished run before the report is written.
+            if index < len(runnable):
+                progress.emit(
+                    (scan_index - 1 + index / float(len(runnable))) / scan_total,
+                    "scan {} of {}: {} of {} landmarks searched".format(
+                        scan_index, scan_total, index, len(runnable)
+                    ),
+                )
 
         results, broken = ({}, False)
         if pool is not None and len(runnable) > 1:
-            results, broken = _walk_in_pool(pool, images, key, runnable, announce)
+            results, broken = _walk_in_pool(
+                pool, images, key, runnable, announce, scan_index, scan_total,
+            )
             if broken:
                 logger.warning(
                     "The agent pool stopped answering after %d of %d "
                     "landmark(s); finishing this scan one at a time. A worker "
                     "was killed -- the host out of memory, most often.",
                     len(results), len(runnable),
+                )
+                # The operator's to look at: the result is unchanged, only
+                # slower, and a killed worker usually means the host is short
+                # of memory.
+                progress.log(
+                    "the landmark worker pool stopped answering; finishing one "
+                    "at a time", "warning",
                 )
 
         # Whatever the pool did not return, including everything when there is
@@ -888,13 +1019,14 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
             results[label] = _walk_one(
                 label, environment, weights, device, budget, seed
             )
+            _note_landmark(label, results[label], scan_index, scan_total)
             announce(len(results))
 
         # Read back in `runnable` order, so `landmarks_found` lists the points
         # in the order the run asked for them and not the order the machine
         # happened to return them.
         for label in runnable:
-            voxel_position, error = results[label]
+            voxel_position, error, _kind = results[label]
             if error is not None:
                 record["landmarks_failed"][label] = error
                 continue
@@ -910,7 +1042,12 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
         shutil.rmtree(scan_work_dir, ignore_errors=True)
 
     if not positions:
-        raise RuntimeError("no landmark converged on this scan")
+        # Not "no landmark converged" unconditionally: when every agent RAISED
+        # (an out-of-memory, an unreadable checkpoint) that sentence sends the
+        # operator to the scan, and the fault is the run's.
+        raise RuntimeError(_no_landmark_reason(results, len(runnable)))
+
+    step["step"] = "writing the markups file"
 
     # ONE file per scan, holding every region, in the input's own tree.
     destination = os.path.join(

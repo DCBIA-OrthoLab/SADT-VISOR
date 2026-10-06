@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import time
+from collections import Counter
 
 from sadt_ali_common.discovery import (
     CBCT,
@@ -27,6 +28,7 @@ from sadt_ali_common.discovery import (
 )
 
 from . import catalog as cbct_catalog
+from . import progress
 from .errors import ToolInputError
 
 logger = logging.getLogger(__name__)
@@ -46,10 +48,14 @@ class Input:
     dictionary, once in the flat output folder.
     """
 
-    def __init__(self, mode: str, scans: list, converted_dicom: int = 0):
+    def __init__(self, mode: str, scans: list, converted_dicom: int = 0,
+                 failed_dicom=None):
         self.mode = mode
         self.scans = scans
         self.converted_dicom = converted_dicom
+        # {key: reason} for every DICOM series that could not be converted, so
+        # the run report lists it as a failed scan instead of forgetting it.
+        self.failed_dicom = dict(failed_dicom or {})
 
 
 
@@ -126,9 +132,21 @@ def detect(input_path: str, work_dir: str) -> Input:
 
     if volumes or dicom_dirs:
         scans = keyed(volumes, root)
-        converted = _convert_dicom(dicom_dirs, root, work_dir)
+        converted, failed = _convert_dicom(dicom_dirs, root, work_dir)
         scans.extend(converted)
-        return Input(CBCT, sorted(scans, key=lambda item: item[1]), converted_dicom=len(converted))
+        if not scans:
+            # Every scan in the input was a DICOM series and none could be
+            # read. The caller's data, not this server: GDCM listed the slices
+            # and then could not assemble them into a volume.
+            reason, count = Counter(failed.values()).most_common(1)[0]
+            raise ToolInputError(
+                f"0 of {len(failed)} DICOM series could be converted; most common "
+                f"failure: {reason} ({count} of {len(failed)})"
+            )
+        return Input(
+            CBCT, sorted(scans, key=lambda item: item[1]),
+            converted_dicom=len(converted), failed_dicom=failed,
+        )
 
     raise ToolInputError(
         f"No CBCT scan ({', '.join(VOLUME_EXTENSIONS)}) or DICOM series found in the input."
@@ -136,34 +154,53 @@ def detect(input_path: str, work_dir: str) -> Input:
 
 
 
-def _convert_dicom(directories: list, root: str, work_dir: str) -> list:
-    """Convert each DICOM series to NIfTI; return (path, key) pairs.
+def _convert_dicom(directories: list, root: str, work_dir: str):
+    """Convert each DICOM series to NIfTI; return ((path, key) pairs, failures).
 
     Written into the working directory, never into the input. The original
     created `<input>/NIFTI/` inside the folder the user had selected -- so it
     modified their data, and a second run re-discovered its own output as
     input scans.
+
+    `failures` is {key: "Type: message"}. A series that cannot be converted
+    used to vanish with one anonymous log line: the run then reported N-1 of
+    N-1 scans done, and the missing patient was noticed -- if at all -- by
+    whoever counted the output files.
     """
     if not directories:
-        return []
+        return [], {}
 
     from . import preprocess
 
     destination_root = os.path.join(work_dir, "dicom_converted")
     converted = []
-    for directory in directories:
+    failed = {}
+    progress.emit(None, f"converting {len(directories)} DICOM series")
+    for index, directory in enumerate(directories, start=1):
         key = scan_key(directory, root)
         destination = os.path.join(destination_root, f"{key.replace(os.sep, '_')}.nii.gz")
         try:
             preprocess.convert_dicom_series(directory, destination)
-        except Exception:
-            # A folder GDCM claimed as a series but could not read. Skipped
-            # with a log line naming nothing: the folder name is the patient.
-            logger.exception("Could not convert a DICOM series")
+        except Exception as exc:  # noqa: BLE001 - one series, not the batch
+            # Position and cause, never the folder: the folder name is the
+            # patient.
+            logger.warning(
+                "DICOM series %d of %d: conversion failed (%s: %s)",
+                index, len(directories), type(exc).__name__, exc,
+            )
+            progress.log(
+                f"DICOM series {index} of {len(directories)} could not be "
+                f"converted and is skipped", "warning", user=True,
+            )
+            failed[f"{key}.nii.gz"] = f"DICOM conversion failed ({type(exc).__name__}: {exc})"
             continue
         converted.append((destination, f"{key}.nii.gz"))
-    logger.info("ALI: converted %d DICOM series", len(converted))
-    return converted
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "%d of %d DICOM series converted, %d failed",
+        len(converted), len(directories), len(failed),
+    )
+    return converted, failed
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +283,21 @@ def identify(
             sup=sup,
         )
         report["dicom_series_converted"] = detected.converted_dicom
+        report["dicom_series_failed"] = len(detected.failed_dicom)
+        # A series that never became a volume is a scan of this batch that
+        # failed, and the report counts it as one rather than leaving the
+        # caller to notice a missing file.
+        for key, reason in detected.failed_dicom.items():
+            report["cases"][key] = {
+                "input": os.path.basename(key),
+                "status": "failed",
+                "error": reason,
+                "landmarks_found": [],
+                "landmarks_failed": {},
+                "produced": [],
+            }
+        report["summary"]["total"] += len(detected.failed_dicom)
+        report["summary"]["failed"] += len(detected.failed_dicom)
     finally:
         # The intermediates are large -- converted DICOM, and every scan
         # preprocessed at two spacings. Removed whether or not the run

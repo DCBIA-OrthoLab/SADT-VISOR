@@ -18,7 +18,10 @@ import logging
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from . import where
+
+# Prefixed with the patient and arch the batch loop is on: see `where`.
+logger = where.attach(logging.getLogger(__name__))
 
 # How far around a landmark to look for the crown it is meant to sit on. Two
 # voxels: a landmark a voxel off the occlusal surface still reads the tooth,

@@ -155,7 +155,7 @@ class Roi:
         self.path = path
 
 
-def read_roi(path: str) -> Roi:
+def read_roi(path: str, where: str = "") -> Roi:
     """Read a `.mrk.json` ROI box.
 
     Raises `ValueError` naming the file for anything a caller can fix: a file
@@ -163,6 +163,9 @@ def read_roi(path: str) -> Roi:
     box. Upstream ran `json.load(open(ROI_Path))['markups'][0]` unguarded
     inside the per-patient loop, so a single malformed file ended the batch
     with a traceback rather than a message.
+
+    `where` is the scan's position in the batch ("scan 2 of 5"), used to say
+    which crop a warning concerns without naming any file.
     """
     name = os.path.basename(path)
     try:
@@ -205,9 +208,11 @@ def read_roi(path: str) -> Roi:
     if ignored:
         # Not fatal: upstream cropped the axis-aligned bounding behaviour
         # silently and this keeps doing exactly that, but it says so.
+        # By the scan's position, not the ROI's name: the name is patient
+        # data, and the position is what lets an operator find the crop.
         logger.warning(
-            "The ROI '%s' is rotated. AutoCrop3D crops an axis-aligned box, so the "
-            "rotation is ignored.", name,
+            "%sthe ROI is rotated; AutoCrop3D crops an axis-aligned box, so the "
+            "rotation is ignored", f"{where}: " if where else "",
         )
 
     return Roi(
@@ -463,9 +468,17 @@ def write_surface(image, destination: str, scratch_dir: str, padding_mm: float,
     padded_path = os.path.join(scratch_dir, "padded.nii.gz")
     sitk.WriteImage(padded, padded_path)
     try:
+        # VTK reports a failure by printing to stderr -- which no operator
+        # sees -- and handing on an empty output, so each stage is checked
+        # here rather than discovered as a missing or zero-cell file later.
         reader = vtk.vtkNIFTIImageReader()
         reader.SetFileName(padded_path)
         reader.Update()
+        if reader.GetErrorCode() or reader.GetOutput().GetNumberOfPoints() == 0:
+            raise RuntimeError(
+                "VTK could not read back the padded label map "
+                f"(error code {reader.GetErrorCode()})"
+            )
 
         marching = vtk.vtkDiscreteMarchingCubes()
         marching.SetInputConnection(reader.GetOutputPort())
@@ -476,6 +489,11 @@ def write_surface(image, destination: str, scratch_dir: str, padding_mm: float,
         for index, label in enumerate(labels):
             marching.SetValue(index, label)
         marching.Update()
+        if marching.GetOutput().GetNumberOfCells() == 0:
+            raise RuntimeError(
+                f"marching cubes produced no surface for {len(labels)} label(s) "
+                f"present in the crop"
+            )
 
         smoother = vtk.vtkSmoothPolyDataFilter()
         smoother.SetInputConnection(marching.GetOutputPort())
@@ -491,7 +509,11 @@ def write_surface(image, destination: str, scratch_dir: str, padding_mm: float,
         writer = vtk.vtkPolyDataWriter()
         writer.SetFileName(destination)
         writer.SetInputData(model)
-        writer.Write()
+        if writer.Write() != 1 or writer.GetErrorCode():
+            raise RuntimeError(
+                "VTK could not write the surface file "
+                f"(error code {writer.GetErrorCode()})"
+            )
     finally:
         if os.path.exists(padded_path):
             os.remove(padded_path)

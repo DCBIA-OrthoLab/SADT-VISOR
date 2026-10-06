@@ -148,7 +148,7 @@ def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
     assert registered.GetPixelID() == sitk.sitkInt16
 
 
-def _oriented_run(tmp_path):
+def _oriented_run(tmp_path, sups=None):
     """An Oriented + Fully-Automated run, ASO and AMASSS planted, elastix real.
 
     The T1 comes back from 'ASO' centred on the origin, as the real one does; the
@@ -176,6 +176,9 @@ def _oriented_run(tmp_path):
 
     reference = tmp_path / "reference"
     reference.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    if sups is not None:
+        sups.append(sup)
     run = dispatch.register(
         t1_path=str(tmp_path / "T1"),
         t2_path=str(tmp_path / "T2"),
@@ -184,9 +187,29 @@ def _oriented_run(tmp_path):
         segmentation_model="/models/AMASSS",
         orientation_reference=str(reference),
         output_dir=str(tmp_path / "out"),
-        sup=FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss}),
+        sup=sup,
     )
     return run, fixed
+
+
+def test_an_oriented_run_moves_its_bar_forward_through_every_step(tmp_path, monkeypatch):
+    """ASO, then AMASSS, then the registration, each in its own slice and in
+    that order. Before the spans the bar showed each child's 0..1 and then
+    AREG's own, which reads as three runs starting over."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    sups = []
+
+    _oriented_run(tmp_path, sups)
+
+    assert sups[0].spans == [("ASO", (0.0, 0.25)), ("AMASSS", (0.25, 0.5))]
+    events = [json.loads(line) for line in events_file.read_text().splitlines()]
+    fractions = [event["fraction"] for event in events if "fraction" in event]
+    assert fractions == sorted(fractions)
+    # ASO, AMASSS, the pairing, the registrations starting, then the one
+    # registration done -- the pairing announced where the registration's
+    # slice starts, so a failure in it is not reported against "segmenting".
+    assert fractions == [0.0, 0.25, 0.5, 0.5, 1.0]
 
 
 def test_an_oriented_run_returns_the_t1_the_t2_was_registered_onto(tmp_path):
@@ -311,11 +334,15 @@ def test_a_label_the_mask_does_not_hold_fails_that_patient_only(tmp_path):
     """It used to fall through to using the WHOLE mask, so asking for label 4
     of a two-label mask registered on everything and reported success."""
     cohort(tmp_path, subjects=("P1", "P2"), size=32)
-    run = semi(tmp_path, segmentation_label=4)
-
-    assert run.succeeded == []
-    for key in ("P1", "P2"):
-        assert "no label 4" in run.patients[key]["regions"]["CB"]["reason"]
+    # Every subject fails on the same argument, so the run fails -- as the
+    # caller's input, with the reason in the error itself: the report holding
+    # the per-subject reasons is deleted with a failed job.
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path, segmentation_label=4)
+    message = str(raised.value)
+    assert message.startswith("0 of 2 subjects registered")
+    assert "no label 4" in message
+    assert "(2 of 2 registrations)" in message
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +390,11 @@ def test_a_subject_with_no_mask_says_how_to_name_one(tmp_path):
     cohort(tmp_path, size=32)
     os.remove(str(tmp_path / "masks" / "P1_T1_CB_seg.nii.gz"))
 
-    run = semi(tmp_path)
-    reason = run.patients["P1"]["regions"]["CB"]["reason"]
+    # Its only subject unregistered, the run fails -- and as the caller's
+    # input, since in Semi-Automated the masks are theirs to name.
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path)
+    reason = str(raised.value)
     assert "no Cranial base mask" in reason
     assert "mask/seg/pred" in reason
     assert "P1_T1_CB_seg.nii.gz" in reason
@@ -625,3 +655,204 @@ def test_register_on_reads_like_the_amasss_lists():
     assert LAYOUT["segmentations"]["ui"] == "chips"
     # And each chip says which folder its transforms come back in.
     assert LAYOUT["regions"]["option_help"]["Cranial base"] == "CB"
+
+
+# ---------------------------------------------------------------------------
+# Failure, as the operator reads it
+# ---------------------------------------------------------------------------
+
+def _messages(caplog, level=None):
+    return [record.getMessage() for record in caplog.records
+            if record.name.startswith("sadt_areg_cbct")
+            and (level is None or record.levelname == level)]
+
+
+def test_a_failed_subject_is_logged_with_its_position_class_and_cause(tmp_path, caplog):
+    """The report holding the reason is deleted with a failed job, and an
+    operator never sees it anyway: the log line has to say which subject (by
+    position), which step, which exception and why -- and never the file."""
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    write(full_mask(phantom(size=24)), str(tmp_path / "masks" / "P2_T1_CB_seg.nii.gz"))
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    run = semi(tmp_path)
+
+    assert run.succeeded == ["P1"]
+    warnings = _messages(caplog, "WARNING")
+    failed = [line for line in warnings if line.startswith("subject ")]
+    assert failed == [failed[0]]
+    assert failed[0].startswith("subject 2 of 2: Cranial base registration failed (")
+    assert "RegistrationError: " in failed[0] and "not the same sampling" in failed[0]
+    assert all("P2" not in line and ".nii" not in line for line in _messages(caplog))
+    # Partial: the summary is a warning, and counts both sides.
+    assert any("1 of 2 subjects registered, 1 failed" in line for line in warnings)
+
+
+def test_a_complete_run_summarises_at_info(tmp_path, caplog):
+    cohort(tmp_path, size=32)
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+    semi(tmp_path)
+    summary = [r for r in caplog.records if "subjects registered" in r.getMessage()]
+    assert [r.levelname for r in summary] == ["INFO"]
+    assert "1 of 1 subjects registered, 0 failed" in summary[0].getMessage()
+
+
+def test_a_run_where_the_engine_failed_everyone_is_a_server_error(tmp_path, monkeypatch):
+    """Not an archive with nothing in it, and not the caller's fault."""
+    from sadt_areg_cbct import elastix
+
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+
+    def broken(fixed, moving):
+        raise RuntimeError("elastix rigid registration failed: too few samples")
+
+    monkeypatch.setattr(elastix, "register", broken)
+    with pytest.raises(RuntimeError) as raised:
+        semi(tmp_path)
+    assert not isinstance(raised.value, ValueError)
+    message = str(raised.value)
+    assert message.startswith("0 of 2 subjects registered; most common failure: RuntimeError: ")
+    assert "too few samples (2 of 2 registrations)" in message
+    # Not chained: the registrations run in spawned workers, and only their
+    # description comes back -- which is why the cause is in the message.
+
+
+def test_one_server_fault_among_input_faults_keeps_it_a_server_error(tmp_path, monkeypatch):
+    """ToolInputError is "your fault"; that is only true when ALL of it was."""
+    from sadt_areg_cbct import elastix
+
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    os.remove(str(tmp_path / "masks" / "P2_T1_CB_seg.nii.gz"))
+    monkeypatch.setattr(elastix, "register",
+                        lambda fixed, moving: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError) as raised:
+        semi(tmp_path)
+    assert not isinstance(raised.value, ToolInputError)
+
+
+def test_the_pairing_counts_are_logged_and_announced(tmp_path, caplog, monkeypatch):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    cohort(tmp_path, subjects=("P1",), size=32)
+    write(phantom(size=32), str(tmp_path / "T2" / "P9_T2_scan.nii.gz"))
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    semi(tmp_path)
+
+    assert "paired 1 subject(s); 0 T1-only, 1 T2-only" in _messages(caplog, "WARNING")
+    messages = [json.loads(line).get("message") for line in events_file.read_text().splitlines()]
+    assert messages[0] == "pairing timepoints"
+
+
+def test_the_pairing_rule_is_said_in_words(tmp_path):
+    """An example file name reaches the operator redacted to a placeholder."""
+    write(phantom(size=16), str(tmp_path / "T1" / "alpha_T1.nii.gz"))
+    write(phantom(size=16), str(tmp_path / "T2" / "beta_T2.nii.gz"))
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path, t1_masks_path=str(tmp_path / "T1"))
+    message = str(raised.value)
+    assert "timepoint token" in message
+    assert ".nii" not in message and "P1" not in message
+
+
+def test_a_subject_the_segmentation_dropped_is_counted(tmp_path, caplog):
+    """AMASSS skipping a scan does not fail; it leaves a subject without a mask,
+    which further down reads like a naming problem. Said per region, counted."""
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    fixed = sitk.ReadImage(str(tmp_path / "T1" / "P1_T1_scan.nii.gz"))
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_scan_Seg_SegOut" / "P1_T1_scan_Seg_CBMASK.nii.gz")
+        return out
+
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+    run = dispatch.register(
+        t1_path=str(tmp_path / "T1"), t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_FULLY, regions=["Cranial base"],
+        segmentation_model="/models/AMASSS", output_dir=str(tmp_path / "out"),
+        sup=FakeSup(tmp_path, {"AMASSS": amasss}),
+    )
+    assert run.succeeded == ["P1"]
+    assert "AMASSS produced no Cranial base mask for 1 of 2 subjects" in _messages(caplog, "WARNING")
+
+
+def test_a_scan_orientation_dropped_is_counted_before_the_pairing(tmp_path, caplog):
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    fixed = sitk.ReadImage(str(tmp_path / "T1" / "P1_T1_scan.nii.gz"))
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        (out / "P1_T1_lm_Or.mrk.json").write_text('{"markups": []}')
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+    dispatch.register(
+        t1_path=str(tmp_path / "T1"), t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+        segmentation_model="/models/AMASSS", orientation_reference=str(reference),
+        output_dir=str(tmp_path / "out"),
+        sup=FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss}),
+    )
+    warnings = _messages(caplog, "WARNING")
+    assert any(line.startswith("ASO returned 1 of 2 oriented T1 scans") for line in warnings)
+    assert "paired 1 subject(s); 0 T1-only, 1 T2-only" in warnings
+
+
+def test_dicom_conversion_is_announced_and_its_failure_names_the_argument(tmp_path, monkeypatch):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    cohort(tmp_path, size=16)
+
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path, dicom_input=True)
+    assert "No DICOM series found in 't1'" in str(raised.value)
+    messages = [json.loads(line).get("message") for line in events_file.read_text().splitlines()]
+    assert messages[-1] == "converting DICOM (T1)"
+
+
+def test_the_missing_segmentation_bundle_is_described_not_pathed():
+    with pytest.raises(ToolInputError) as raised:
+        dispatch._check_cbct(
+            automation=catalogs.AUTOMATION_FULLY, regions=["Cranial base"],
+            t1_masks=None, reference=None, segmentation_model=None,
+            sup=FakeSup("/tmp/areg-rules"),
+        )
+    message = str(raised.value)
+    assert "'segmentation_model'" in message and "AMASSS_Models" in message
+    assert "/" not in message
+
+
+def test_the_missing_reference_names_the_arguments_not_an_endpoint():
+    with pytest.raises(ToolInputError) as raised:
+        dispatch._check_cbct(
+            automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+            t1_masks=None, reference=None, segmentation_model="/models/AMASSS",
+            sup=FakeSup("/tmp/areg-rules"),
+        )
+    message = str(raised.value)
+    assert "'orientation'" in message and "'cbct_reference'" in message
+    assert "/" not in message
+
+
+def test_an_unreadable_reference_markups_file_is_warned_about(tmp_path, caplog):
+    from sadt_areg_cbct import tools
+
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "frame_Or.mrk.json").write_text("{not json")
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    assert tools.reference_landmarks(str(reference)) == []
+    warnings = _messages(caplog, "WARNING")
+    assert len(warnings) == 1
+    assert warnings[0].startswith("orientation reference: markups file 1 of 1 could not be read (JSONDecodeError: ")
+    assert "frame_Or" not in warnings[0]

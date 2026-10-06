@@ -19,9 +19,10 @@ import numpy as np
 from sadt_areg_common import pairing
 from sadt_areg_common.errors import ToolInputError
 
-from . import geometry
+from . import geometry, where
 
-logger = logging.getLogger(__name__)
+# Prefixed with the patient and arch the batch loop is on: see `where`.
+logger = where.attach(logging.getLogger(__name__))
 
 SURFACE_EXTENSIONS = (".vtk", ".stl")
 LANDMARK_EXTENSIONS = (".json", ".mrk.json")
@@ -52,8 +53,16 @@ def patient_key(filename: str) -> str:
     return digits.lstrip("0") or digits or stem
 
 
-def discover(ios_dir: str, cbct_dir: str) -> tuple:
+def discover(ios_dir: str, cbct_dir: str, ios_source: str = "'ios'",
+             cbct_source: str = "'cbct'", ios_error=ToolInputError,
+             cbct_error=ToolInputError) -> tuple:
     """`({patient: {"ios": [paths], "cbct": path}}, {patient: why})`.
+
+    `ios_source` and `cbct_source` name where each folder came from in the
+    refusal -- the caller's argument, or the tool that produced it -- and
+    `ios_error` / `cbct_error` are what an empty side is raised as: an empty
+    folder the caller sent is theirs to fix, one a supervised tool returned is
+    not.
 
     A patient with only one modality is reported rather than silently dropped:
     a batch that registered half of what was sent and said nothing is the
@@ -80,6 +89,11 @@ def discover(ios_dir: str, cbct_dir: str) -> tuple:
             if pairing.is_scan_file(name):
                 cbct.setdefault(patient_key(name), os.path.join(root, name))
 
+    if not ios:
+        raise ios_error(f"No intraoral mesh (.vtk or .stl) found in {ios_source}.")
+    if not cbct:
+        raise cbct_error(f"No CBCT scan found in {cbct_source}.")
+
     paired, unpaired = {}, {}
     for key in sorted(set(ios) | set(cbct)):
         if key in ios and key in cbct:
@@ -88,9 +102,12 @@ def discover(ios_dir: str, cbct_dir: str) -> tuple:
             unpaired[key] = "no CBCT" if key in ios else "no intraoral scan"
 
     if not paired:
+        # Counts, never the keys: a key is built from the caller's file names,
+        # and this message reaches the server's log as well as the caller.
         raise ToolInputError(
-            "No patient has both an intraoral scan and a CBCT. Found "
-            f"{len(ios)} intraoral key(s) and {len(cbct)} CBCT key(s): {unpaired}."
+            "No patient has both an intraoral scan and a CBCT: "
+            f"{len(ios)} intraoral key(s) and {len(cbct)} CBCT key(s), none in "
+            "common. Patients are matched on the digits of their file names."
         )
     if unpaired:
         # The counts, never the keys: a key is the caller's own file name, and

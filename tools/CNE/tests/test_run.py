@@ -1067,13 +1067,18 @@ def test_the_finish_reason_is_reported_for_every_note(tmp_path, model, llm):
     assert entry_for(output, "a.txt")["finish_reason"] == "stop"
 
 
-def test_an_answer_shaped_wrong_is_a_readable_error():
+def test_an_answer_shaped_wrong_is_a_server_fault_not_the_callers():
+    """The note was fine; the engine answered in the wrong shape. A ValueError
+    would be answered 422 and blamed on the request."""
     class Broken:
         def create_chat_completion(self, **_kwargs):
             return {"choices": []}
 
-    with pytest.raises(ValueError, match="cannot read"):
+    with pytest.raises(RuntimeError, match="cannot read") as raised:
         extraction.complete(Broken(), [], 10, 0.0)
+
+    assert not isinstance(raised.value, ValueError)
+    assert isinstance(raised.value.__cause__, IndexError)
 
 
 # --------------------------------------------------------------------------
@@ -1621,3 +1626,261 @@ def test_an_array_of_several_objects_is_refused_rather_than_spanned():
 def test_blank_lines_between_fields_do_not_break_the_ratio():
     data = extraction.parse_extraction("patient_age: 34\n\n\njaw_locking: false\n")
     assert data == {"patient_age": "34", "jaw_locking": "false"}
+
+
+# --------------------------------------------------------------------------
+# Progress and the run's log: a position, never a note's name
+# --------------------------------------------------------------------------
+
+def read_events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in
+               Path(events_file).read_text().splitlines() if line]
+    progress = [record for record in records if record.get("kind") != "log"]
+    logs = [record for record in records if record.get("kind") == "log"]
+    return progress, logs
+
+
+def test_progress_announces_the_load_then_counts_notes(
+    tmp_path, model, llm, monkeypatch
+):
+    """The load is one opaque call, so it gets a message at the start of the
+    bar and no share of it; each note after it is one call to the model, and
+    the position in the batch is what is counted."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_txt(tmp_path / "notes" / "Smith_John.txt")
+    write_txt(tmp_path / "notes" / "Jones_Mary.txt")
+    write_txt(tmp_path / "notes" / "Brown_Ann.txt")
+
+    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+
+    events, logs = read_events(events_file)
+    assert [event["message"] for event in events] == [
+        "loading the language model",
+        "note 1 of 3", "note 2 of 3", "note 3 of 3",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    assert logs == []
+    text = events_file.read_text()
+    assert not any(name in text for name in ("Smith", "Jones", "Brown", ".txt"))
+
+
+def test_a_note_that_fails_is_logged_to_the_clinician_by_position(
+    tmp_path, model, llm, monkeypatch, caplog
+):
+    """The clinician learns that one note of the batch was not extracted and
+    where to look; neither their panel nor the server's log learns its name."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_txt(tmp_path / "notes" / "a_Smith_John.txt")
+    write_txt(tmp_path / "notes" / "b_Jones_Mary.txt", text="   ")
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+
+    _, logs = read_events(events_file)
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert logs[0]["message"].startswith("note 2 of 2 could not be extracted")
+    assert "Jones" not in events_file.read_text()
+    assert not any("Jones" in record.getMessage() for record in caplog.records)
+    assert entry_for(tmp_path / "out", "b_Jones_Mary.txt")["status"] == "failed"
+
+
+# --------------------------------------------------------------------------
+# What an operator reads when a run fails: where, what and why
+# --------------------------------------------------------------------------
+
+def test_a_failed_note_is_logged_with_position_step_class_and_message(
+    tmp_path, model, llm, caplog
+):
+    notes = tmp_path / "notes"
+    write_txt(notes / "a_Smith_John.txt")
+    write_txt(notes / "b_Jones_Mary.txt", text="   ")
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+
+    messages = [record.getMessage() for record in caplog.records]
+    failed = [message for message in messages if message.startswith("note 2 of 2")]
+    assert len(failed) == 1
+    assert "reading the note failed" in failed[0]
+    assert "ValueError: no text could be extracted" in failed[0]
+    assert not any("Jones" in message or ".txt" in message for message in messages)
+    assert entry_for(tmp_path / "out", "b_Jones_Mary.txt")["failed_step"] == (
+        "reading the note"
+    )
+
+
+def test_a_partial_run_ends_with_a_warning_summary_by_category(
+    tmp_path, model, llm, caplog
+):
+    notes = tmp_path / "notes"
+    write_txt(notes / "a.txt")
+    write_txt(notes / "b.txt", text="   ")
+
+    with caplog.at_level("INFO", logger="CNE"):
+        sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+
+    summary = caplog.records[-1]
+    assert summary.levelname == "WARNING"
+    assert summary.getMessage() == (
+        "1 of 2 notes extracted, 1 failed; failures by category: ValueError 1"
+    )
+
+
+def test_a_complete_run_ends_with_an_info_summary(tmp_path, model, llm, caplog):
+    write_txt(tmp_path / "notes" / "a.txt")
+
+    with caplog.at_level("INFO", logger="CNE"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+
+    assert caplog.records[-1].levelname == "INFO"
+    assert caplog.records[-1].getMessage() == "1 of 1 notes extracted"
+
+
+def test_nothing_extracted_because_the_engine_failed_is_a_runtime_error(
+    tmp_path, model, llm
+):
+    """Every note lost to the engine is this server's fault, not the caller's:
+    it must not be answered 422 as the old ValueError was."""
+    notes = tmp_path / "notes"
+    write_txt(notes / "a.txt")
+    write_txt(notes / "b.txt")
+
+    def crash(_messages):
+        raise RuntimeError("llama_decode returned -3")
+
+    llm.answers = crash
+
+    with pytest.raises(RuntimeError) as raised:
+        sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value).startswith(
+        "0 of 2 notes extracted; most common failure: RuntimeError: "
+        "llama_decode returned -3 (2 of 2)"
+    )
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_nothing_extracted_from_a_mix_of_input_and_engine_faults_is_a_runtime_error(
+    tmp_path, model, llm
+):
+    notes = tmp_path / "notes"
+    write_txt(notes / "a.txt", text="   ")
+    write_txt(notes / "b.txt")
+
+    def crash(_messages):
+        raise RuntimeError("llama_decode returned -3")
+
+    llm.answers = crash
+
+    with pytest.raises(RuntimeError) as raised:
+        sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+
+    assert not isinstance(raised.value, (ValueError, ToolUnavailableError))
+
+
+def test_nothing_extracted_only_through_the_callers_notes_keeps_a_value_error(
+    tmp_path, model, llm
+):
+    write_pdf(tmp_path / "notes" / "a.pdf", text="")
+
+    with pytest.raises(ValueError) as raised:
+        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+
+    assert "0 of 1 notes extracted; most common failure: ValueError" in str(raised.value)
+
+
+def test_nothing_extracted_from_missing_readers_and_empty_notes_is_unavailable(
+    tmp_path, model, llm, monkeypatch
+):
+    def no_fitz(name):
+        raise ImportError(f"No module named {name!r}")
+
+    monkeypatch.setattr(dependencies.importlib, "import_module", no_fitz)
+    notes = tmp_path / "notes"
+    write_pdf(notes / "a.pdf")
+    write_txt(notes / "b.txt", text="   ")
+
+    with pytest.raises(ToolUnavailableError):
+        sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+
+
+def test_tool_unavailable_is_a_runtime_error_never_a_value_error():
+    assert issubclass(ToolUnavailableError, RuntimeError)
+    assert not issubclass(ToolUnavailableError, ValueError)
+
+
+def _fake_llama(monkeypatch, raises, printed=""):
+    """A `llama_cpp` whose `Llama` prints to stderr and then refuses to load."""
+    def refuse(**_kwargs):
+        if printed:
+            print(printed, file=sys.stderr)
+        raise raises
+
+    module = types.SimpleNamespace(
+        Llama=refuse, llama_supports_gpu_offload=lambda: 0,
+    )
+    monkeypatch.setattr(extraction, "engine_module", lambda: module)
+
+
+def test_a_model_that_will_not_load_is_a_runtime_error_with_the_settings(
+    tmp_path, monkeypatch, caplog
+):
+    """llama.cpp raises ValueError("Failed to load model from file: <path>")
+    for every failed load: a server fault dressed as the caller's."""
+    model_file = tmp_path / "m.gguf"
+    model_file.write_bytes(b"x" * 2_000_000)
+    _fake_llama(
+        monkeypatch,
+        ValueError(f"Failed to load model from file: {model_file}"),
+        printed="llama_model_load: error loading model: tensor data is truncated",
+    )
+
+    with caplog.at_level("INFO", logger="CNE"):
+        with pytest.raises(RuntimeError) as raised:
+            extraction.load_model(model_file, 6144, 0, -1)
+
+    assert not isinstance(raised.value, (ValueError, ToolUnavailableError))
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert str(raised.value).startswith("loading the language model failed (ValueError")
+    assert "n_ctx=6144, n_gpu_layers=-1" in str(raised.value)
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "model 2 MB, n_ctx=6144, n_gpu_layers=-1" in errors[0]
+    assert "gpu offload compiled in=False" in errors[0]
+    loader = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert loader == [
+        "llama.cpp loader output: llama_model_load: error loading model: "
+        "tensor data is truncated"
+    ]
+
+
+def test_a_model_file_gone_before_the_load_is_tool_unavailable(tmp_path, monkeypatch):
+    missing = tmp_path / "m.gguf"
+    _fake_llama(monkeypatch, ValueError(f"Model path does not exist: {missing}"))
+
+    with pytest.raises(ToolUnavailableError, match="no longer on this server"):
+        extraction.load_model(missing, 2048, 0, 0)
+
+
+def test_a_shipped_cuda_library_that_will_not_open_is_a_warning(
+    tmp_path, monkeypatch, caplog
+):
+    _fake_cuda_wheels(tmp_path, monkeypatch, dependencies.CUDA_RUNTIME_LIBRARIES)
+
+    def refuse(path, mode=None):
+        raise OSError("file too short")
+
+    monkeypatch.setattr(ctypes, "CDLL", refuse)
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        dependencies.preload_cuda_runtime()
+
+    assert len(caplog.records) == len(dependencies.CUDA_RUNTIME_LIBRARIES)
+    assert all(record.levelname == "WARNING" for record in caplog.records)
+    assert "libcudart.so.12 (OSError: file too short)" in caplog.records[0].getMessage()

@@ -19,6 +19,7 @@ What the move out of the server changed, beyond dropping `base`/`config`/
 See the comments marked "FIX:" for the original CLI's defects corrected here.
 """
 
+from collections import Counter
 from concurrent import futures
 import json
 import logging
@@ -26,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import threading
 import time
 
 from . import nnunet_runner, progress, vtk_export
@@ -60,6 +62,45 @@ TOOL_NAME = Path(__file__).resolve().parents[2].name
 # before returning. A leading dot keeps them out of the way if a run dies
 # before the cleanup.
 WORK_DIRNAME = ".amasss_work"
+
+
+def _formats_in_words() -> str:
+    """The accepted scan formats, without a leading dot.
+
+    ".nii.gz" in a message reaches the operator as `<file>`: the redaction
+    takes any dotted imaging suffix for a file name.
+    """
+    names = []
+    for extension in SCAN_EXTENSIONS:
+        name = extension.lstrip(".")
+        if name.endswith(".gz"):
+            name = name[: -len(".gz")]
+        if name not in names:
+            names.append(name)
+    return ", ".join(names) + " (each optionally gzipped)"
+
+
+def _failure(exc: BaseException, scan_path: str = "") -> str:
+    """"Type: message" on one line, with the scan's own path taken out.
+
+    The LAST line, because a SimpleITK or nnUNet message is several and ends on
+    its cause, and the server keeps about 300 characters of it. The path,
+    because SimpleITK names the file it could not open: that is patient
+    metadata in a log, and it also made every scan's failure a different
+    string, so the commonest one could never be counted.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    message = lines[-1] if lines else ""
+    if scan_path:
+        message = message.replace(scan_path, "the scan")
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def _most_common_failure(failures: list) -> str:
+    """"<Type: msg> (k of N)" for the commonest of `failures`, from `_failure`."""
+    counts = Counter(failures)
+    text, count = counts.most_common(1)[0]
+    return f"{text} ({count} of {len(failures)})"
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +138,7 @@ def discover_scans(input_path: str, prediction_id: str) -> list:
     announced N scans and the CLI silently processed a subset.
     """
     if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Input path not found: {input_path}")
+        raise FileNotFoundError("'scans' path does not exist")
 
     if os.path.isfile(input_path):
         return [input_path]
@@ -126,8 +167,7 @@ def discover_scans(input_path: str, prediction_id: str) -> list:
         # FIX: the original called sys.exit(1) here, which produces no usable
         # error for a caller that is not a shell.
         raise FileNotFoundError(
-            f"No scan found in {input_path}. Supported extensions: "
-            f"{', '.join(SCAN_EXTENSIONS)}"
+            f"No scan found in the 'scans' folder; supported formats: {_formats_in_words()}"
         )
     return sorted(found)
 
@@ -138,7 +178,7 @@ def resolve_models(model_path: str, structures):
     Returns (available, missing).
     """
     if not os.path.isdir(model_path):
-        raise FileNotFoundError(f"Model bundle is not a directory: {model_path}")
+        raise FileNotFoundError("'model' path is not a directory")
 
     # A bundle may be wrapped in a single top-level folder (a copy of
     # "AMASSS_Models/" rather than of its contents). Descend into it so both
@@ -152,20 +192,31 @@ def resolve_models(model_path: str, structures):
         if len(entries) == 1:
             model_path = entries[0]
 
-    available, missing = {}, []
+    available, missing, reasons = {}, [], []
     for code in structures:
         model_folder = nnunet_runner.find_model_folder(model_path, code)
         if model_folder is None:
-            logger.warning("No usable model for structure '%s' in %s", code, model_path)
+            reason = nnunet_runner.why_no_model(model_path, code)
+            reasons.append(f"{code}: {reason}")
+            logger.warning("structure %s has no usable model (%s); it is skipped", code, reason)
+            # The clinician asked for this structure and will not get it; the
+            # report lists it too, but a missing mask is easy to overlook.
+            progress.log(
+                f"no model is installed for {code}; it was not segmented",
+                "warning", user=True,
+            )
             missing.append(code)
         else:
             available[code] = model_folder
 
     if not available:
+        # In words, not as a path: the operator reads this redacted, and the
+        # layout spelled as a path reached them as `<path>`.
         raise nnunet_runner.ModelNotFoundError(
-            f"No nnUNet model found in '{os.path.basename(model_path)}' for any of the "
-            f"requested structures ({', '.join(structures)}). Expected "
-            f"<bundle>/<CODE>/**/*__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth"
+            "No usable nnUNet model for any requested structure ("
+            + "; ".join(reasons)
+            + "). Each structure needs a folder named by its code in the model "
+            "bundle, holding a 3d_fullres plans folder with fold 0's final checkpoint."
         )
     return available, missing
 
@@ -231,6 +282,81 @@ def _write_segmentation(array, reference, output_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
+# How often, in seconds, the structures' output folders are looked at while
+# nnUNet runs. One scan takes about a minute per structure on the card, so two
+# seconds moves the bar promptly and costs nothing.
+WATCH_INTERVAL = 2.0
+
+
+class _InferenceProgress:
+    """The bar through the structure phase, from two counts that are both real.
+
+    One nnUNet call per structure covers the whole cohort and says nothing on
+    the way, but it exports each case's mask under the case id as soon as that
+    case is done, to a folder of the structure's own. So the masks on disk,
+    across every structure, ARE the (structure, scan) pairs finished: a thread
+    counting them every few seconds moves the bar between the structures'
+    completions instead of leaving it still for the length of each one.
+
+    Both writers -- that thread and the loop collecting finished structures --
+    go through one lock and one high-water mark, so neither can send the bar
+    backwards past what the other already showed. A mask already on disk
+    before the phase is not counted, and the thread is a daemon, stopped in
+    `stop()`, that swallows every error of its own: progress must never fail a
+    run.
+    """
+
+    def __init__(self, expected, start, end, interval=None):
+        self.start, self.end = start, end
+        self.interval = WATCH_INTERVAL if interval is None else interval
+        self.total = len(expected)
+        try:
+            self.fresh = [path for path in expected if not os.path.exists(path)]
+        except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+            self.fresh = []
+        self.lock = threading.Lock()
+        self.high = start
+        self.reported = 0
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(
+            target=self._watch, name="amasss-progress", daemon=True
+        )
+
+    def _emit(self, share, message):
+        with self.lock:
+            fraction = max(self.high, self.start + (self.end - self.start) * share)
+            self.high = fraction
+            progress.emit(fraction, message)
+
+    def structure_done(self, done, total):
+        """A structure has finished: "structure k of n", where k is the next."""
+        # The same arithmetic `progress.report` uses, so the message keeps its
+        # meaning; only the floor is raised to what the masks already showed.
+        self._emit((done - 1) / float(total), f"structure {done} of {total}")
+
+    def _watch(self):
+        while not self.stopping.wait(self.interval):
+            try:
+                done = sum(1 for path in self.fresh if os.path.exists(path))
+                # The last mask is not reported: once it exists its structure
+                # is about to complete, and that completion says so itself.
+                if self.reported < done < self.total:
+                    self.reported = done
+                    self._emit(done / float(self.total),
+                               f"mask {done + 1} of {self.total}")
+            except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+                pass
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.stopping.set()
+        self.thread.join(timeout=self.interval + 1.0)
+        return False
+
 
 def _channels_for(sup, wanted: int, declared: int = 0) -> int:
     """How many structures to predict at once: what the machine will pay for.
@@ -368,9 +494,15 @@ def segment(
     with open(os.path.join(output_dir, "AMASSS_report.json"), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
 
-    logger.info(
-        "AMASSS finished: %d/%d scan(s) in %.1fs",
-        report["summary"]["processed"], report["summary"]["total"],
+    summary = report["summary"]
+    partial = summary["failed"] or summary["partial"] or report["structures_failed"] \
+        or report["structures_without_model"]
+    logger.log(
+        logging.WARNING if partial else logging.INFO,
+        "%d of %d scans segmented, %d failed, %d missing a structure; "
+        "%d of %d structures predicted (%.1fs)",
+        summary["processed"], summary["total"], summary["failed"], summary["partial"],
+        len(report["predicted_structures"]), len(report["requested_structures"]),
         report["duration_seconds"],
     )
     return report
@@ -388,6 +520,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
     os.makedirs(nnunet_input, exist_ok=True)
 
     scan_records = []
+    read_failures = []
     # Three phases share the bar. Only the middle one is long, so it is given
     # most of the range; what is exact is the counter in each message, the
     # split between the phases being a weighting and nothing more.
@@ -414,14 +547,25 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
             # Position in the batch, never the scan's name -- the same rule the
             # progress call above follows, and it matters more here: a failed
             # run's stderr is copied into the server's own persistent log.
-            logger.exception("Could not read scan %d of %d", index + 1, len(scans))
+            failure = _failure(exc, scan_path)
+            logger.warning("scan %d of %d: reading failed (%s)",
+                           index + 1, len(scans), failure)
+            read_failures.append(failure)
+            progress.log(
+                f"scan {index + 1} of {len(scans)} could not be read and was "
+                f"left out", "warning", user=True,
+            )
             record["status"] = "failed"
-            record["error"] = f"Unreadable input: {exc}"
+            record["error"] = f"Unreadable input: {failure}"
         scan_records.append(record)
 
     readable = [record for record in scan_records if record["status"] != "failed"]
     if not readable:
-        raise ToolInputError("None of the input scans could be read as a medical volume.")
+        # The caller's input, every time: kept a ToolInputError.
+        raise ToolInputError(
+            f"0 of {len(scans)} scans could be read as a medical volume; most common "
+            f"failure: {_most_common_failure(read_failures)}"
+        )
 
     # --- Inference: one model load per structure --------------------------
     #
@@ -459,22 +603,41 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
     # run after this one is reserved for five channels' worth and then granted
     # fewer of them.
     progress.set_width(width)
+    # Before the pool, so a run that dies inside nnUNet is not diagnosed as
+    # still "reading scan".
+    progress.emit(0.1, f"predicting {len(models)} structure(s)")
     done = 0
-    with futures.ThreadPoolExecutor(max_workers=width) as pool:
-        running = {pool.submit(predict, item): item[0] for item in models.items()}
+    prediction_failures = []
+    expected = [
+        os.path.join(work_dir, f"pred_{code}", f"{record['case_id']}.nii.gz")
+        for code in models for record in readable
+    ]
+    with _InferenceProgress(expected, start=0.1, end=0.9) as bar, \
+            futures.ThreadPoolExecutor(max_workers=width) as pool:
+        running = {pool.submit(predict, item): (position, item[0])
+                   for position, item in enumerate(models.items(), start=1)}
         for future in futures.as_completed(running):
-            code = running[future]
+            position, code = running[future]
             done += 1
             # Reported on COMPLETION, not on submission: with a pool every
             # structure starts at once, so a bar driven off starts would jump
             # to full and then sit there for the length of the run.
-            progress.report(done, len(models), "structure", start=0.1, end=0.9)
+            bar.structure_done(done, len(models))
             try:
                 _code, structure_output = future.result()
                 predictions[code] = structure_output
             except Exception as exc:
                 # One structure failing must not lose the others.
-                logger.exception("Prediction failed for structure %s", code)
+                failure = _failure(exc)
+                logger.warning(
+                    "structure %d of %d (%s): prediction failed (%s)",
+                    position, len(models), code, failure,
+                )
+                prediction_failures.append(failure)
+                progress.log(
+                    f"{code} could not be segmented; the report says why",
+                    "warning", user=True,
+                )
                 failed_structures[code] = str(exc)
     # Back to declaring nothing: what follows is one scan at a time again, and
     # a width left standing over it would be the permission masquerading as a
@@ -483,17 +646,26 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
 
     if not predictions:
         raise RuntimeError(
-            "Every structure failed to predict: "
-            + "; ".join(f"{code}: {error}" for code, error in failed_structures.items())
+            f"0 of {len(models)} structures predicted; most common failure: "
+            f"{_most_common_failure(prediction_failures)}"
         )
 
     # --- Assemble per-scan outputs ----------------------------------------
-    for index, record in enumerate(readable, start=1):
+    scan_failures = list(read_failures)
+    index = 0
+    for position, record in enumerate(scan_records, start=1):
+        if record["status"] == "failed":
+            continue
+        index += 1
         progress.report(index, len(readable), "writing scan", start=0.9)
         scan_started = time.monotonic()
         try:
             _assemble_scan_outputs(
                 record=record,
+                # The position in the whole batch, the one the reading phase
+                # already named, so both lines about one scan agree.
+                position=position,
+                total=len(scan_records),
                 predictions=predictions,
                 output_dir=output_dir,
                 work_dir=work_dir,
@@ -513,9 +685,12 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
             # FIX: the original re-raised on the LAST scan only, so a batch
             # could abort at the very end and lose everything already
             # produced. Every failure is recorded; the run continues.
-            logger.exception(
-                "Failed to assemble outputs for scan %d of %d", index, len(readable)
+            failure = _failure(exc, record["input_path"])
+            logger.warning(
+                "scan %d of %d: writing outputs failed (%s)",
+                position, len(scan_records), failure,
             )
+            scan_failures.append(failure)
             record["status"] = "failed"
             record["error"] = str(exc)
         record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
@@ -523,9 +698,11 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
 
     processed = [record for record in scan_records if record["status"] == "ok"]
     if not processed:
+        # At least one scan was readable and failed after inference, which is
+        # never the caller's doing: a RuntimeError, not an input error.
         raise RuntimeError(
-            "AMASSS produced no output for any scan. First error: "
-            + str(next((r.get("error") for r in scan_records if r.get("error")), "unknown"))
+            f"0 of {len(scan_records)} scans segmented; most common failure: "
+            f"{_most_common_failure(scan_failures)}"
         )
 
     return {
@@ -553,6 +730,8 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
             "total": len(scan_records),
             "processed": len(processed),
             "failed": len(scan_records) - len(processed),
+            # Segmented, but without every structure that was predicted.
+            "partial": sum(1 for record in processed if record.get("partial")),
         },
         "duration_seconds": round(time.monotonic() - started_at, 2),
     }
@@ -560,7 +739,8 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
 
 def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction_ID,
                            merge, generate_surface, surface_smoothing,
-                           surface_decimation, workers: int = 1) -> None:
+                           surface_decimation, workers: int = 1,
+                           position: int = 1, total: int = 1) -> None:
     """Turn one scan's per-structure nnUNet masks into its final files."""
     import numpy as np
     import SimpleITK as sitk
@@ -578,20 +758,31 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
     reference = sitk.ReadImage(scan_path)
 
     masks = {}
+    without = []
     for code, structure_output in predictions.items():
         predicted_file = os.path.join(structure_output, f"{case_id}.nii.gz")
         if not os.path.isfile(predicted_file):
-            # The case id, not the input's name: `p_003` is the scan's position
-            # in the batch and is also what nnUNet read and wrote, so the line
-            # is the more useful of the two AND carries no patient metadata.
-            logger.warning("No %s prediction for %s", code, case_id)
+            # The position, not the case id: `p_003` reaches the operator as
+            # `<id>`, and never the input's name, which is patient metadata.
+            without.append(code)
             continue
         array = sitk.GetArrayFromImage(sitk.ReadImage(predicted_file))
         masks[code] = (array > 0).astype(np.uint8)
 
     if not masks:
-        raise FileNotFoundError(f"nnUNet produced no prediction for {record['input']}")
+        # Not a FileNotFoundError: that class reads as the caller's fault, and
+        # an nnUNet that wrote nothing is the server's.
+        raise RuntimeError(
+            f"nnUNet wrote no mask for this scan for any of {len(predictions)} structure(s)"
+        )
+    for code in without:
+        logger.warning("scan %d of %d has no %s mask; written without it",
+                       position, total, code)
+    if without:
+        record["partial"] = True
+        record["structures_missing"] = sorted(without, key=lambda c: STRUCTURE_CODES.index(c))
 
+    where = f"scan {position} of {total}: "
     record["predicted_structures"] = sorted(masks, key=lambda c: STRUCTURE_CODES.index(c))
 
     scan_dir = os.path.join(output_dir, f"{base}_{prediction_ID}_SegOut")
@@ -619,6 +810,7 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
                     output_dir=scan_dir,
                     name_of=lambda code: f"{base}_{prediction_ID}_{code}.vtk",
                     workers=workers,
+                    where=where,
                 )
             )
 
@@ -641,6 +833,7 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
                 decimation=surface_decimation,
                 output_path=os.path.join(scan_dir, f"{base}_{prediction_ID}_MERGED.vtk"),
                 workers=workers,
+                where=where,
             )
             if surface:
                 record["surfaces"].append(surface)
@@ -653,5 +846,5 @@ def _assemble_scan_outputs(record, predictions, output_dir, work_dir, prediction
     record["produced"] = record["segmentations"] + record["surfaces"]
     if not record["segmentations"]:
         raise RuntimeError(
-            f"No segmentation was written for {record['input']} (merge modes: {', '.join(merge)})."
+            f"No segmentation was written for this scan (merge modes: {', '.join(merge)})."
         )

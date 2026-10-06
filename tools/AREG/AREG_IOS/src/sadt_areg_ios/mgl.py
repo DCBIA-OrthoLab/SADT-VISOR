@@ -76,19 +76,26 @@ class PatchError(Exception):
     """The MGL patch could not be built for this mesh."""
 
 
-def ordered_landmarks(landmarks: dict) -> np.ndarray:
+def ordered_landmarks(landmarks: dict, where: str = None) -> np.ndarray:
     """The MG landmark positions in arch order, as an (N, 3) array.
 
     Accepts both the current names (LL6MG...) and the older suffix-less ones,
     and tolerates missing teeth: a scan where ALI could not place every point
     still yields a usable curve as long as three remain.
+
+    `where` here and in the functions below is the mesh's position in the run
+    ("subject 3 of 8, T2"), put in front of each log line: the operator needs to
+    know WHICH mesh, and the file name is the one thing that may not say it.
     """
     for order in (MGL_ORDER, MGL_ORDER_LEGACY):
         points = [np.asarray(landmarks[name], dtype=float) for name in order if name in landmarks]
         if len(points) >= 3:
             missing = [name for name in order if name not in landmarks]
             if missing:
-                logger.warning("AREG MGL: %d MG landmark(s) missing from the prediction", len(missing))
+                logger.warning(
+                    "AREG MGL, %s: %d of %d MG landmark(s) missing from the prediction",
+                    where or "one mesh", len(missing), len(order),
+                )
             return np.array(points), missing
     raise PatchError(
         f"fewer than 3 mucogingival landmarks in this file (expected names such as "
@@ -163,7 +170,7 @@ def grow_band(surface, seeds, radius: float, adjacency=None) -> np.ndarray:
     return distance <= radius
 
 
-def _tooth_mask(surface) -> np.ndarray:
+def _tooth_mask(surface, where: str = None) -> np.ndarray:
     """True where a vertex belongs to a lower crown, False on the gingiva.
 
     All-False when the mesh carries no segmentation, so the caller keeps the
@@ -172,7 +179,8 @@ def _tooth_mask(surface) -> np.ndarray:
     array_name = surfaces.label_array_name(surface)
     if array_name is None:
         logger.warning(
-            "AREG MGL: this mesh carries no tooth labels, so the band is not kept off the crowns"
+            "AREG MGL, %s: the mesh carries no tooth labels, so the band is not kept off the crowns",
+            where or "one mesh",
         )
         return np.zeros(surface.GetNumberOfPoints(), dtype=bool)
     labels = vtk_to_numpy(surface.GetPointData().GetArray(array_name))
@@ -186,6 +194,7 @@ def build_patch(
     samples: int = DEFAULT_SAMPLES,
     array_name: str = MGL_ARRAY_NAME,
     exclude_teeth: bool = True,
+    where: str = None,
 ) -> tuple:
     """Paint the band around the mucogingival line into `array_name`.
 
@@ -199,7 +208,7 @@ def build_patch(
     around the mucogingival line buys over the points that carry it.
     """
     surface = postprocess.triangulate(surface)
-    points, missing = ordered_landmarks(landmarks)
+    points, missing = ordered_landmarks(landmarks, where=where)
 
     if height == 0:
         seeds = _snap_to_surface(surface, points)
@@ -211,7 +220,7 @@ def build_patch(
 
     dropped = 0
     if exclude_teeth:
-        on_teeth = _tooth_mask(surface) & inside
+        on_teeth = _tooth_mask(surface, where=where) & inside
         dropped = int(on_teeth.sum())
         inside = inside & ~on_teeth
 
@@ -227,8 +236,8 @@ def build_patch(
     surface.GetPointData().SetActiveScalars(array_name)
 
     logger.info(
-        "AREG MGL: %d of %d vertices in the patch (height %g mm, %d dropped as crown)",
-        int(inside.sum()), surface.GetNumberOfPoints(), height, dropped,
+        "AREG MGL, %s: %d of %d vertices in the patch (height %g mm, %d dropped as crown)",
+        where or "one mesh", int(inside.sum()), surface.GetNumberOfPoints(), height, dropped,
     )
     note = None
     if missing:

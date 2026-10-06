@@ -70,4 +70,7 @@ def run(
         # is pinning which models ran and is obeyed.
         model=Path(model) if model else _own_models(data_root),
         output_dir=Path(output_dir),
+        # Whether a missing folder is the caller's fault or the deployment's,
+        # which the path alone does not say.
+        installed_model=not model,
     )

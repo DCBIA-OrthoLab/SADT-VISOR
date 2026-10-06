@@ -13,12 +13,23 @@ failure here is swallowed.
 **Never name a file in a message.** Position in the batch is progress; a file
 name is patient metadata, and these messages are stored on the server and shown
 to whoever is watching the run.
+
+Every record says whose it is: the supervised call this process is
+(`SADT_PROGRESS_CALL`, set by the server's supervisor for each nested call) and
+its depth. That is what lets the server fold a nested tool's own 0..1 into the
+span its caller gave it, so a chain shows one bar instead of each tool's in
+turn. Both are absent for the tool a request named, and so are left out.
 """
 
 import json
 import os
 
 VARIABLE = "SADT_PROGRESS_FILE"
+CALL_VARIABLE = "SADT_PROGRESS_CALL"
+DEPTH_VARIABLE = "SADT_SUPERVISOR_DEPTH"
+
+# What `log` accepts; anything else is read as "info".
+LEVELS = ("debug", "info", "warning", "error")
 
 # The server truncates a message to 200 characters; truncating here too is what
 # keeps the write under PIPE_BUF, below which POSIX makes a write to an
@@ -57,6 +68,58 @@ def set_width(width):
         _width = None
 
 
+def _whose(record):
+    """Stamp the call and depth this process runs at, when it is nested."""
+    call = os.environ.get(CALL_VARIABLE)
+    if call:
+        record["call"] = call[:64]
+        try:
+            record["depth"] = int(os.environ.get(DEPTH_VARIABLE) or 0)
+        except ValueError:
+            pass
+    return record
+
+
+def _append(record):
+    path = os.environ.get(VARIABLE)
+    if not path:
+        return  # nobody is watching: a checkout, a test, an older server
+    line = json.dumps(record).encode("utf-8") + b"\n"
+    if len(line) > PIPE_BUF:
+        return  # a partial line would be unparsable; drop the event instead
+    handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(handle, line)
+    finally:
+        os.close(handle)
+
+
+def log(message, level="info", user=False):
+    """Say something about this run. Never raises; does nothing when unset.
+
+    `level` is debug, info, warning or error. `user=False` (the default) is
+    for whoever runs the server: it reaches the operator page, redacted, and a
+    warning or error is kept with the run's history. `user=True` is written for
+    the clinician who started the run and reaches their panel.
+
+    The same rule as a progress message, whoever reads it: never a file name
+    or a patient's -- "scan 4 of 12 has no mandible", not the scan's name.
+
+    For a tool with a supervisor, `sup.log(message, level=, user=)` is the
+    same line; this is the one for the tools that have none.
+    """
+    try:
+        level = str(level or "info").lower()
+        _append(_whose({
+            "kind": "log",
+            "level": level if level in LEVELS else "info",
+            "audience": "user" if user else "admin",
+            "message": str(message).replace("\n", " ")[:MAX_MESSAGE],
+        }))
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+        pass
+
+
 def emit(fraction, message):
     """Append one progress event. Never raises; does nothing when unset.
 
@@ -65,8 +128,7 @@ def emit(fraction, message):
     knowledge the tool does not have, and a bar that lies is worse than a bar
     that says nothing.
     """
-    path = os.environ.get(VARIABLE)
-    if not path:
+    if not os.environ.get(VARIABLE):
         return  # nobody is watching: a checkout, a test, an older server
     try:
         if fraction is not None:
@@ -74,14 +136,7 @@ def emit(fraction, message):
         record = {"fraction": fraction, "message": str(message)[:MAX_MESSAGE]}
         if _width is not None:
             record["width"] = _width
-        line = json.dumps(record).encode("utf-8") + b"\n"
-        if len(line) > PIPE_BUF:
-            return  # a partial line would be unparsable; drop the event instead
-        handle = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(handle, line)
-        finally:
-            os.close(handle)
+        _append(_whose(record))
     except Exception:  # noqa: BLE001 -- telemetry must never fail a run
         pass
 

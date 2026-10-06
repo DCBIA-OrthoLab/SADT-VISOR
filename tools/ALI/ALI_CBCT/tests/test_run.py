@@ -1264,10 +1264,61 @@ def test_a_batch_says_which_scan_it_is_on(tmp_path, stub_agent, cbct_environment
         regions=CRANIAL_BASE_ONLY,
     )
 
-    events = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    events = [record for record in records if record.get("kind") != "log"]
+    # One landmark per scan, so there is nothing to count inside a scan and no
+    # landmark event: a scan's last landmark stands where the next scan starts.
     assert [event["message"] for event in events] == ["scan 1 of 2", "scan 2 of 2"]
     assert [event["fraction"] for event in events] == [0.0, 0.5]
     assert not any("patient01" in event["message"] for event in events)
+    # The bundle has none of the other cranial-base landmarks, and the
+    # clinician is told so once, by count.
+    logs = [record for record in records if record.get("kind") == "log"]
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert "have no model in this bundle" in logs[0]["message"]
+
+
+def test_the_bar_moves_inside_a_scan_as_its_landmarks_come_back(
+    tmp_path, stub_agent, cbct_environment, monkeypatch
+):
+    """A search is about a minute, so a scan of many landmarks used to hold
+    the bar still for its whole length. The position is now (scan, landmark)
+    pairs finished across the cohort -- a count of searches that came back --
+    at the same tenth-of-the-scan cadence as the log line beside it."""
+    from sadt_ali_cbct import catalog as cbct_catalog_module
+
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_volume(tmp_path / "cohort" / "Smith_John.nii.gz")
+    write_volume(tmp_path / "cohort" / "Jones_Mary.nii.gz")
+    labels = cbct_catalog_module.GROUP_LABELS["CB"][:4]
+    bundle = write_cbct_bundle(tmp_path / "bundle", {"Cranial_Base": labels})
+
+    run(
+        input=tmp_path / "cohort",
+        model=bundle,
+        output_dir=tmp_path / "out",
+        landmarks=labels,
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    events = [record for record in records if record.get("kind") != "log"]
+    assert [event["message"] for event in events] == [
+        "scan 1 of 2",
+        "scan 1 of 2: 1 of 4 landmarks searched",
+        "scan 1 of 2: 2 of 4 landmarks searched",
+        "scan 1 of 2: 3 of 4 landmarks searched",
+        "scan 2 of 2",
+        "scan 2 of 2: 1 of 4 landmarks searched",
+        "scan 2 of 2: 2 of 4 landmarks searched",
+        "scan 2 of 2: 3 of 4 landmarks searched",
+    ]
+    assert [event["fraction"] for event in events] == [
+        0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875,
+    ]
+    assert [record for record in records if record.get("kind") == "log"] == []
+    text = events_file.read_text()
+    assert "Smith" not in text and "Jones" not in text
 
 
 def test_every_description_is_sourced_or_absent():
@@ -1355,3 +1406,191 @@ def test_the_ask_is_capped_at_the_widest_width_worth_having():
 
     # A busy machine still narrows it further; the cap is not a floor.
     assert cbct_engine._channels_for(_Stingy(), 119) == 2
+
+
+# ---------------------------------------------------------------------------
+# What an operator can read when a run fails
+# ---------------------------------------------------------------------------
+#
+# The server keeps the exception's class and message, and the log lines of
+# this package -- no traceback, nothing a spawned worker logged, and no job
+# directory once a run has failed. These tests pin that what is left says
+# what failed, where, and why.
+
+def _messages(caplog, level=None):
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name.startswith("sadt_ali_cbct")
+        and (level is None or record.levelname == level)
+    ]
+
+
+@pytest.fixture
+def raising_brain(monkeypatch, stub_agent):
+    """Every landmark's networks fail to build, as on a card out of memory."""
+    from sadt_ali_cbct import engine as cbct_engine
+
+    class OutOfMemoryBrain:
+        def __init__(self, scale_keys, device, out_channels=6):
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    monkeypatch.setattr(cbct_engine, "Brain", OutOfMemoryBrain)
+
+
+def test_a_scan_on_which_every_agent_raised_names_the_error_not_convergence(
+    tmp_path, raising_brain, cbct_environment, caplog
+):
+    """"No landmark converged" used to be said even when every agent died of
+    an out-of-memory -- sending the operator to the scan when the run was at
+    fault. Building the networks is inside the per-landmark guard too."""
+    write_volume(tmp_path / "cohort" / "Smith_John.nii.gz")
+    bundle = write_cbct_bundle(tmp_path / "bundle", {"Cranial_Base": ["Ba", "S"]})
+
+    with caplog.at_level("INFO"), pytest.raises(RuntimeError) as raised:
+        run(input=tmp_path / "cohort", model=bundle, output_dir=tmp_path / "out",
+            landmarks=["Ba", "S"])
+
+    message = str(raised.value)
+    assert message.startswith("0 of 1 scans processed; most common failure: ")
+    assert "0 of 2 landmarks placed; most common failure: RuntimeError: CUDA out of memory" in message
+    assert "converge" not in message
+    warnings = _messages(caplog, "WARNING")
+    assert "scan 1 of 1: landmark Ba failed (RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB)" in warnings
+    assert any(line.startswith("scan 1 of 1: landmark search failed (RuntimeError: 0 of 2")
+               for line in warnings)
+    assert not any("Smith" in line for line in _messages(caplog))
+
+
+def test_a_scan_on_which_every_agent_gave_up_says_so(tmp_path, stub_agent, cbct_environment):
+    from sadt_ali_cbct import engine as cbct_engine
+
+    write_volume(tmp_path / "cohort" / "patient01.nii.gz")
+    bundle = write_cbct_bundle(tmp_path / "bundle", {"Cranial_Base": ["XA", "XB"]})
+    results = {
+        "XA": (None, "stubbed failure", cbct_engine.NOT_FOUND),
+        "XB": (None, "stubbed failure", cbct_engine.NOT_FOUND),
+    }
+    assert cbct_engine._no_landmark_reason(results, 2) == (
+        "0 of 2 landmarks placed: every agent stopped without converging on this scan"
+    )
+    # A single raise among the give-ups is what the message leads with.
+    results["XB"] = (None, "OSError: checkpoint unreadable", cbct_engine.RAISED)
+    assert "most common failure: OSError: checkpoint unreadable (1 of 2)" in (
+        cbct_engine._no_landmark_reason(results, 2)
+    )
+
+
+def test_a_landmark_that_raised_in_a_worker_is_logged_by_the_parent(monkeypatch, caplog):
+    """A spawned worker's log lines are never forwarded, so the error has to
+    be said where the result comes back."""
+    from concurrent import futures as concurrent_futures
+    from sadt_ali_cbct import engine as cbct_engine
+
+    def worker_walk(task):
+        _images, _key, label = task
+        if label == "Ba":
+            return None, "RuntimeError: CUDA out of memory", cbct_engine.RAISED
+        if label == "S":
+            return None, "agent left the volume", cbct_engine.NOT_FOUND
+        return np.array([1.0, 2.0, 3.0]), None, None
+
+    monkeypatch.setattr(cbct_engine, "_worker_walk", worker_walk)
+    with caplog.at_level("INFO"), concurrent_futures.ThreadPoolExecutor(2) as pool:
+        results, broken = cbct_engine._walk_in_pool(
+            pool, {}, "key", ("Ba", "N", "S"), lambda _count: None, 3, 7,
+        )
+
+    assert not broken and sorted(results) == ["Ba", "N", "S"]
+    assert _messages(caplog, "WARNING") == [
+        "scan 3 of 7: landmark Ba failed (RuntimeError: CUDA out of memory)"
+    ]
+    assert "scan 3 of 7: landmark S not found (agent left the volume)" in _messages(caplog, "INFO")
+
+
+def test_a_partial_batch_ends_on_a_warning_with_counts(
+    tmp_path, stub_agent, cbct_environment, monkeypatch, caplog
+):
+    from sadt_ali_cbct import engine as cbct_engine
+
+    write_volume(tmp_path / "cohort" / "a.nii.gz")
+    write_volume(tmp_path / "cohort" / "b.nii.gz")
+    bundle = write_cbct_bundle(tmp_path / "bundle", {"Cranial_Base": ["Ba"]})
+    real_prepare = cbct_engine._prepare_scan
+
+    def prepare(scan_path, work_dir):
+        if scan_path.endswith("b.nii.gz"):
+            raise OSError("truncated gzip stream")
+        return real_prepare(scan_path, work_dir)
+
+    monkeypatch.setattr(cbct_engine, "_prepare_scan", prepare)
+    with caplog.at_level("INFO"):
+        run(input=tmp_path / "cohort", model=bundle, output_dir=tmp_path / "out",
+            landmarks=["Ba"])
+
+    warnings = _messages(caplog, "WARNING")
+    assert "scan 2 of 2: preprocessing failed (OSError: truncated gzip stream)" in warnings
+    assert any(line.startswith("1 of 2 scans processed, 1 failed") for line in warnings)
+
+
+def test_a_dicom_series_that_cannot_be_converted_is_counted_as_failed(
+    tmp_path, stub_agent, cbct_environment, monkeypatch, caplog
+):
+    """It used to vanish with an anonymous log line, and the run reported
+    every remaining scan done."""
+    from sadt_ali_cbct import preprocess
+
+    write_volume(tmp_path / "cohort" / "volume01.nii.gz")
+    series = tmp_path / "cohort" / "Smith_John"
+    series.mkdir(parents=True)
+    (series / "IM000001").write_bytes(b"not really dicom")
+    bundle = write_cbct_bundle(tmp_path / "bundle", {"Cranial_Base": ["Ba"]})
+
+    def broken(directory, destination):
+        raise RuntimeError("Exception thrown in SimpleITK ImageSeriesReader_Execute")
+
+    monkeypatch.setattr(dispatch, "classify", lambda root: (
+        [str(tmp_path / "cohort" / "volume01.nii.gz")], []))
+    monkeypatch.setattr(dispatch, "_dicom_directories", lambda root: [str(series)])
+    monkeypatch.setattr(preprocess, "convert_dicom_series", broken)
+
+    with caplog.at_level("INFO"):
+        output_dir = run(input=tmp_path / "cohort", model=bundle,
+                         output_dir=tmp_path / "out", landmarks=["Ba"])
+
+    report = json.loads((output_dir / dispatch.REPORT_NAME).read_text())
+    assert report["summary"] == {"total": 2, "processed": 1, "failed": 1}
+    assert report["dicom_series_failed"] == 1
+    failed = [case for case in report["cases"].values() if case["status"] == "failed"]
+    assert failed and failed[0]["error"].startswith("DICOM conversion failed (RuntimeError")
+    assert ("DICOM series 1 of 1: conversion failed (RuntimeError: Exception thrown in "
+            "SimpleITK ImageSeriesReader_Execute)") in _messages(caplog, "WARNING")
+    assert not any("Smith" in line for line in _messages(caplog))
+
+
+def test_an_input_whose_every_dicom_series_fails_is_refused_with_counts(tmp_path, monkeypatch):
+    from sadt_ali_cbct import preprocess
+
+    series = tmp_path / "cohort" / "series"
+    series.mkdir(parents=True)
+    (series / "IM000001").write_bytes(b"x")
+    monkeypatch.setattr(preprocess, "is_dicom_series", lambda directory: True)
+
+    def broken(directory, destination):
+        raise ValueError("GDCM found no slice of a DICOM series in this folder")
+
+    monkeypatch.setattr(preprocess, "convert_dicom_series", broken)
+    with pytest.raises(ToolInputError, match=r"^0 of 1 DICOM series could be converted"):
+        dispatch.detect(str(tmp_path / "cohort"), str(tmp_path / "work"))
+
+
+def test_a_half_copied_landmark_is_logged_with_its_count(tmp_path, caplog):
+    from sadt_ali_cbct import engine as cbct_engine
+
+    folder = tmp_path / "bundle" / "Ba" / "1"
+    folder.mkdir(parents=True)
+    (folder / "Ba_Net_1.pth").write_bytes(b"fake")
+
+    with caplog.at_level("WARNING"):
+        cbct_engine.discover_weights(str(tmp_path / "bundle"))
+    assert any(line.startswith("1 landmark(s) in the bundle lack a checkpoint at every scale")
+               and line.endswith(": Ba") for line in _messages(caplog, "WARNING"))

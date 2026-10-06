@@ -308,8 +308,41 @@ def test_a_cohort_where_no_patient_could_be_derived_is_refused(tmp_path):
     (tmp_path / "cb").mkdir()
     (tmp_path / "max").mkdir()
 
-    with pytest.raises(ToolInputError, match="No patient's landmarks could be"):
+    # The pipeline's fault, not the caller's, and the reason travels in the
+    # error: the run report is deleted with the job when the run fails.
+    with pytest.raises(RuntimeError, match=r"0 of 1 .* most common failure: no "
+                                           r"orientation transform for the source frame"):
         landmarks.derive_into_frame(
             str(tmp_path / "lm_cb"), str(tmp_path / "cb"), str(tmp_path / "max"),
             str(tmp_path / "max"), ["Ba"], str(tmp_path / "lm_max"),
         )
+
+
+def test_a_patient_that_cannot_be_derived_is_logged_by_position_not_name(tmp_path, caplog):
+    _two_frames(tmp_path)
+    landmarks.write_markups(ARCH, str(tmp_path / "lm_cb" / "P2_T1_CB_Or_lm_Pred_CB.mrk.json"))
+
+    with caplog.at_level("WARNING", logger="sadt_vface"):
+        landmarks.derive_into_frame(
+            str(tmp_path / "lm_cb"), str(tmp_path / "cb"), str(tmp_path / "max"),
+            str(tmp_path / "max"), ["Ba"], str(tmp_path / "lm_max"),
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("patient 2 of 2" in m and "orientation transform" in m for m in messages)
+    assert any("1 of 2 patient(s), 1 failed" in m for m in messages)
+    assert not any("P2" in m for m in messages)
+
+
+def test_an_unreadable_landmark_file_is_logged_with_its_position_and_cause(tmp_path, caplog):
+    landmarks.write_markups(ARCH, str(tmp_path / "lm" / "P1_T1_CB_Or_lm_Pred_CB.mrk.json"))
+    (tmp_path / "lm" / "P2_T1_CB_Or_lm_Pred_CB.mrk.json").write_text("{not json")
+
+    with caplog.at_level("WARNING", logger="sadt_vface"):
+        found = landmarks.read_cohort(str(tmp_path / "lm"))
+
+    assert set(found) == {"P1"}
+    (message,) = [record.getMessage() for record in caplog.records]
+    assert "landmark file 2 of 2" in message
+    assert "JSONDecodeError" in message
+    assert "P2" not in message

@@ -372,6 +372,9 @@ def test_the_run_report_names_the_unmatched_landmark_files(tmp_path):
     root = tmp_path / "input"
     _write_scan(root / "P1_CBCT.nii.gz")
     _write_markups(str(root / "P1.mrk.json"), _REFERENCE_POINTS)
+    # A second, well-formed patient, so the run succeeds and keeps its report:
+    # a run that orients nobody now raises, and its report is not kept.
+    _cbct_case(root, key="patient2")
 
     report = dispatch.orient(
         input_path=str(root),
@@ -382,7 +385,8 @@ def test_the_run_report_names_the_unmatched_landmark_files(tmp_path):
         output_dir=str(tmp_path / "out"),
     ).report
 
-    assert report["summary"]["oriented"] == 0
+    assert report["summary"]["oriented"] == 1
+    assert report["cases"]["P1_CBCT"]["status"] == "failed"
     assert report["unmatched_markups"] == ["P1.mrk.json"]
     reason = report["cases"]["P1_CBCT"]["reason"]
     # The file is NAMED, and so is the rule that would have paired it.
@@ -718,10 +722,15 @@ class FakeSup:
         self.out = tmp_path
         self.tmp = tmp_path
         self.calls = []
+        self.spans = []
         self.messages = []
         self.call_index = 0
 
     def run(self, tool, **params):
+        # `_progress` is the caller's span of its own bar, and the supervisor
+        # removes it before the callee sees it -- so it is recorded apart and
+        # never left among the parameters a tool would be handed.
+        self.spans.append((tool, params.pop("_progress", None)))
         # The input is captured HERE, not after the run: it lives in the
         # working directory, which is removed before `orient` returns.
         self.calls.append((tool, params))
@@ -752,7 +761,7 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
 
 
@@ -1611,6 +1620,34 @@ def test_the_landmark_waypoint_reaches_the_supervisor(tmp_path):
     assert (0.2, f"predicting landmarks with {dispatch.LANDMARK_TOOL}") in sup.messages
 
 
+def test_the_landmark_tool_is_given_the_slice_between_the_phases(tmp_path, monkeypatch):
+    """The landmark tool fills 0.2..0.6 of ASO's bar, exactly the gap its own
+    phases leave: recentring ends where the span starts, registration starts
+    where it ends. Anything else and the folded bar steps back or jumps."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "patient2": _predicted()}, tmp_path)
+
+    _run_aso(
+        tmp_path, input=str(root), reference=_cbct_reference(tmp_path),
+        modality="CBCT", automation="Fully-Automated",
+        landmark_model="Bundle", cbct_landmarks=list(_REFERENCE_POINTS), sup=sup,
+    )
+
+    assert sup.spans == [(dispatch.LANDMARK_TOOL, (0.2, 0.6))]
+    _tool, params = sup.calls[0]
+    assert "_progress" not in params
+    fractions = [event["fraction"] for event in _events(events_file)]
+    centring = [f for f in fractions if f < 0.2 + 1e-9]
+    registering = [f for f in fractions if f > 0.2 + 1e-9]
+    assert fractions == sorted(fractions)
+    assert max(centring) <= 0.2
+    assert min(registering) >= 0.6
+
+
 # ---------------------------------------------------------------------------
 # What reaches the log: a position, never a patient
 # ---------------------------------------------------------------------------
@@ -1839,3 +1876,182 @@ def test_landmarks_rewritten_from_a_callers_file_are_drawn_too(tmp_path):
     assert node["display"]["color"] == [1.0, 0.0, 0.0], (
         "the caller's own colour is theirs to keep"
     )
+
+
+# ---------------------------------------------------------------------------
+# What an operator can read when a run fails
+# ---------------------------------------------------------------------------
+#
+# The server keeps the exception's class and message and this package's log
+# lines -- no traceback, and no report: the job directory is deleted when a
+# run fails.
+
+def _aso_messages(caplog, level):
+    return [record.getMessage() for record in caplog.records
+            if record.name.startswith("sadt_aso") and record.levelname == level]
+
+
+def _orient_cbct(tmp_path, root, **kwargs):
+    return dispatch.orient(
+        input_path=str(root),
+        reference_path=kwargs.pop("reference", None) or _cbct_reference(tmp_path),
+        modality=catalogs.MODALITY_CBCT,
+        automation=kwargs.pop("automation", catalogs.AUTOMATION_SEMI),
+        cbct_landmarks=list(_REFERENCE_POINTS),
+        output_dir=str(tmp_path / "out"),
+        **kwargs,
+    )
+
+
+def test_a_run_that_oriented_nobody_for_want_of_landmarks_is_the_callers(tmp_path, caplog):
+    """It used to return success with an empty output folder."""
+    root = tmp_path / "input"
+    _write_scan(root / "Smith_John_scan.nii.gz")
+
+    with caplog.at_level(logging.INFO), pytest.raises(ToolInputError) as raised:
+        _orient_cbct(tmp_path, root)
+
+    assert str(raised.value).startswith(
+        "0 of 1 patients oriented; most common failure: no landmark file (.mrk.json)"
+    )
+    assert str(raised.value).endswith("(1 of 1)")
+    warnings = _aso_messages(caplog, "WARNING")
+    assert any(line.startswith("patient 1 of 1: landmark lookup failed (no landmark file")
+               for line in warnings)
+    assert not any("Smith" in line for line in warnings)
+
+
+def test_a_run_whose_every_registration_failed_is_the_servers(tmp_path, monkeypatch, caplog):
+    root = tmp_path / "input"
+    _cbct_case(root, key="patient1")
+    _cbct_case(root, key="patient2")
+
+    def refuse(**kwargs):
+        raise cbct_pipeline.icp.RegistrationError("no landmark triplet is well conditioned")
+
+    monkeypatch.setattr(cbct_pipeline, "orient_patient", refuse)
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError) as raised:
+        _orient_cbct(tmp_path, root)
+
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value) == (
+        "0 of 2 patients oriented; most common failure: no landmark triplet is "
+        "well conditioned (2 of 2)"
+    )
+    assert "patient 2 of 2: registration failed (no landmark triplet is well conditioned)" in (
+        _aso_messages(caplog, "WARNING")
+    )
+    assert "CBCT Semi-Automated: 0 of 2 patients oriented, 2 failed" in (
+        _aso_messages(caplog, "WARNING")
+    )
+
+
+def test_a_scan_that_cannot_be_read_back_costs_only_its_patient(tmp_path, monkeypatch, caplog):
+    """`sitk.ReadImage` sat outside the per-patient guard, so one bad volume
+    stopped the cohort."""
+    import SimpleITK as sitk
+
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "patient2": _predicted()}, tmp_path)
+    real_read = sitk.ReadImage
+
+    def read(path, *args, **kwargs):
+        # Only once the landmark tool has read the scans: the fake reads them
+        # with this same function, and that read must succeed.
+        if hasattr(sup, "sent") and "centered" in str(path) and "patient1" in str(path):
+            raise RuntimeError("ITK ERROR: ImageFileReader: could not read the file")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(sitk, "ReadImage", read)
+    with caplog.at_level(logging.INFO):
+        oriented = _orient_cbct(tmp_path, root, automation=catalogs.AUTOMATION_FULLY,
+                                landmark_model="Bundle", sup=sup)
+
+    assert oriented.report["summary"] == {"cases": 2, "oriented": 1, "failed": 1}
+    assert any(line.startswith("patient 1 of 2: re-reading the centred scan failed "
+                               "(RuntimeError: ITK ERROR")
+               for line in _aso_messages(caplog, "WARNING"))
+
+
+def test_what_the_landmark_tool_returned_is_compared_with_what_was_sent(tmp_path, caplog):
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "stranger": _predicted()}, tmp_path)
+
+    with caplog.at_level(logging.INFO):
+        _orient_cbct(tmp_path, root, automation=catalogs.AUTOMATION_FULLY,
+                     landmark_model="Bundle", sup=sup)
+
+    warnings = _aso_messages(caplog, "WARNING")
+    assert (f"{dispatch.LANDMARK_TOOL} returned landmarks for 1 of 2 scan(s); "
+            "1 predicted file(s) matched no scan") in warnings
+    assert f"patient 2 of 2: {dispatch.LANDMARK_TOOL} returned no landmarks" in warnings
+
+
+def test_an_unreadable_reference_bundle_is_the_servers_fault(tmp_path):
+    root = tmp_path / "input"
+    _cbct_case(root)
+    reference = tmp_path / "gold"
+    reference.mkdir()
+    (reference / "reference_lm.mrk.json").write_text("{not json")
+
+    with pytest.raises(RuntimeError, match=r"^reference bundle unreadable: ") as raised:
+        _orient_cbct(tmp_path, root, reference=str(reference))
+    assert not isinstance(raised.value, ValueError)
+
+
+def test_an_ios_reference_with_nothing_usable_is_the_servers_fault(tmp_path):
+    empty = tmp_path / "gold_ios"
+    empty.mkdir()
+    with pytest.raises(RuntimeError, match=r"^reference bundle unreadable: ") as raised:
+        ios_pipeline.load_reference(str(empty))
+    assert not isinstance(raised.value, ValueError)
+
+
+def test_a_dicom_series_that_cannot_be_converted_is_named_by_position(
+    tmp_path, monkeypatch, caplog
+):
+    dicom = dicom_module()
+    root = tmp_path / "input"
+    _write_dicom_series(root / "Smith_John")
+    _write_dicom_series(root / "Jones_Mary")
+    converted = []
+
+    def convert(directory, series, destination):
+        if converted:
+            raise RuntimeError("GDCM could not assemble the slices")
+        converted.append(directory)
+
+    monkeypatch.setattr(dicom, "_convert_series", convert)
+    with caplog.at_level(logging.INFO), pytest.raises(ToolInputError) as raised:
+        dicom.convert_tree(str(root), str(tmp_path / "nifti"))
+
+    assert str(raised.value) == (
+        "DICOM series 2 of 2 could not be converted "
+        "(RuntimeError: GDCM could not assemble the slices)"
+    )
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    lines = _aso_messages(caplog, "WARNING") + _aso_messages(caplog, "INFO")
+    assert "DICOM series 2 of 2: conversion failed (RuntimeError: GDCM could not " \
+           "assemble the slices)" in lines
+    assert not any("Smith" in line or "Jones" in line for line in lines)
+
+
+def test_a_failed_ios_jaw_is_logged_with_its_patient_position(tmp_path, caplog):
+    root = tmp_path / "input"
+    _ios_case(root, key="P1", array_name="NotALabelArray")
+    _ios_case(root, key="P2")
+
+    with caplog.at_level(logging.INFO):
+        oriented = dispatch.orient(
+            input_path=str(root), reference_path=_ios_reference(tmp_path),
+            modality=catalogs.MODALITY_IOS, automation=catalogs.AUTOMATION_FULLY,
+            output_dir=str(tmp_path / "out"),
+        )
+
+    assert oriented.report["summary"]["failed"] == 1
+    assert any(line.startswith("patient 1 of 2: Upper jaw: registration failed (")
+               for line in _aso_messages(caplog, "WARNING"))

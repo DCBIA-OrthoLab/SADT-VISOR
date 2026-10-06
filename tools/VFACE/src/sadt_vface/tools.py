@@ -88,6 +88,44 @@ def require(sup, tool: str, mode: str) -> None:
     )
 
 
+def split_span(span, weights) -> list:
+    """`span` cut into consecutive slices in proportion to `weights`, in order.
+
+    A stage that makes several calls -- one per frame, one per region -- gives
+    each its own slice, because the server folds each call into the span it is
+    handed: two calls sharing one span would show the second as the bar going
+    back to where the first started. None in, a None per call out, so a caller
+    with no bar still makes every call.
+    """
+    weights = [float(weight) for weight in weights]
+    if span is None or not weights:
+        return [None] * len(weights)
+    if sum(weights) <= 0:
+        weights = [1.0] * len(weights)
+    start, end = span
+    total = sum(weights)
+    slices, position = [], start
+    for weight in weights:
+        width = (end - start) * weight / total
+        slices.append((round(position, 6), round(position + width, 6)))
+        position += width
+    # Rounding must not leave a sliver between the last slice and the next
+    # stage: the last one ends exactly where the stage does.
+    slices[-1] = (slices[-1][0], end)
+    return slices
+
+
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
 def _returned(produced) -> str:
     """A tool returns a Path, or a dict of named ones; VFACE wants a directory."""
     if isinstance(produced, dict):
@@ -114,7 +152,7 @@ def _returned(produced) -> str:
 # ---------------------------------------------------------------------------
 
 def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
-                 landmark_model: str = "", label: str = "") -> str:
+                 landmark_model: str = "", label: str = "", span=None) -> str:
     """Orient a cohort into one frame.
 
     Fully-Automated, which for CBCT means ASO predicts the landmarks through
@@ -142,10 +180,11 @@ def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
     # request, not a forgotten one.
     if landmark_model:
         parameters["landmark_model"] = landmark_model
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
-def segment_masks(sup, scans: str, model: str, structures, label: str = "") -> str:
+def segment_masks(sup, scans: str, model: str, structures, label: str = "",
+                  span=None) -> str:
     """Segment the bone the registration and the heat maps are keyed on.
 
     `merge=["SEPARATE"]` for the same reason AREG asks for it: one binary file
@@ -161,11 +200,12 @@ def segment_masks(sup, scans: str, model: str, structures, label: str = "") -> s
         merge=["SEPARATE"],
         prediction_ID="seg",
         generate_surface=False,
+        **_span(span),
     ))
 
 
 def mirror(sup, files: str, transform: str, content: str = "Automatic",
-           label: str = "") -> str:
+           label: str = "", span=None) -> str:
     """The patient's own scan, mirrored -- which is what an asymmetry assessment
     compares against.
 
@@ -185,10 +225,12 @@ def mirror(sup, files: str, transform: str, content: str = "Automatic",
         same_transform_for_every_patient=True,
         output_suffix="mir",
         content=content,
+        **_span(span),
     ))
 
 
-def apply_transforms(sup, files: str, transforms: str, label: str = "") -> str:
+def apply_transforms(sup, files: str, transforms: str, label: str = "",
+                     span=None) -> str:
     """Move each patient's files by that patient's OWN transform.
 
     The other AutoMatrix call. `mirror` applies one transform to everybody --
@@ -209,10 +251,12 @@ def apply_transforms(sup, files: str, transforms: str, label: str = "") -> str:
         same_transform_for_every_patient=False,
         output_suffix="reg",
         content="Automatic",
+        **_span(span),
     ))
 
 
-def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "") -> str:
+def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "",
+             span=None) -> str:
     """Register `t2` onto `t1` on one region's bone.
 
     Semi-Automated: VFACE has already oriented the scans and already has the
@@ -230,6 +274,7 @@ def register(sup, t1: str, t2: str, region: str, masks: str, label: str = "") ->
         regions=[region],
         t1_masks=masks,
         output_suffix="Reg",
+        **_span(span),
     )))
 
 
@@ -293,11 +338,22 @@ def _why_nothing_registered(produced: str) -> str:
         return ""
 
     parts = []
+    # AREG_CBCT writes "unmatched", `{"t1_without_t2": [...], "t2_without_t1":
+    # [...]}`, always present and usually empty; "unpaired" is the older key,
+    # read for a report written before the rename. Counted, never listed: the
+    # entries are patient names.
+    unmatched = content.get("unmatched") or {}
+    if isinstance(unmatched, dict):
+        t1_only = len(unmatched.get("t1_without_t2") or [])
+        t2_only = len(unmatched.get("t2_without_t1") or [])
+        if t1_only or t2_only:
+            parts.append(f"unmatched: {t1_only} T1-only, {t2_only} T2-only")
     unpaired = content.get("unpaired")
     if unpaired:
-        parts.append(f"unpaired: {unpaired}")
+        count = len(unpaired) if isinstance(unpaired, (list, dict)) else unpaired
+        parts.append(f"unpaired: {count}")
     patients = content.get("patients") or {}
-    for key, entry in list(patients.items())[:3]:
+    for index, entry in enumerate(list(patients.values())[:3], start=1):
         state = entry.get("status", "?")
         reason = entry.get("error") or entry.get("reason") or ""
         # AREG records the reason PER REGION, one level below the patient, so
@@ -306,8 +362,9 @@ def _why_nothing_registered(produced: str) -> str:
             if region.get("reason"):
                 reason = f"{code}: {region['reason']}"
                 break
-        parts.append(f"{key}: {state}{f' ({reason})' if reason else ''}")
-    if not patients and not unpaired:
+        parts.append(f"patient {index} of {len(patients)}: {state}"
+                     f"{f' ({reason})' if reason else ''}")
+    if not parts:
         parts.append("its report names no patient at all")
     return " AREG says -- " + "; ".join(parts) + "."
 
@@ -326,7 +383,7 @@ def _transforms_in(directory: str) -> list:
 
 
 def predict_landmarks(sup, scans: str, landmarks, model: str = "",
-                      label: str = "") -> str:
+                      label: str = "", span=None) -> str:
     """The landmarks every measurement is computed from.
 
     Asked for by NAME, not by region: a measurement names the points it needs,
@@ -341,10 +398,10 @@ def predict_landmarks(sup, scans: str, landmarks, model: str = "",
     }
     if model:
         parameters["model"] = model
-    return _returned(sup.run("ALI_CBCT", **parameters))
+    return _returned(sup.run("ALI_CBCT", **parameters, **_span(span)))
 
 
-def segment_surfaces(sup, scans: str, model: str, label: str = "") -> str:
+def segment_surfaces(sup, scans: str, model: str, label: str = "", span=None) -> str:
     """The surfaces a heat map is drawn on.
 
     Only the visualisation path asks for this. The measurements are computed
@@ -361,4 +418,5 @@ def segment_surfaces(sup, scans: str, model: str, label: str = "") -> str:
         scans=scans,
         model=model,
         prediction_ID="Seg",
+        **_span(span),
     ))

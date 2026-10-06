@@ -270,8 +270,8 @@ def test_a_failure_names_the_position_and_never_the_patient(
                            output_dir=tmp_path / "out")
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any(m.startswith("GreedyReg failed on patient ") and m.endswith(" of 2")
-               for m in messages), messages
+    assert "GreedyReg failed on patient 1 of 2: greedy registration (NCC, 6 dof) failed " \
+        "(RuntimeError: greedy: images do not overlap)" in messages, messages
     assert not any("MAMP_0001" in m for m in messages), messages
 
     report = json.loads((tmp_path / "out" / "GreedyReg_report.json").read_text())

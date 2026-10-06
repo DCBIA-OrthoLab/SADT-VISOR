@@ -170,19 +170,27 @@ def _write(polydata, writer_name: str, destination: str, binary: bool) -> str:
         # the two: it round-trips the float32 vertices exactly, where ASCII
         # keeps about six significant digits.
         writer.SetFileTypeToBinary()
-    writer.Write()
+    # VTK reports a failed write (unwritable folder, full disk) by returning 0
+    # and printing to stderr, which nobody reads -- so without this check the
+    # report listed a surface that was never written. No path in the message:
+    # the operator reads it redacted to `<path>` anyway.
+    if writer.Write() != 1 or writer.GetErrorCode() != 0:
+        raise RuntimeError(
+            f"writing a surface failed ({writer_name}, VTK error code {writer.GetErrorCode()})"
+        )
     return destination
 
 
 def write(labels, model, base: str, output_dir: str, suffix: str,
-          formats, smoothing: int = 30, decimation: int = 0) -> list:
+          formats, smoothing: int = 30, decimation: int = 0, where: str = "") -> list:
     """Write every surface format in `formats`. Returns what it wrote.
 
     `labels` is the multi-label volume as SimpleITK read it, so the surfaces
     land on the input scan's own geometry. Only the labels PRESENT in this
     scan are written, for the same reason `_split_segments` does the same: a
     UniversalLab run would otherwise write 55 empty meshes per patient, and an
-    empty mesh cannot be told from a structure the model failed on.
+    empty mesh cannot be told from a structure the model failed on. `where`
+    prefixes the log lines with the scan's position, e.g. "scan 2 of 5: ".
     """
     chosen = wanted_meshes(formats)
     if not chosen:
@@ -194,7 +202,7 @@ def write(labels, model, base: str, output_dir: str, suffix: str,
     array = sitk.GetArrayViewFromImage(labels)
     present = set(int(value) for value in np.unique(array) if value != 0)
     if not present:
-        logger.warning("No label in this scan, so no surface was written")
+        logger.warning("%sno label in this scan, so no surface was written", where)
         return []
 
     per_label = [name for name in chosen if name in _PER_LABEL_WRITERS]
@@ -215,6 +223,11 @@ def write(labels, model, base: str, output_dir: str, suffix: str,
         surface = _labelled(
             _surface(array == value, labels, smoothing, decimation), value
         )
+        if surface.GetNumberOfCells() == 0:
+            # Present in the volume yet contoured to nothing: worth a line,
+            # because the file looks fine until it is opened.
+            logger.warning("%ssurface for %s is empty (0 triangles); written anyway",
+                           where, name)
         safe_name = name.replace(" ", "-").replace("/", "-")
         for fmt in per_label:
             writer_name, extension, binary = _PER_LABEL_WRITERS[fmt]

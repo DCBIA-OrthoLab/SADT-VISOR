@@ -29,9 +29,11 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import threading
 import time
 from argparse import Namespace
 
+from . import progress
 from .errors import ToolInputError, ToolUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,11 @@ def array_name_for(numbering: str) -> str:
     return _ARRAY_NAMES.get(numbering, DEFAULT_ARRAY_NAME)
 
 WORK_DIRNAME = ".crownseg_work"
+
+# How often, in seconds, the output tree is looked at while shapeaxi runs. One
+# mesh takes about 52 s on the card, so two seconds is fine-grained enough to
+# move the bar promptly and coarse enough to cost nothing.
+WATCH_INTERVAL = 2.0
 
 # The published crown-segmentation checkpoint, and the token every one of them
 # is named with. Fly-by-CNN publishes its weights under the training run that
@@ -176,6 +183,10 @@ def resolve_device(requested: str = None) -> str:
         return "cuda:0"
     if wanted.startswith("cuda"):
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
+        progress.log(
+            "a GPU was requested but none is visible; segmenting on the CPU",
+            "warning",
+        )
     return "cpu"
 
 
@@ -366,6 +377,92 @@ def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: s
         dental_model_seg.main(args)
 
 
+# The longest cause quoted back out of a shapeaxi failure. The server cuts a
+# failure's reason at about 300 characters, so the cause has to fit well inside
+# that together with the count that precedes it.
+MAX_CAUSE = 200
+
+
+def _last_meaningful_line(message) -> str:
+    """The line of an exception message that actually says what went wrong.
+
+    shapeaxi runs its meshes through a PyTorch DataLoader, and an error raised
+    in a loader worker comes back re-wrapped: "Caught ValueError in DataLoader
+    worker process 0.", then "Original Traceback (most recent call last):",
+    then the whole worker traceback, and only on the LAST line the real
+    "ValueError: <message>". The server keeps the first few hundred characters
+    of a reason, which would be the wrapper and the frame list and never the
+    cause. The last non-blank line is the cause for that shape and is the whole
+    message for an ordinary one-line error, so it is right for both.
+    """
+    lines = [line.strip() for line in str(message).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    return last if len(last) <= MAX_CAUSE else last[:MAX_CAUSE - 3] + "..."
+
+
+def _describe_failure(exc) -> str:
+    """`Type: cause`, with the cause reduced to its meaningful last line.
+
+    When the last line already names an exception type -- the DataLoader case,
+    where `exc` itself is only the RuntimeError wrapper -- that inner type is
+    the informative one and is not prefixed a second time.
+    """
+    cause = _last_meaningful_line(exc)
+    head = cause.split(":", 1)[0]
+    if cause and head.isidentifier() and head[:1].isupper() and (
+        head.endswith("Error") or head.endswith("Exception")
+    ):
+        return cause
+    return f"{type(exc).__name__}: {cause}" if cause else type(exc).__name__
+
+
+@contextlib.contextmanager
+def _counting_outputs(expected, what, interval=None):
+    """Report "mesh k of n" while shapeaxi runs, from the outputs that exist.
+
+    shapeaxi takes the whole batch in one call and says nothing on the way, but
+    it writes each mesh's segmented copy as soon as that mesh is done, to a
+    path known in advance. So the number of those files that exist IS the
+    number of meshes finished -- a count, not an estimate -- and a thread that
+    looks at them every few seconds can move the bar truthfully.
+
+    A file that was already there before the call is not counted: it says
+    nothing about this run, and counting it would claim a mesh still to come.
+    The thread is a daemon, is stopped in a `finally` whatever the call does,
+    and swallows every error of its own -- progress must never fail a run.
+    """
+    interval = WATCH_INTERVAL if interval is None else interval
+    total = len(expected)
+    try:
+        fresh = [path for path in expected if not os.path.exists(path)]
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+        fresh = []
+    stop = threading.Event()
+
+    def watch():
+        reported = 0
+        while not stop.wait(interval):
+            try:
+                done = sum(1 for path in fresh if os.path.exists(path))
+                # The last mesh is not reported here: once it exists the call
+                # is about to return, and the run's own next step says so.
+                if reported < done < total:
+                    reported = done
+                    progress.report(done + 1, total, what)
+            except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+                pass
+
+    thread = threading.Thread(target=watch, name="crownseg-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=interval + 1.0)
+
+
 def _predicted_path(output_dir: str, csv_stem: str, suffix: str, mesh: str,
                     input_root: str) -> str:
     """Where shapeaxi's csv branch writes the segmented copy of `mesh`.
@@ -470,6 +567,13 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
         engine_available, engine_error = True, None
     except Exception as exc:  # ToolUnavailableError, or anything its import raises
         engine_available, engine_error = False, f"{type(exc).__name__}: {exc}"
+        # The operator's to fix, not the clinician's: the deployment is missing
+        # an extra. The reason itself stays in the report, where an install
+        # path in it reaches nobody but the caller.
+        progress.log(
+            "the segmentation engine is not installed here; only meshes that "
+            "already carry labels can be served", "warning",
+        )
 
     records = {}
     produced = []
@@ -517,21 +621,60 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
             for mesh in to_segment:
                 handle.write(f"{mesh}\n")
 
-        logger.info("CrownSeg: segmenting %d mesh(es) on %s", len(to_segment), device)
-        _run_shapeaxi(
-            csv_path=csv_path,
-            output_dir=output_dir,
-            model_path=model_path,
-            input_root=input_root,
-            array_name=array_name,
-            suffix=suffix,
-            device=device,
-            fdi=fdi,
-            num_workers=num_workers,
-        )
-
+        total = len(to_segment)
         csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
-        for mesh in to_segment:
+        expected = [
+            _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
+            for mesh in to_segment
+        ]
+        # Said BEFORE the call, because a failure inside shapeaxi arrives as one
+        # opaque exception for the whole batch: this line is what tells the
+        # operator which checkpoint, how many meshes and which device were
+        # being attempted when it came. The checkpoint's name is the model's,
+        # never a patient's.
+        logger.info(
+            "loading checkpoint %s and segmenting %d mesh(es) on %s",
+            os.path.basename(model_path), total, device,
+        )
+        # The model load inside shapeaxi is not visible from here, so the first
+        # mesh is announced at the start of the bar and the load is part of it.
+        progress.report(1, total, "mesh")
+        try:
+            with _counting_outputs(expected, "mesh"):
+                _run_shapeaxi(
+                    csv_path=csv_path,
+                    output_dir=output_dir,
+                    model_path=model_path,
+                    input_root=input_root,
+                    array_name=array_name,
+                    suffix=suffix,
+                    device=device,
+                    fdi=fdi,
+                    num_workers=num_workers,
+                )
+        except (ToolUnavailableError, ToolInputError):
+            # Already phrased for whoever has to act on them, and classed so the
+            # server answers 503 or 422; rewrapping would turn both into a 500.
+            raise
+        except Exception as exc:
+            # shapeaxi takes the batch in one call, so its failure carries no
+            # position. The outputs on disk do: they say how far it got.
+            written = sum(1 for path in expected if os.path.isfile(path))
+            cause = _describe_failure(exc)
+            logger.error(
+                "shapeaxi failed after %d of %d meshes were written (%s)",
+                written, total, cause,
+            )
+            # RuntimeError whatever shapeaxi raised: a ValueError out of its
+            # loader is a fault of the bundled engine or of this server, not
+            # an argument the caller sent, and must not be answered as a 422.
+            # The cause comes first so the server's cut keeps it.
+            raise RuntimeError(
+                f"crown segmentation failed: {cause} "
+                f"({written} of {total} meshes were written before it)"
+            ) from exc
+
+        for index, mesh in enumerate(to_segment, start=1):
             relative = os.path.relpath(mesh, input_root)
             predicted = _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
             if os.path.isfile(predicted):
@@ -540,6 +683,14 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                 produced.append(predicted)
             else:
                 # One mesh shapeaxi could not write must not cost the batch.
+                logger.warning(
+                    "mesh %d of %d: segmentation failed (shapeaxi returned "
+                    "without error but wrote no output for it)", index, total,
+                )
+                progress.log(
+                    f"mesh {index} of {total} produced no segmentation",
+                    "warning", user=True,
+                )
                 records[relative] = {
                     "status": "failed",
                     "input": relative,
@@ -547,8 +698,25 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                     "error": "the segmentation produced no output for this mesh",
                 }
 
+    failed = sum(1 for r in records.values() if r["status"] == "failed")
     if not produced:
-        raise RuntimeError("CrownSeg produced no segmented mesh for any input.")
+        # Only reachable when every mesh went to shapeaxi and it returned
+        # cleanly having written none of them -- an exception would have been
+        # raised above. Saying so explicitly is the point: "no output" with no
+        # error is a different fault (a wrong output layout, a silent skip)
+        # from a crash, and the operator has nothing else to tell them apart.
+        raise RuntimeError(
+            f"0 of {len(meshes)} meshes segmented; shapeaxi returned without "
+            f"error but wrote none of the {len(to_segment)} expected outputs"
+        )
+
+    labelled = len(produced)
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "%d of %d meshes labelled, %d failed (%d segmented here, %d already labelled)",
+        labelled, len(meshes), failed, labelled - len(already_segmented),
+        len(already_segmented),
+    )
 
     report = {
         "tool": TOOL_NAME,

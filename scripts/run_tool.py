@@ -319,7 +319,12 @@ class LocalSupervisor:
         self._depth = depth
 
     def run(self, tool, **params):
-        self.log("running {}".format(tool))
+        # The caller's span of its own bar (`_progress=(start, end)`). The
+        # server folds the callee's progress into it; there is no server here
+        # to fold anything, and the callee declares no such argument, so it is
+        # dropped exactly as the server's supervisor drops it.
+        params.pop("_progress", None)
+        self._say("running {}".format(tool))
         scratch = Path(tempfile.mkdtemp(prefix="sup_", dir=str(self.tmp)))
         params_file, result_file = scratch / "params.json", scratch / "result.json"
         params_file.write_text(json.dumps(_jsonable(params)), encoding="utf-8")
@@ -354,9 +359,15 @@ class LocalSupervisor:
         # thread prints it, so writing to stderr here as well would double
         # every line.
         if not append_progress(fraction, message):
-            self.log("{:.0%} {}".format(fraction, message))
+            self._say("{:.0%} {}".format(fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
+        # The server's supervisor writes this to the run's events, for the
+        # operator or for the clinician. Here there is only the developer at
+        # the terminal, so it is the same line with its level and audience on.
+        self._say("{}{}: {}".format("(user) " if user else "", str(level).upper(), message))
+
+    def _say(self, message):
         # stderr, never stdout: stdout carries a result when this script is
         # driven by another copy of itself.
         sys.stderr.write("{}[sup] {}\n".format("  " * self._depth, message))

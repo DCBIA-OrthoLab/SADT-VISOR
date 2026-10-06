@@ -75,8 +75,10 @@ def test_a_list_of_folders_survives_the_json_round_trip(tmp_path, catalog_path):
 
 
 def test_a_missing_catalogue_reaches_the_caller_as_a_caller_facing_error(tmp_path):
-    """`CatalogError` derives from `ToolInputError` derives from `ValueError`,
-    which the server maps to 422 with the message passed through."""
+    """Raised as `ToolInputError` itself, which the server maps to 422 with the
+    message passed through. The server maps the EXACT class name, so a subclass
+    of it -- as `CatalogError` used to be -- would have reached the caller as an
+    opaque 500."""
     with pytest.raises(ToolFailed) as raised:
         run_tool(
             "Agent",
@@ -85,7 +87,8 @@ def test_a_missing_catalogue_reaches_the_caller_as_a_caller_facing_error(tmp_pat
             catalog_file=tmp_path / "nowhere.json",
             endpoint=CLOSED_PORT,
         )
-    assert "CatalogError" in str(raised.value)
+    assert "ToolInputError" in str(raised.value)
+    assert "'catalog_file' could not be read" in str(raised.value)
 
 
 def test_an_empty_prompt_is_refused_in_the_subprocess_too(tmp_path, catalog_path):

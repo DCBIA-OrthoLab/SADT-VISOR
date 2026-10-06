@@ -150,8 +150,21 @@ def surface_properties(scaled_surface, device):
     )
     # VTK stores polys as (count, id0, id1, id2) tuples; the meshes here are
     # triangulated, so dropping the leading count gives the face table.
+    # Checked rather than assumed: a quad mesh used to fail inside `reshape`
+    # with "cannot reshape array of size N into shape (4)", which names
+    # neither the mesh's problem nor its fix.
+    polys = with_normals.GetPolys()
+    raw_faces = vtk_to_numpy(polys.GetData())
+    cell_count = polys.GetNumberOfCells()
+    if cell_count == 0:
+        raise ValueError("This mesh has no polygon faces; expected a triangulated surface")
+    if raw_faces.size != 4 * cell_count or polys.GetMaxCellSize() != 3:
+        raise ValueError(
+            f"This mesh has non-triangular faces (up to {polys.GetMaxCellSize()} "
+            f"vertices per face); triangulate it before sending it"
+        )
     faces = torch.tensor(
-        vtk_to_numpy(with_normals.GetPolys().GetData()).reshape(-1, 4)[:, 1:],
+        raw_faces.reshape(-1, 4)[:, 1:],
         dtype=torch.int64,
         device=device,
     )

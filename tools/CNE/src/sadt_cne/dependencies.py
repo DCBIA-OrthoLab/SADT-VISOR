@@ -25,7 +25,7 @@ import os
 logger = logging.getLogger("CNE")
 
 
-class ToolUnavailableError(Exception):
+class ToolUnavailableError(RuntimeError):
     """This deployment cannot do it, and no request will change that.
 
     The server maps an exception by its class NAME -- there is no shared base
@@ -33,6 +33,10 @@ class ToolUnavailableError(Exception):
     this name answers 503 with the message. That is the right answer for a
     missing dependency: the request was valid, the reason names a package, and
     nothing the caller sends will help.
+
+    A `RuntimeError` rather than a bare `Exception` so that anything catching
+    server-side faults by that class catches this one too: it is never the
+    caller's fault, and must never be mistaken for a `ValueError`.
     """
 
 
@@ -106,8 +110,15 @@ def preload_cuda_runtime() -> list:
             except OSError as error:
                 # Not fatal: llama.cpp is about to try the system copy, and the
                 # error it raises then names the library far more usefully than
-                # anything that could be raised here.
-                logger.debug("could not preload %s: %s", candidate, error)
+                # anything that could be raised here. But logged at WARNING, not
+                # DEBUG: the library was SHIPPED here and would not open, which
+                # is a broken deployment, and the import error that follows is
+                # unreadable without this line beside it.
+                logger.warning(
+                    "could not preload the CUDA runtime library %s "
+                    "(OSError: %s); llama.cpp will look for a system copy",
+                    library, error,
+                )
                 continue
             opened.append(candidate)
             break

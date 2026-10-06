@@ -12,6 +12,7 @@ That progression is why this tool has no engine of its own: each step it does
 not do itself is a `sup.run()` into a tool that has one.
 """
 
+import collections
 import json
 import logging
 import os
@@ -23,9 +24,10 @@ import numpy as np
 from sadt_areg_common import catalogs
 from sadt_areg_common.errors import ToolInputError
 
-from . import geometry, pipeline, progress, tools
+from . import geometry, pipeline, progress, tools, where
 
-logger = logging.getLogger(__name__)
+# Prefixed with the patient and arch the batch loop is on: see `where`.
+logger = where.attach(logging.getLogger(__name__))
 
 MODALITY = catalogs.MODALITY_IOSCBCT
 REPORT_NAME = "AREG_report.json"
@@ -76,15 +78,32 @@ def _cbct_surface(scan_path: str, landmark_sets: dict):
     try:
         surface, on_enamel = volume.read(scan_path, merged)
     except Exception as exc:  # noqa: BLE001 - a landmark-only run is still a run
-        # The class name, not `str(exc)`: readers carry the server's own paths in
-        # their messages, and the report goes back to the client. The full
-        # traceback stays in the log, where paths belong.
-        logger.exception("Could not contour the CBCT of %s", scan_path)
+        # The class name, not `str(exc)`, in the report: readers carry the
+        # server's own paths in their messages, and the report goes back to the
+        # client. The log line has the message too -- the server redacts paths
+        # there -- and `where` puts the patient's position in front of it.
+        logger.warning(
+            "CBCT contouring failed (%s: %s); registering on the landmarks alone, "
+            "without ICP", type(exc).__name__, exc)
+        logger.debug("CBCT contouring traceback", exc_info=True)
         return None, {}, f"the CBCT could not be contoured ({type(exc).__name__})"
     return surface, on_enamel, None
 
 
-def _landmarks_by_jaw(directory: str) -> dict:
+def _landmark_files(directory: str) -> list:
+    """Every landmark file under `directory`, in a stable order."""
+    paths = []
+    if not directory or not os.path.isdir(directory):
+        return paths
+    for root, directories, files in os.walk(directory):
+        directories.sort()
+        for name in sorted(files):
+            if name.lower().endswith(pipeline.LANDMARK_EXTENSIONS):
+                paths.append(os.path.join(root, name))
+    return paths
+
+
+def _landmarks_by_jaw(directory: str, side: str = "landmark") -> dict:
     """`{relative path: {label: position}}` for every landmark file in a folder.
 
     Keyed by the path relative to the folder, not by the base name: ALI writes
@@ -92,19 +111,24 @@ def _landmarks_by_jaw(directory: str) -> dict:
     Pred.mrk.json` are two files. Keyed by base name the second silently
     replaced the first, which then made `len(candidates) == 1` -- the "one file
     covers every jaw" fallback -- fire on a folder that held two.
+
+    A file that cannot be read is skipped with a warning rather than taking the
+    batch with it: one truncated JSON among forty used to abort the run with a
+    bare JSONDecodeError and no word of which side it was on. `side` ("intraoral"
+    or "CBCT") is what that warning names, with the file's position -- never its
+    name.
     """
     found = {}
-    if not directory or not os.path.isdir(directory):
-        return found
-    for root, directories, files in os.walk(directory):
-        directories.sort()
-        for name in sorted(files):
-            if not name.lower().endswith(pipeline.LANDMARK_EXTENSIONS):
-                continue
-            path = os.path.join(root, name)
+    paths = _landmark_files(directory)
+    for index, path in enumerate(paths, start=1):
+        try:
             points = pipeline.read_landmarks(path)
-            if points:
-                found[os.path.relpath(path, directory)] = points
+        except Exception as exc:  # noqa: BLE001 - one bad file must not cost the batch
+            logger.warning("%s landmark file %d of %d unreadable (%s: %s)",
+                           side, index, len(paths), type(exc).__name__, exc)
+            continue
+        if points:
+            found[os.path.relpath(path, directory)] = points
     return found
 
 
@@ -136,6 +160,31 @@ def _for_patient(candidates: dict, patient: str, sole_patient: bool) -> dict:
 
 
 _JAW_TOKENS = {"u", "upper", "l", "lower"}
+
+
+def _arch(mesh_path: str):
+    """"U" or "L" from the mesh's jaw token, or None when its name has none."""
+    from sadt_areg_common import pairing
+
+    found = set(pairing.tokens(os.path.basename(mesh_path)))
+    if found & {"u", "upper"}:
+        return "U"
+    if found & {"l", "lower"}:
+        return "L"
+    return None
+
+
+def _most_common(failures: list) -> tuple:
+    """`(first exception of the commonest kind, how many share it)`.
+
+    Grouped on class AND message, so "share only 1 landmark(s)" on five arches
+    and an ICP refusal on one read as two kinds, the larger first.
+    """
+    kinds = collections.Counter((type(exc).__name__, str(exc)) for exc in failures)
+    (name, message), count = kinds.most_common(1)[0]
+    first = next(exc for exc in failures
+                 if (type(exc).__name__, str(exc)) == (name, message))
+    return first, count
 
 
 def _match_landmarks(mesh_path: str, candidates: dict) -> dict:
@@ -199,79 +248,209 @@ def _own_reference(data_root):
     return candidate if os.path.isdir(candidate) else ""
 
 
+# How a run shares its bar, as fractions of the whole, per supervised call.
+# The calls come first because they run first -- in that order: ASO orients the
+# CBCT, Crown_Seg labels the crowns, ALI_IOS and then ALI_CBCT place the
+# landmarks -- and the registration takes what is left. ASO's CBCT mode runs
+# ALI_CBCT inside it, and an ALI_CBCT agent is a full two-scale walk of the
+# volume, so those two get the larger slices; the intraoral networks run on a
+# mesh and cost less. A weighting, not a measurement: what is exact is the
+# counter in each message.
+ORIENT_SHARE = 0.25
+CROWN_SHARE = 0.1
+IOS_LANDMARK_SHARE = 0.1
+CBCT_LANDMARK_SHARE = 0.2
+
+
+def _spans(automation: str, predict_ios: bool, predict_cbct: bool) -> dict:
+    """{step: (start, end)} for the steps this run makes, in the order it makes
+    them, ending with "register" on whatever is left.
+
+    The waypoints used to be fixed numbers in `tools.py` -- 0.5 for ASO, 0.1
+    for ALI_CBCT -- while the calls ran ASO first and ALI_CBCT last, so the bar
+    went backwards twice in a fully-automated run. Deriving them from the call
+    order is what makes that impossible; a step a mode skips takes no slice.
+    """
+    steps = []
+    if automation != catalogs.AUTOMATION_REGISTRATION:
+        if automation == catalogs.AUTOMATION_FULLY:
+            steps.append(("orient", ORIENT_SHARE))
+        steps.append(("crowns", CROWN_SHARE))
+        if predict_ios:
+            steps.append(("ios_landmarks", IOS_LANDMARK_SHARE))
+        if predict_cbct:
+            steps.append(("cbct_landmarks", CBCT_LANDMARK_SHARE))
+    spans, position = {}, 0.0
+    for name, share in steps:
+        spans[name] = (round(position, 6), round(position + share, 6))
+        position += share
+    spans["register"] = (round(position, 6), 1.0)
+    return spans
+
+
 def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_dir: str,
              output_dir: str, suffix: str, report: dict, max_dist: float,
-             progress_start: float = 0.0) -> None:
+             progress_span: tuple = (0.0, 1.0), produced_by: dict = None) -> None:
     """The registration proper, once every landmark exists.
 
-    `progress_start` is where this phase begins on the run's progress bar. It
-    is 0 in the Registration mode, which predicts nothing, and follows the
-    waypoints in `tools.py` in the two modes that do -- otherwise a run that
-    called no other tool would report itself as more than half done before it
-    had registered anything.
+    `progress_span` is the slice of the run's progress bar this phase fills.
+    It is the whole bar in the Registration mode, which predicts nothing, and
+    what the supervised calls left (see `_spans`) in the two modes that make
+    them -- otherwise a run that called no other tool would report itself as
+    more than half done before it had registered anything.
+
+    `produced_by` maps "ios", "cbct", "ios_landmarks" and "cbct_landmarks" to
+    the supervised tool that wrote that folder; one left out is the caller's
+    own argument of that name. It decides two things about a refusal: which
+    source the message names, and its class -- an empty folder the caller sent
+    is theirs to fix (ToolInputError), one a tool returned is a fault on this
+    side (RuntimeError).
     """
-    paired, unpaired = pipeline.discover(ios_dir, cbct_dir)
+    produced_by = produced_by or {}
+
+    def source(role):
+        tool = produced_by.get(role)
+        return f"{tool}'s output" if tool else f"'{role}'"
+
+    def error_for(*roles):
+        return RuntimeError if any(produced_by.get(r) for r in roles) else ToolInputError
+
+    # Before the first file is read: walking and parsing every landmark file
+    # takes a while on a large batch, and the last stage a watcher saw was the
+    # previous tool's.
+    progress.emit(progress_span[0], "reading landmarks")
+    paired, unpaired = pipeline.discover(
+        ios_dir, cbct_dir,
+        ios_source=source("ios"), cbct_source=source("cbct"),
+        ios_error=error_for("ios"), cbct_error=error_for("cbct"),
+    )
     report["unpaired"] = unpaired
 
-    ios_landmarks = _landmarks_by_jaw(ios_landmark_dir)
-    cbct_landmarks = _landmarks_by_jaw(cbct_landmark_dir)
-    if not ios_landmarks or not cbct_landmarks:
-        raise ToolInputError(
-            "Both landmark folders must hold at least one file: found "
-            f"{len(ios_landmarks)} intraoral and {len(cbct_landmarks)} CBCT."
-        )
+    ios_landmarks = _landmarks_by_jaw(ios_landmark_dir, "intraoral")
+    cbct_landmarks = _landmarks_by_jaw(cbct_landmark_dir, "CBCT")
+    for found, role, side, directory in (
+        (ios_landmarks, "ios_landmarks", "intraoral", ios_landmark_dir),
+        (cbct_landmarks, "cbct_landmarks", "CBCT", cbct_landmark_dir),
+    ):
+        if not found:
+            files = len(_landmark_files(directory))
+            raise error_for(role)(
+                f"No {side} landmark could be read from {source(role)}: "
+                f"{files} landmark file(s) (.json or .mrk.json) found, none "
+                "readable with points in it."
+            )
 
     sole_patient = len(paired) == 1
+    failures = []
+    total_meshes = sum(len(data["ios"]) for data in paired.values())
     for index, (patient, data) in enumerate(paired.items(), start=1):
         # Per patient, not per mesh: the inner loop is one or two arches, and
         # the counter is what a watcher can act on. The patient key is built
         # from the caller's file names and never travels in a message.
-        progress.report(index, len(paired), "patient", start=progress_start)
+        progress.report(index, len(paired), "patient",
+                        start=progress_span[0], end=progress_span[1])
+        position = f"patient {index}/{len(paired)}"
         entry = {"cbct": os.path.basename(data["cbct"]), "meshes": {}}
         # Narrowed to this patient BEFORE the jaw is looked at: see _for_patient.
         own_ios = _for_patient(ios_landmarks, patient, sole_patient)
         own_cbct = _for_patient(cbct_landmarks, patient, sole_patient)
-        cbct_surface, on_enamel, surface_error = _cbct_surface(data["cbct"], own_cbct)
+        with where.at(position):
+            cbct_surface, on_enamel, surface_error = _cbct_surface(data["cbct"], own_cbct)
         if surface_error:
             entry["cbct_surface_error"] = surface_error
-        for mesh_path in data["ios"]:
+        for mesh_index, mesh_path in enumerate(data["ios"], start=1):
             name = os.path.basename(mesh_path)
+            arch = _arch(mesh_path)
+            here = (f"{position}, arch {arch}" if arch
+                    else f"{position}, mesh {mesh_index}/{len(data['ios'])}")
             try:
-                moving = _match_landmarks(mesh_path, own_ios)
-                fixed = _match_landmarks(mesh_path, own_cbct)
-                if not moving or not fixed:
-                    raise ToolInputError(
-                        f"No landmark file matches patient '{patient}' and this mesh's "
-                        f"jaw on {'the intraoral' if not moving else 'the CBCT'} side."
+                with where.at(here):
+                    moving = _match_landmarks(mesh_path, own_ios)
+                    fixed = _match_landmarks(mesh_path, own_cbct)
+                    if not moving or not fixed:
+                        role = "ios_landmarks" if not moving else "cbct_landmarks"
+                        raise error_for(role)(
+                            "No landmark file matches this patient and this mesh's "
+                            f"jaw on {'the intraoral' if not moving else 'the CBCT'} "
+                            f"side, in {source(role)}."
+                        )
+                    mesh = _read_mesh(mesh_path)
+                    matrix, detail = pipeline.register_one(
+                        mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
                     )
-                mesh = _read_mesh(mesh_path)
-                matrix, detail = pipeline.register_one(
-                    mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
-                )
-                destination = os.path.join(
-                    output_dir, patient, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
-                )
-                _write_mesh(mesh.transform(matrix, inplace=False), destination)
-                # splitext, not `destination.replace(".vtk", ...)`: str.replace
-                # rewrites EVERY occurrence, so a mesh whose own stem carries
-                # `.vtk` produced a mangled matrix name beside a correct mesh.
-                np.save(os.path.splitext(destination)[0] + "_matrix.npy", matrix)
+                    destination = os.path.join(
+                        output_dir, patient, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
+                    )
+                    _write_mesh(mesh.transform(matrix, inplace=False), destination)
+                    # splitext, not `destination.replace(".vtk", ...)`: str.replace
+                    # rewrites EVERY occurrence, so a mesh whose own stem carries
+                    # `.vtk` produced a mangled matrix name beside a correct mesh.
+                    np.save(os.path.splitext(destination)[0] + "_matrix.npy", matrix)
                 entry["meshes"][name] = dict(
                     detail, status="ok", output=os.path.relpath(destination, output_dir)
                 )
             except Exception as exc:  # noqa: BLE001 - one mesh must not cost the batch
-                logger.exception("AREG_IOSCBCT failed on one mesh")
+                # Position, class and message: the report naming the mesh is
+                # deleted with the job when the run fails, so this line is what
+                # an operator has left.
+                logger.warning("%s: registration failed (%s: %s)",
+                               here, type(exc).__name__, exc)
+                logger.debug("Registration traceback", exc_info=True)
+                failures.append(exc)
                 entry["meshes"][name] = {"status": "failed", "error": str(exc)}
         registered = [m for m in entry["meshes"].values() if m["status"] == "ok"]
         entry["status"] = "ok" if registered else "failed"
         report["patients"][patient] = entry
 
-    produced = [p for p in report["patients"].values() if p["status"] == "ok"]
-    if not produced:
-        raise RuntimeError(
-            "AREG_IOSCBCT registered no mesh for any patient. The per-mesh errors "
-            "are in the report."
-        )
+    report["meshes_registered"] = total_meshes - len(failures)
+    report["meshes_failed"] = len(failures)
+    if failures and len(failures) == total_meshes:
+        first, count = _most_common(failures)
+        # Self-contained: the report is deleted with a failed job, so pointing
+        # at it sends the operator nowhere. Kept as the caller's error when
+        # every arch failed on the caller's own input; anything else is ours.
+        every_input = all(isinstance(exc, ToolInputError) for exc in failures)
+        raise (ToolInputError if every_input else RuntimeError)(
+            f"0 of {total_meshes} mesh(es) registered; most common failure: "
+            f"{type(first).__name__}: {first} ({count} of {total_meshes})"
+        ) from first
+
+
+def _count(directory, keep) -> int:
+    """How many files under `directory` `keep(name)` accepts; 0 when absent."""
+    if not directory or not os.path.isdir(str(directory)):
+        return 0
+    return sum(1 for _root, _dirs, files in os.walk(str(directory))
+               for name in files if keep(name))
+
+
+def _is_mesh(name: str) -> bool:
+    return name.lower().endswith(pipeline.SURFACE_EXTENSIONS)
+
+
+def _is_landmark(name: str) -> bool:
+    return name.lower().endswith(pipeline.LANDMARK_EXTENSIONS)
+
+
+def _is_scan(name: str) -> bool:
+    from sadt_areg_common import pairing
+
+    return pairing.is_scan_file(name)
+
+
+def _compare(tool: str, what: str, sent: int, returned: int) -> None:
+    """Say so when a supervised tool hands back fewer files than it was sent.
+
+    The tool itself ran to the end, so nothing raised: the shortfall shows up
+    only later, as patients the registration silently has nothing for. Counted
+    here, where it is still clear whose output it was. Fewer is a warning, not
+    a refusal -- the rest of the batch is still worth registering, and an
+    empty return is refused downstream, naming the tool.
+    """
+    if returned < sent:
+        logger.warning("%s returned %d %s for %d sent", tool, returned, what, sent)
+    else:
+        logger.info("%s returned %d %s for %d sent", tool, returned, what, sent)
 
 
 def derive_automation(automation: str, ios_landmarks, cbct_landmarks,
@@ -339,6 +518,11 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
         ios_lm = str(ios_landmarks) if ios_landmarks else None
         cbct_lm = str(cbct_landmarks) if cbct_landmarks else None
 
+        spans = _spans(automation, predict_ios=not ios_lm, predict_cbct=not cbct_lm)
+        # Which folders a supervised tool wrote, for `register` to name in a
+        # refusal -- and to tell the caller's fault from this side's.
+        produced_by = {}
+
         if automation != catalogs.AUTOMATION_REGISTRATION:
             # Everything the caller did not supply is fetched from the tool that
             # produces it. Checked up front so a request that cannot work comes
@@ -360,13 +544,34 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
                         "(scripts/setup-models.sh --tool AREG), or name another "
                         "in 'cbct_reference'."
                     )
-                cbct_root = tools.orient_cbct(sup, cbct_root, cbct_reference, landmark_model)
+                scans_sent = _count(cbct_root, _is_scan)
+                cbct_root = tools.orient_cbct(
+                    sup, cbct_root, cbct_reference, landmark_model, span=spans["orient"]
+                )
+                _compare("ASO", "oriented CBCT(s)", scans_sent, _count(cbct_root, _is_scan))
+                produced_by["cbct"] = "ASO"
 
-            labelled = tools.label_crowns(sup, ios_root, crown_model or "")
+            meshes_sent = _count(ios_root, _is_mesh)
+            labelled = tools.label_crowns(sup, ios_root, crown_model or "", span=spans["crowns"])
+            meshes_labelled = _count(labelled, _is_mesh)
+            _compare("Crown_Seg", "labelled mesh(es)", meshes_sent, meshes_labelled)
+            produced_by["ios"] = "Crown_Seg"
             if not ios_lm:
-                ios_lm = tools.predict_ios_landmarks(sup, labelled, ios_landmark_model or "")
+                ios_lm = tools.predict_ios_landmarks(
+                    sup, labelled, ios_landmark_model or "", span=spans["ios_landmarks"]
+                )
+                # One landmark file per mesh is what ALI_IOS writes.
+                _compare("ALI_IOS", "landmark file(s)", meshes_labelled,
+                         _count(ios_lm, _is_landmark))
+                produced_by["ios_landmarks"] = "ALI_IOS"
             if not cbct_lm:
-                cbct_lm = tools.predict_cbct_landmarks(sup, cbct_root, landmark_model or "")
+                scans = _count(cbct_root, _is_scan)
+                cbct_lm = tools.predict_cbct_landmarks(
+                    sup, cbct_root, landmark_model or "", span=spans["cbct_landmarks"]
+                )
+                # And one per scan from ALI_CBCT.
+                _compare("ALI_CBCT", "landmark file(s)", scans, _count(cbct_lm, _is_landmark))
+                produced_by["cbct_landmarks"] = "ALI_CBCT"
             ios_root = labelled
 
         if not ios_lm or not cbct_lm:
@@ -381,9 +586,10 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
             ios_landmark_dir=ios_lm, cbct_landmark_dir=cbct_lm,
             output_dir=output_dir, suffix=suffix, report=report,
             max_dist=float(max_dist) if max_dist else geometry.ICP_MAX_DIST_MM,
-            # The last waypoint `tools.py` writes is 0.5; the registration has
-            # the rest. Registration mode wrote none of them and starts at 0.
-            progress_start=0.0 if automation == catalogs.AUTOMATION_REGISTRATION else 0.6,
+            # Whatever the supervised calls left; the whole bar in the
+            # Registration mode, which makes none of them.
+            progress_span=spans["register"],
+            produced_by=produced_by,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -391,6 +597,13 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
     report["duration_seconds"] = round(time.monotonic() - started_at, 2)
     with open(os.path.join(output_dir, REPORT_NAME), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
-    logger.info("AREG_IOSCBCT: %d patient(s) in %.1fs",
-                len(report["patients"]), report["duration_seconds"])
+    failed = report.get("meshes_failed", 0)
+    total = report.get("meshes_registered", 0) + failed
+    # WARNING when partial: a batch that registered 30 of 40 arches finishes
+    # "successfully", and this line is where the other ten show.
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "AREG_IOSCBCT: %d of %d mesh(es) registered, %d failed, over %d patient(s) "
+        "in %.1fs", total - failed, total, failed, len(report["patients"]),
+        report["duration_seconds"])
     return output_dir

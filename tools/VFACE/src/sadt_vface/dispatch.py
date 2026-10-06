@@ -44,34 +44,123 @@ CLASSIFICATION_DIRNAME = "Classification"
 FEATURE_TABLE_NAME = "PostProcess_Measurements.xlsx"
 CLASSIFICATION_NAME = "Classification.xlsx"
 
-# Where each phase sits on the progress bar. A forty-patient run is an hour of
-# other tools, and the share each takes is roughly what these say; a bar that
-# jumped from 10% to 90% would be worse than none.
-WAYPOINTS = {
-    "resample": 0.02,
-    "orient": 0.10,
-    "segment": 0.30,
-    "second": 0.45,
-    "register": 0.55,
-    "landmarks": 0.75,
-    "measure": 0.90,
-    "classify": 0.97,
+# How much of the bar each stage takes, relative to the others. A forty-patient
+# run is an hour of other tools, and the share each takes is roughly what these
+# say; a bar that jumped from 10% to 90% would be worse than none. Orienting and
+# registering are the long stages -- ASO runs ALI_CBCT inside it, AREG_CBCT runs
+# elastix per patient -- and measuring is arithmetic. A weighting, not a
+# measurement.
+#
+# Only the stages a run actually makes are laid out (see `_plan`), so a mode
+# that skips the orientation, or a request that asks for no measurement, does
+# not leave a jump where the skipped stage would have been.
+STAGE_WEIGHTS = {
+    "resample": 8,
+    "orient": 20,
+    # Sorting scans that came already oriented, in place of "orient".
+    "sort": 1,
+    "segment": 15,
+    "register": 20,
+    "landmarks": 15,
+    "measure": 7,
+    "classify": 3,
+    # Two Batch_Dental_Seg calls per region, then a distance map per patient.
+    "heat_maps": 15,
 }
+# The second scan is a mirror for an asymmetry assessment -- an AutoMatrix call
+# per frame -- and a whole second resample and orientation for a longitudinal
+# study, which is why the two weigh so differently.
+SECOND_WEIGHTS = {
+    catalogs.STUDY_ASYMMETRY: 5,
+    "longitudinal": STAGE_WEIGHTS["resample"] + STAGE_WEIGHTS["orient"],
+}
+# Within the landmark stage: an ALI_CBCT call is a full search per landmark, an
+# AutoMatrix call moves files.
+LANDMARK_CALL_WEIGHT = 4
+MATRIX_CALL_WEIGHT = 1
+# What came before the first stage -- reading the measurement lists -- keeps
+# the sliver of the bar it always had.
+LEAD = 0.02
 
 
-def _stage(sup, key: str, message: str) -> None:
-    """Say where the run has got to, through whichever channel exists.
+def _plan(mode: str, study: str, wants_measurements: bool, wants_heat_maps: bool) -> dict:
+    """{stage: (start, end)} for the stages this run makes, in the order it
+    makes them, tiling LEAD..1.
+
+    The waypoints used to be fixed numbers, and the heat maps reused the
+    classification's 0.97 -- so a run asking only for heat maps sat at 55% for
+    the whole registration and then leapt to 97% for its longest remaining
+    stage. Laying out only what runs is what makes each stage's slice honest.
+    """
+    stages = []
+    if mode == catalogs.MODE_FULL:
+        stages += ["resample", "orient"]
+    else:
+        stages.append("sort")
+    if mode != catalogs.MODE_REGISTERED:
+        stages += ["segment", "second", "register"]
+    if wants_measurements:
+        stages += ["landmarks", "measure", "classify"]
+    if wants_heat_maps:
+        stages.append("heat_maps")
+
+    weights = [
+        SECOND_WEIGHTS.get(study, SECOND_WEIGHTS["longitudinal"]) if stage == "second"
+        else STAGE_WEIGHTS[stage]
+        for stage in stages
+    ]
+    return dict(zip(stages, tools.split_span((LEAD, 1.0), weights)))
+
+
+def _stage(sup, plan: dict, key: str, message: str) -> tuple:
+    """Say where the run has got to, through whichever channel exists, and
+    return the stage's span for the calls it makes.
 
     The supervisor's when there is one -- a chain's events land in one file,
     already ordered -- and the tool's own otherwise, so a standalone run
     reports just the same.
     """
-    fraction = WAYPOINTS[key]
+    span = plan[key]
     if sup is not None and hasattr(sup, "progress"):
-        sup.progress(fraction, message)
+        sup.progress(span[0], message)
     else:
-        progress.emit(fraction, message)
+        progress.emit(span[0], message)
     logger.info("VFACE: %s", message)
+    return span
+
+
+def _per_item(sup, span):
+    """A `(done, total, message)` callback that moves the bar across `span`.
+
+    For the steps VFACE runs itself, one item at a time: each message lands as
+    the run's stage, so a failure in the middle of one is reported with the
+    item it was on rather than with the line that opened the step. None for
+    no span, which is a caller with no bar.
+    """
+    if span is None:
+        return None
+    start, end = span
+
+    def report(done: int, total: int, message: str) -> None:
+        fraction = start + (end - start) * done / max(total, 1)
+        if sup is not None and hasattr(sup, "progress"):
+            sup.progress(fraction, message)
+        else:
+            progress.emit(fraction, message)
+
+    return report
+
+
+def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
+    """`sup.log` when there is a supervisor, the progress file's log otherwise.
+
+    Never a file name: the line reaches the operator page, and with `user`
+    the clinician's panel.
+    """
+    if sup is not None and hasattr(sup, "log"):
+        sup.log(message, level=level, user=user)
+    else:
+        progress.log(message, level=level, user=user)
 
 
 def _folder(work_dir: str, *parts) -> str:
@@ -125,10 +214,11 @@ def _split_by_frame(scans_dir: str, work_dir: str) -> dict:
 
 
 def _orient(sup, scans_dir: str, work_dir: str, reference_of: dict,
-            landmark_model: str) -> dict:
-    """The cohort in both frames, one ASO call each."""
+            landmark_model: str, span=None) -> dict:
+    """The cohort in both frames, one ASO call each, each in half of `span`."""
     oriented = {}
-    for frame, entry in catalogs.FRAMES.items():
+    spans = tools.split_span(span, [1] * len(catalogs.FRAMES))
+    for (frame, entry), frame_span in zip(catalogs.FRAMES.items(), spans):
         reference = reference_of.get(frame)
         if not reference:
             raise ToolInputError(
@@ -137,14 +227,14 @@ def _orient(sup, scans_dir: str, work_dir: str, reference_of: dict,
             )
         oriented[frame] = tools.orient_scans(
             sup, scans_dir, reference, entry["landmarks"], entry["suffix"],
-            landmark_model, label=frame,
+            landmark_model, label=frame, span=frame_span,
         )
     return oriented
 
 
 def _second_timepoint(sup, study: str, oriented: dict, mirror_reference: str,
                       t2: str, work_dir: str, reference_of: dict,
-                      landmark_model: str, report: dict) -> dict:
+                      landmark_model: str, report: dict, span=None) -> dict:
     """What the baseline is compared against, in each frame.
 
     The patient's own mirror for an asymmetry assessment, the follow-up for a
@@ -157,10 +247,11 @@ def _second_timepoint(sup, study: str, oriented: dict, mirror_reference: str,
                 "An asymmetry assessment compares a patient against their own "
                 "mirror, and 'mirror_reference' names the transform that makes it."
             )
+        spans = tools.split_span(span, [1] * len(oriented))
         return {
             frame: tools.mirror(sup, folder, mirror_reference, content="Scan",
-                                label=f"scans-{frame}")
-            for frame, folder in oriented.items()
+                                label=f"scans-{frame}", span=frame_span)
+            for (frame, folder), frame_span in zip(oriented.items(), spans)
         }
 
     if not t2:
@@ -169,27 +260,39 @@ def _second_timepoint(sup, study: str, oriented: dict, mirror_reference: str,
             f"Use '{catalogs.STUDY_ASYMMETRY}' to compare a patient against their "
             "own mirror instead."
         )
-    resampled = resample.resample_cohort(t2, _folder(work_dir, "t2_resampled"),
-                                         report=report)
-    return _orient(sup, resampled, work_dir, reference_of, landmark_model)
+    # The follow-up goes through the same two stages the baseline did, in the
+    # same proportions: a resample, then an orientation per frame.
+    resample_span, orient_span = tools.split_span(
+        span, [STAGE_WEIGHTS["resample"], STAGE_WEIGHTS["orient"]]
+    )
+    resampled = resample.resample_cohort(
+        t2, _folder(work_dir, "t2_resampled"), report=report,
+        on_progress=_per_item(sup, resample_span),
+    )
+    return _orient(sup, resampled, work_dir, reference_of, landmark_model,
+                   span=orient_span)
 
 
-def _register(sup, regions, oriented: dict, second: dict, masks: dict) -> dict:
-    """Each region registered in its own frame. Returns `{region: folder}`."""
+def _register(sup, regions, oriented: dict, second: dict, masks: dict,
+              span=None) -> dict:
+    """Each region registered in its own frame. Returns `{region: folder}`.
+
+    One AREG_CBCT call per region, each in an equal share of `span`.
+    """
     registered = {}
-    for region in regions:
+    for region, region_span in zip(regions, tools.split_span(span, [1] * len(regions))):
         entry = catalogs.REGION_TABLE[region]
         frame = entry["frame"]
         registered[region] = tools.register(
             sup, oriented[frame], second[frame], entry["areg"], masks[frame],
-            label=region,
+            label=region, span=region_span,
         )
     return registered
 
 
 def _landmarks(sup, oriented: dict, registered: dict, measurements: dict,
                work_dir: str, landmark_model: str, mirror_reference: str,
-               study: str, second: dict, report: dict) -> tuple:
+               study: str, second: dict, report: dict, span=None) -> tuple:
     """Both timepoints' landmarks, per frame and per region.
 
     Predicted ONCE, in the cranial base frame, and carried into the maxillary
@@ -205,12 +308,29 @@ def _landmarks(sup, oriented: dict, registered: dict, measurements: dict,
     if not wanted:
         raise ToolInputError("The measurement lists name no landmark to find.")
 
+    # The calls this stage makes, in the order it makes them: the baseline's
+    # search, then the comparison set per frame -- mirrored, or searched again
+    # on the follow-up -- then one AutoMatrix move per region. Each gets its
+    # own slice of the stage, weighted by what it costs.
+    asymmetry = study == catalogs.STUDY_ASYMMETRY
+    compared_weight = MATRIX_CALL_WEIGHT if asymmetry else LANDMARK_CALL_WEIGHT
+    frames = [catalogs.FRAME_CRANIAL_BASE, catalogs.FRAME_MAXILLA]
+    slices = tools.split_span(
+        span,
+        [LANDMARK_CALL_WEIGHT]
+        + [compared_weight] * (len(frames) if asymmetry else len(second))
+        + [MATRIX_CALL_WEIGHT] * len(registered),
+    )
+    baseline_span = slices[0]
+    compared_spans = slices[1:len(slices) - len(registered)]
+    region_spans = slices[len(slices) - len(registered):]
+
     padded = landmark_files.pad_scans(
         oriented[catalogs.FRAME_CRANIAL_BASE], _folder(work_dir, "padded"), report=report
     )
     baseline = {
         catalogs.FRAME_CRANIAL_BASE: tools.predict_landmarks(
-            sup, padded, wanted, landmark_model, label="t1"
+            sup, padded, wanted, landmark_model, label="t1", span=baseline_span,
         )
     }
     baseline[catalogs.FRAME_MAXILLA] = landmark_files.derive_into_frame(
@@ -230,8 +350,8 @@ def _landmarks(sup, oriented: dict, registered: dict, measurements: dict,
             # resampled, and these folders hold markups. AutoMatrix reads it per
             # FILE, which is what a folder of landmarks needs.
             frame: tools.mirror(sup, folder, mirror_reference, content="Automatic",
-                                label=f"landmarks-{frame}")
-            for frame, folder in baseline.items()
+                                label=f"landmarks-{frame}", span=frame_span)
+            for (frame, folder), frame_span in zip(baseline.items(), compared_spans)
         }
     else:
         # Padded too, and for the same reason. Searching the baseline with room
@@ -244,9 +364,9 @@ def _landmarks(sup, oriented: dict, registered: dict, measurements: dict,
                 landmark_files.pad_scans(
                     folder, _folder(work_dir, "padded_t2", frame), report=report
                 ),
-                wanted, landmark_model, label=f"t2-{frame}",
+                wanted, landmark_model, label=f"t2-{frame}", span=frame_span,
             )
-            for frame, folder in second.items()
+            for (frame, folder), frame_span in zip(second.items(), compared_spans)
         }
 
     # And then moved by the registration, so both sets sit in one frame. One
@@ -256,9 +376,9 @@ def _landmarks(sup, oriented: dict, registered: dict, measurements: dict,
     per_region = {
         region: tools.apply_transforms(
             sup, compared[catalogs.REGION_TABLE[region]["frame"]], folder,
-            label=f"registered-{region}",
+            label=f"registered-{region}", span=region_span,
         )
-        for region, folder in registered.items()
+        for (region, folder), region_span in zip(registered.items(), region_spans)
     }
     return baseline, per_region
 
@@ -270,21 +390,41 @@ def _measure(regions, baseline: dict, compared: dict, measurements: dict,
     stats = {}
     for region in regions:
         frame = catalogs.REGION_TABLE[region]["frame"]
+        summary = {}
         rows = aq3dc.compute_cohort(
             landmark_files.read_cohort(baseline[frame]),
             landmark_files.read_cohort(compared[region]),
-            measurements[region], report=report,
+            measurements[region], report=report, summary=summary,
         )
         if not rows:
             raise ToolInputError(
-                f"No measurement could be made on the {region}. The per-patient "
-                "reasons are in the run report."
+                f"No measurement could be made on the {region}: "
+                f"{_why_nothing_measured(summary, len(measurements[region]))}"
             )
         aq3dc.write_table(rows, os.path.join(
             destination, f"Measurements_{_short(region)}.xlsx"
         ))
         stats[_short(region)] = features.to_stats(rows)
     return stats
+
+
+def _why_nothing_measured(summary: dict, listed: int) -> str:
+    """The cause of an empty measurement table, said in the error itself.
+
+    Never "see the run report": the job directory, and the report in it, is
+    deleted when the run fails, so the error is the only thing that survives.
+    """
+    patients = summary.get("patients", 0)
+    if not patients:
+        return (f"no patient has landmarks at both timepoints "
+                f"({summary.get('only_one', 0)} at only one)")
+    skipped = summary.get("skipped") or {}
+    if not skipped:
+        return f"the measurement list names no measurement ({patients} patient(s))"
+    reason, count = max(skipped.items(), key=lambda item: item[1])
+    total = patients * listed
+    return (f"0 of {total} measurement(s) made over {patients} patient(s); most "
+            f"common failure: {reason} ({count} of {total})")
 
 
 def _short(region: str) -> str:
@@ -458,24 +598,32 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
             )
 
     lists = _measurement_lists(measurements, regions) if wants_measurements else {}
+    plan = _plan(mode, study, wants_measurements, wants_heat_maps)
 
     # --- the scans, in the two frames ---------------------------------------
     if mode == catalogs.MODE_FULL:
-        _stage(sup, "resample", "putting the cohort on one voxel grid")
+        span = _stage(sup, plan, "resample", "putting the cohort on one voxel grid")
         resampled = resample.resample_cohort(t1, _folder(work_dir, "resampled"),
-                                             report=report)
-        _stage(sup, "orient", "orienting into the cranial base and maxillary frames")
-        oriented = _orient(sup, resampled, work_dir, reference_of, landmark_model)
+                                             report=report,
+                                             on_progress=_per_item(sup, span))
+        span = _stage(sup, plan, "orient",
+                      "orienting into the cranial base and maxillary frames")
+        oriented = _orient(sup, resampled, work_dir, reference_of, landmark_model,
+                           span=span)
     else:
-        _stage(sup, "orient", "sorting the oriented scans by frame")
+        _stage(sup, plan, "sort", "sorting the oriented scans by frame")
         split = _split_by_frame(t1, work_dir)
         oriented = split["folders"]
         if split["unplaced"]:
             report["scans_without_a_frame"] = split["unplaced"]
+            # The run goes on without them; the clinician who sent them would
+            # otherwise learn it only from the report. A count, never a name.
+            _log(sup, f"{len(split['unplaced'])} scan(s) name neither frame and are "
+                      "left out", level="warning", user=True)
 
     # --- the masks, the second scan, the registration ------------------------
     if mode != catalogs.MODE_REGISTERED:
-        _stage(sup, "segment", "segmenting the bone each region registers on")
+        span = _stage(sup, plan, "segment", "segmenting the bone each region registers on")
         # Only the frames some region actually registers on. Both frames are
         # oriented whatever was asked for -- the landmarks are predicted in the
         # cranial base frame and derived into the maxillary one, so the
@@ -484,19 +632,27 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
         # with "Select at least one structure to segment". A request for the
         # cranial base alone died there, after both orientations had been paid
         # for.
-        masks = {
-            frame: tools.segment_masks(
-                sup, folder, segmentation_model, structures, label=frame,
-            )
+        to_segment = [
+            (frame, folder, structures)
             for frame, folder in oriented.items()
             for structures in [catalogs.structures_for(frame, regions)]
             if structures
+        ]
+        masks = {
+            frame: tools.segment_masks(
+                sup, folder, segmentation_model, structures, label=frame,
+                span=frame_span,
+            )
+            for (frame, folder, structures), frame_span
+            in zip(to_segment, tools.split_span(span, [1] * len(to_segment)))
         }
-        _stage(sup, "second", "building the scan each patient is compared against")
+        span = _stage(sup, plan, "second",
+                      "building the scan each patient is compared against")
         second = _second_timepoint(sup, study, oriented, mirror_reference, t2,
-                                   work_dir, reference_of, landmark_model, report)
-        _stage(sup, "register", "registering each region")
-        registered = _register(sup, regions, oriented, second, masks)
+                                   work_dir, reference_of, landmark_model, report,
+                                   span=span)
+        span = _stage(sup, plan, "register", "registering each region")
+        registered = _register(sup, regions, oriented, second, masks, span=span)
     else:
         # The caller registered already, so the transforms are theirs to supply.
         # Taking them from `t1` would have read the ORIENTATION transforms
@@ -521,23 +677,33 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
     if not catalogs.wants_measurements(outputs):
         report["measurements"] = "not asked for"
     else:
-        _stage(sup, "landmarks", "finding the landmarks the measurements are made on")
+        span = _stage(sup, plan, "landmarks",
+                      "finding the landmarks the measurements are made on")
         baseline, compared = _landmarks(
             sup, oriented, registered, lists, work_dir, landmark_model,
-            mirror_reference, study, second, report,
+            mirror_reference, study, second, report, span=span,
         )
-        _stage(sup, "measure", "measuring")
+        _stage(sup, plan, "measure", "measuring")
         stats = _measure(regions, baseline, compared, lists, output_dir, report)
 
-        _stage(sup, "classify", "reading the measurements as a classification")
-        _classify(stats, feature_template, classifier_model, output_dir, report)
+        _stage(sup, plan, "classify", "reading the measurements as a classification")
+        _classify(sup, stats, feature_template, classifier_model, output_dir, report)
 
     if wants_heat_maps:
         from . import heatmap
 
-        _stage(sup, "classify", "drawing the heat maps")
+        # Its own stage, after the classification rather than on top of it:
+        # two segmentations per region are the longest thing left in the run.
+        span = _stage(sup, plan, "heat_maps", "drawing the heat maps")
         heatmap.draw_cohort(sup, oriented, registered, regions, surface_model,
-                            output_dir, work_dir, report)
+                            output_dir, work_dir, report, span=span)
+        if report.get("heat_maps_unpaired") or report.get("heat_maps_failed"):
+            # Some patient has a map missing for some region. Counted, never
+            # named: the per-pair detail is in the run report.
+            missing = (sum(report.get("heat_maps_unpaired", {}).values())
+                       + len(report.get("heat_maps_failed", {})))
+            _log(sup, f"{missing} heat map(s) could not be drawn; the run report "
+                      "says which region", level="warning", user=True)
 
 
 def _measurement_lists(folder: str, regions) -> dict:
@@ -548,7 +714,10 @@ def _measurement_lists(folder: str, regions) -> dict:
     by whoever wrote them.
     """
     if not os.path.isdir(folder):
-        raise ToolInputError(f"'{folder}' is not a folder of measurement lists.")
+        raise ToolInputError(
+            "'measurements' is not a folder: it should be the folder holding one "
+            "measurement list per region."
+        )
 
     spellings = {
         catalogs.REGION_CRANIAL_BASE: ("CB", "CRANIAL", "CRANIOFACIAL"),
@@ -560,7 +729,9 @@ def _measurement_lists(folder: str, regions) -> dict:
         if name.lower().endswith((".xlsx", ".xls")) and not name.startswith("~$")
     )
     if not workbooks:
-        raise ToolInputError(f"'{os.path.basename(folder)}' holds no Excel file.")
+        raise ToolInputError(
+            "'measurements' holds no Excel file: each measurement list is a workbook."
+        )
 
     found = {}
     for region in regions:
@@ -582,7 +753,18 @@ def _measurement_lists(folder: str, regions) -> dict:
     return found
 
 
-def _classify(stats, feature_template: str, classifier_model: str,
+def _skip_classification(sup, report: dict, reason: str, detail: str = "") -> None:
+    """Record, and SAY, that the verdict was not read.
+
+    Not raised, for the reasons `_classify` gives -- but never silent either: a
+    run that finishes without the verdict it was asked for has to tell the
+    operator and the clinician why, in a line rather than only in the report.
+    """
+    report["classification"] = f"not run: {reason}{f' {detail}' if detail else ''}"
+    _log(sup, f"classification not run: {reason}", level="warning", user=True)
+
+
+def _classify(sup, stats, feature_template: str, classifier_model: str,
               output_dir: str, report: dict) -> None:
     """The feature table, and the classification read off it.
 
@@ -593,9 +775,10 @@ def _classify(stats, feature_template: str, classifier_model: str,
     run, so the columns the models name exist.
     """
     if not feature_template:
-        report["classification"] = (
-            "not run: it needs 'feature_template', the workbook naming the features "
-            "the classifier was trained on"
+        _skip_classification(
+            sup, report,
+            "it needs 'feature_template', the workbook naming the features "
+            "the classifier was trained on",
         )
         return
 
@@ -608,7 +791,7 @@ def _classify(stats, feature_template: str, classifier_model: str,
         # down with the verdict on top of them -- and the server destroys the
         # job directory on failure, so the clinician would be left with the GPU
         # minutes and nothing else.
-        report["classification"] = f"not run: {exc}"
+        _skip_classification(sup, report, str(exc))
         return
 
     features.write_table(
@@ -618,21 +801,28 @@ def _classify(stats, feature_template: str, classifier_model: str,
     report["features"] = len(records)
 
     if not classifier_model:
-        report["classification"] = (
-            "not run: the feature table was written, and reading it as a verdict "
-            "needs 'classifier_model' from the same training run"
+        _skip_classification(
+            sup, report,
+            "the feature table was written, and reading it as a verdict "
+            "needs 'classifier_model' from the same training run",
         )
         return
 
     try:
         classified = classify.classify(records, classifier_model, report=report)
-    except ToolInputError as exc:
+    except (ToolInputError, RuntimeError) as exc:
         # Same reasoning, one step further along: the feature table is written
         # too by now, and it is what somebody would look at to find out WHY the
-        # models could not read it.
-        report["classification"] = (
-            f"not run: {exc} The measurements and the feature table were written "
-            "and are in this archive."
+        # models could not read it. A RuntimeError is a bundle the installed
+        # libraries cannot unpickle (see `classify.load_models`): the
+        # deployment's fault rather than the caller's, and no more a reason to
+        # throw the measurements away.
+        reason = str(exc) if isinstance(exc, ToolInputError) else (
+            f"{type(exc).__name__}: {exc}"
+        )
+        _skip_classification(
+            sup, report, reason,
+            "The measurements and the feature table were written and are in this archive.",
         )
         return
 

@@ -16,7 +16,10 @@ import logging
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from . import where
+
+# Prefixed with the patient and arch the batch loop is on: see `where`.
+logger = where.attach(logging.getLogger(__name__))
 
 # How far a point may be from its nearest neighbour and still count as a
 # correspondence, in millimetres. This is the point-to-POINT estimator's own

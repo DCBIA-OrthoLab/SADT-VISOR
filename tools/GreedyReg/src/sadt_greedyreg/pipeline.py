@@ -142,24 +142,86 @@ Greedy3D().execute(" ".join(sys.argv[1:]), out=sys.stdout)
 """
 
 
+def describe(command: list) -> str:
+    """What one greedy invocation is, in words: the step, and for the affine
+    search the metric and the degrees of freedom.
+
+    Read back from the command rather than passed alongside it, so the
+    description cannot disagree with what was actually run.
+    """
+    command = [str(part) for part in command]
+    if "-a" in command:
+        details = []
+        if "-m" in command:
+            details.append(command[command.index("-m") + 1])
+        if "-dof" in command:
+            details.append(f"{command[command.index('-dof') + 1]} dof")
+        if "-gm" in command:
+            details.append("masked")
+        return f"registration ({', '.join(details)})" if details else "registration"
+    if "-rf" in command:
+        return "resample"
+    return "call"
+
+
+def last_line(text: str) -> str:
+    """The last non-empty line of a child's output.
+
+    The child is a Python interpreter, so when greedy throws, its stderr is a
+    whole traceback whose LAST line is the one that says what went wrong; the
+    frames above it are boilerplate, and a message cut at ~300 characters
+    would keep the boilerplate and lose the cause.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def final_metric(stdout: str):
+    """The metric value of greedy's last resolution level, or None.
+
+    greedy's affine search prints `Level N  LastIter   Metrics  <value>  Energy
+    = <value>` once per resolution level; the last one is the metric the
+    transform was accepted at. Read by splitting words rather than with a
+    regular expression, which this tool keeps for nothing but patient names.
+    """
+    value = None
+    for line in (stdout or "").splitlines():
+        words = line.split()
+        if "LastIter" in words and "Metrics" in words[:-1]:
+            try:
+                value = float(words[words.index("Metrics") + 1])
+            except ValueError:
+                continue
+    return value
+
+
 def run_greedy(command: list, timeout: float = CASE_TIMEOUT_SECONDS) -> str:
     """One greedy invocation, in a child process. Returns whatever it printed.
 
     A non-zero exit carries greedy's own message, which is the one a caller
     needs: nothing this tool knows explains why a registration did not
-    converge. A timeout is raised as such rather than as a generic failure,
-    because the two call for different things -- a bigger bound, or different
-    images.
+    converge. Only its last line travels, prefixed with the step. A timeout is
+    raised as a `TimeoutError` rather than as a generic failure, because the
+    two call for different things -- a bigger bound, or different images.
     """
     import subprocess
     import sys
 
-    finished = subprocess.run(
-        [sys.executable, "-c", _CHILD, *[str(part) for part in command]],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if finished.returncode != 0:
-        raise RuntimeError(
-            finished.stderr.strip() or finished.stdout.strip() or "greedy failed"
+    step = describe(command)
+    try:
+        finished = subprocess.run(
+            [sys.executable, "-c", _CHILD, *[str(part) for part in command]],
+            capture_output=True, text=True, timeout=timeout,
         )
+    except subprocess.TimeoutExpired:
+        # `from None`: TimeoutExpired's own message is the whole command line,
+        # child script and scan paths included, and a failed run's stderr is
+        # copied into the server's persistent log.
+        raise TimeoutError(
+            f"greedy {step.split(' (')[0]} did not finish within {timeout:g}s"
+        ) from None
+    if finished.returncode != 0:
+        cause = (last_line(finished.stderr) or last_line(finished.stdout)
+                 or f"exit code {finished.returncode}, nothing printed")
+        raise RuntimeError(f"greedy {step} failed: {cause}")
     return finished.stdout

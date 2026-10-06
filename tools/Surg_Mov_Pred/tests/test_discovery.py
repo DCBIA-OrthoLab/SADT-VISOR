@@ -53,13 +53,14 @@ def test_a_table_with_no_rows_is_reported_rather_than_silently_written(
     tmp_path, model_folder
 ):
     """Zero patients cannot be scaled, and must not produce an empty result
-    file that reads like a successful run of nothing."""
+    file that reads like a successful run of nothing. It is the caller's
+    table, so the refusal is an input error naming the argument."""
     from sadt_surgmovpred import run
 
     table = tmp_path / "empty.csv"
     pd.DataFrame({"PatientID": [], "f1": []}).to_csv(table, index=False)
 
-    with pytest.raises(RuntimeError, match="produced a prediction"):
+    with pytest.raises(ValueError, match="'measurements' table has no rows"):
         run(measurements=table, model=model_folder, output_dir=tmp_path / "out")
 
     assert not (tmp_path / "out").exists(), "nothing is written for a run that failed"
@@ -278,7 +279,36 @@ def test_one_unreadable_package_does_not_lose_the_others(tmp_path, caplog):
     packages = load_model_packages(models)
 
     assert list(packages) == ["good_Pred"]
-    assert "Unable to load package" in caplog.text
+    assert "model package 1 of 2 (target 'broken') failed (" in caplog.text
+    assert "loaded 1 of 2 model package(s); 1 failed" in caplog.text
+    # By its target folder, never by its path.
+    assert str(models) not in caplog.text
+
+
+def test_a_table_of_a_batch_that_cannot_be_read_is_named_by_position(tmp_path):
+    folder = tmp_path / "batch"
+    folder.mkdir()
+    pd.DataFrame({"PatientID": [1], "f1": [1]}).to_csv(folder / "a.csv", index=False)
+    (folder / "b.xlsx").write_bytes(b"this is not an excel file")
+
+    with pytest.raises(ValueError) as failure:
+        load_measurements(folder)
+
+    message = str(failure.value)
+    assert message.startswith("'measurements' table 2 of 2 could not be read (")
+    assert "b.xlsx" not in message
+
+
+def test_a_missing_installed_models_folder_is_the_deployments_fault(tmp_path):
+    """The default folder missing is no argument the caller can fix: a 503,
+    and a message that says it was the installed folder, not 'model'."""
+    from sadt_surgmovpred.errors import ToolUnavailableError
+
+    with pytest.raises(ToolUnavailableError, match="installed models folder"):
+        load_model_packages(tmp_path / "absent", installed=True)
+
+    with pytest.raises(FileNotFoundError, match="the 'model' argument"):
+        load_model_packages(tmp_path / "absent")
 
 
 def test_every_package_being_unreadable_is_a_failure_not_an_empty_run(tmp_path):

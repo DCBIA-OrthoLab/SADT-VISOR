@@ -241,34 +241,119 @@ def test_a_batch_says_which_patient_it_is_on(tmp_path, monkeypatch):
                         output_dir=tmp_path / "out")
 
     events = [json.loads(line) for line in events_file.read_text().splitlines() if line]
-    assert [e["message"] for e in events] == ["patient 1 of 2", "patient 2 of 2"]
-    assert [e["fraction"] for e in events] == [0.0, 0.5]
+    patients = [e for e in events if ":" not in e["message"]]
+    assert [e["message"] for e in patients] == ["patient 1 of 2", "patient 2 of 2"]
+    assert [e["fraction"] for e in patients] == [0.0, 0.5]
+    # Between them, the steps of the one patient that had a transform, by
+    # position: the last of these is the stage a failed run is diagnosed in.
+    steps = [e["message"] for e in events if ":" in e["message"]]
+    assert steps[0] == "patient 1 of 2, file 1 of 1: reading the transform"
+    assert "patient 1 of 2, file 1 of 1: resampling" in steps
+    assert not any("P1" in m or "P2" in m for m in steps), steps
 
 
 def test_a_failure_names_the_position_and_never_the_file(tmp_path, caplog):
-    """Both counters, and never the name the caller gave the file.
-
-    A tool's stderr is captured to a file in the job directory, and on a FAILED
-    run the server copies its tail into its own persistent log -- so a name
-    written on this path outlives the run and its job directory. The report
-    still names the file under `failed`; that goes back to whoever sent it.
-    """
+    """Position, step and exception class, and never the name the caller gave
+    the file -- not even inside the exception's own message, where SimpleITK
+    quotes the full path. A log line outlives the run and its job directory.
+    The report still names the file under `failed`; that goes back to whoever
+    sent it."""
     (tmp_path / "in").mkdir()
     (tmp_path / "in" / "MAMP_0001_T1.nii.gz").write_bytes(b"not a volume at all")
     _transform(tmp_path / "tfm" / "MAMP_0001_transform.tfm")
     _volume(tmp_path / "in" / "P2_T1.nii.gz")
     _transform(tmp_path / "tfm" / "P2_transform.tfm")
 
-    with caplog.at_level(logging.INFO, logger="AutoMatrix"):
+    with caplog.at_level(logging.INFO, logger="sadt_automatrix"):
         sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
                             output_dir=tmp_path / "out")
 
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    failure = [m for m in warnings if "failed (" in m]
+    assert len(failure) == 1, warnings
+    assert failure[0].startswith(
+        "patient 1 of 2, file 1 of 1: reading the volume failed "
+        "(ValueError: a 'files' volume could not be read: "
+    ), failure[0]
     messages = [record.getMessage() for record in caplog.records]
-    assert "AutoMatrix failed on patient 1 of 2, file 1 of 1" in messages, messages
     assert not any("MAMP_0001" in m for m in messages), messages
+    assert not any(str(tmp_path) in m for m in messages), messages
+    # The summary, at WARNING because the run was partial.
+    assert "1 of 2 files transformed, 1 failed; 0 of 2 patients skipped " \
+           "for want of a transform" in warnings
 
     report = json.loads((tmp_path / "out" / "AutoMatrix_report.json").read_text())
     assert report["cases"]["MAMP_0001"]["failed"], "the report still names it"
+
+
+def test_a_clean_run_logs_its_start_and_its_summary_at_info(tmp_path, caplog):
+    _volume(tmp_path / "in" / "P1_T1.nii.gz")
+    _transform(tmp_path / "tfm" / "P1_transform.tfm")
+
+    with caplog.at_level(logging.INFO, logger="sadt_automatrix"):
+        sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
+                            output_dir=tmp_path / "out")
+
+    assert all(r.levelno == logging.INFO for r in caplog.records), caplog.records
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages[0].startswith("AutoMatrix: 1 patient(s), 1 file(s), 1 transform(s)")
+    assert messages[-1].startswith("1 of 1 files transformed, 0 failed")
+
+
+def test_patients_without_a_transform_are_counted_and_placed(tmp_path, caplog):
+    """Upstream dropped them in silence, so 3 of 40 looked complete."""
+    for patient in ("P1", "P2", "P3"):
+        _volume(tmp_path / "in" / f"{patient}_T1.nii.gz")
+    _transform(tmp_path / "tfm" / "P2_transform.tfm")
+    _transform(tmp_path / "tfm" / "P9_transform.tfm")
+
+    with caplog.at_level(logging.INFO, logger="sadt_automatrix"):
+        sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
+                            output_dir=tmp_path / "out")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert ("2 of 3 patients have no transform and are skipped (2 file(s), "
+            "positions 1, 3); 1 transform(s) matched no file") in warnings, warnings
+    assert "1 of 1 files transformed, 0 failed; 2 of 3 patients skipped " \
+           "for want of a transform" in warnings
+    assert not any("P1" in m or "P3" in m or "P9" in m for m in warnings), warnings
+
+
+def test_a_landmark_file_with_nothing_to_move_is_named_by_position(tmp_path, caplog):
+    """Written, and identical to its input: that must not pass for a result."""
+    path = tmp_path / "in" / "P1_lm.mrk.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"markups": [{"controlPoints": [
+        {"label": "A", "position": [1.0, 2.0, 3.0], "positionStatus": "undefined"}]}]}))
+    _transform(tmp_path / "tfm" / "P1_transform.tfm")
+
+    with caplog.at_level(logging.INFO, logger="sadt_automatrix"):
+        sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
+                            output_dir=tmp_path / "out")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert ("patient 1 of 1, file 1 of 1: the landmark file has no point to move "
+            "(none defined with 3 coordinates); written unchanged") in warnings, warnings
+
+
+def test_an_unreadable_reference_names_the_argument(tmp_path):
+    """The server redacts the path out of the reason; what is left must still
+    say which input to fix. A ValueError: the reference is the caller's."""
+    _volume(tmp_path / "in" / "P1_T1.nii.gz")
+    _transform(tmp_path / "tfm" / "P1_transform.tfm")
+    reference = tmp_path / "grid.nii.gz"
+    reference.write_bytes(b"not a volume")
+
+    with pytest.raises(ValueError, match="^the 'reference' volume could not be read: "):
+        sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
+                            output_dir=tmp_path / "out", reference=reference)
+
+
+def test_the_tool_logs_under_its_own_package():
+    """The server shows only the loggers under the tool's package; the old
+    "AutoMatrix" logger was invisible there."""
+    assert sadt_automatrix.logger.name == "sadt_automatrix"
+    assert pipeline.logger.name == "sadt_automatrix.pipeline"
 
 
 # ---------------------------------------------------------------------------

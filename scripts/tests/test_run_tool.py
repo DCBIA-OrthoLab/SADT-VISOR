@@ -173,6 +173,39 @@ def test_the_supervisor_exposes_exactly_the_five_members(tmp_path):
     assert sup.out.is_absolute() and sup.tmp.is_absolute()
 
 
+def test_the_supervisor_log_takes_a_level_and_an_audience(tmp_path, capsys):
+    """The server's `sup.log(message, level=, user=)`. One argument is still
+    an info line, which is what every existing caller writes."""
+    sup = run_tool.LocalSupervisor(out=tmp_path / "out", tmp=tmp_path)
+
+    sup.log("plain")
+    sup.log("3 of 7 landmarks found", level="warning")
+    sup.log("scan 4 skipped", level="warning", user=True)
+
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == ["[sup] INFO: plain", "[sup] WARNING: 3 of 7 landmarks found",
+                     "[sup] (user) WARNING: scan 4 skipped"]
+
+
+def test_a_callers_span_is_never_passed_to_the_callee(tmp_path, monkeypatch):
+    """`_progress=(start, end)` belongs to the supervisor, as on the server:
+    the callee declares no such argument and would refuse it."""
+    sent = {}
+
+    def fake_run(command, **_):
+        sent.update(json.loads(Path(command[command.index("--params-file") + 1]).read_text()))
+        result = Path(command[command.index("--result-file") + 1])
+        result.write_text(json.dumps({"kind": "path", "value": str(tmp_path)}))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(run_tool.subprocess, "run", fake_run)
+    sup = run_tool.LocalSupervisor(out=tmp_path / "out", tmp=tmp_path)
+
+    sup.run("Leaf", scans="in", _progress=(0.2, 0.6))
+
+    assert sent == {"scans": "in"}
+
+
 def test_supervisor_paths_are_absolute(tmp_path, monkeypatch):
     """The callee starts from a NEUTRAL working directory -- which is what makes
     "writes only under output_dir" testable -- so a relative path handed across

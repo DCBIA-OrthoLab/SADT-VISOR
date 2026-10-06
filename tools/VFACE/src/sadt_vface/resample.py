@@ -36,7 +36,7 @@ as every other tool in this repository keeps it.
 import logging
 import os
 
-from .errors import ToolInputError
+from .errors import ToolInputError, describe_failure, nothing_succeeded
 from .discovery import find_scans
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,8 @@ def resample_image(image, spacing=DEFAULT_SPACING, centre: bool = True):
 
 
 def resample_cohort(scans_dir: str, output_dir: str, spacing=DEFAULT_SPACING,
-                    centre: bool = True, report: dict = None) -> str:
+                    centre: bool = True, report: dict = None,
+                    on_progress=None) -> str:
     """Every volume under `scans_dir`, resampled into `output_dir`.
 
     The tree is mirrored, not flattened. Returns `output_dir`.
@@ -98,6 +99,10 @@ def resample_cohort(scans_dir: str, output_dir: str, spacing=DEFAULT_SPACING,
     resampled is refused, because the steps after this one would otherwise
     report "0 file" on a folder the caller knows is not empty -- and name the
     wrong step while doing it.
+
+    `on_progress(done, total, message)`, when given, is called before each
+    scan, so the stage a failure is reported under says which scan of how many
+    it was on rather than only that the resample had started.
     """
     import SimpleITK as sitk
 
@@ -109,14 +114,23 @@ def resample_cohort(scans_dir: str, output_dir: str, spacing=DEFAULT_SPACING,
         )
 
     written = []
+    failures = []
+    total = len(found)
     for index, path in enumerate(found, start=1):
+        if on_progress is not None:
+            on_progress(index - 1, total, f"resampling scan {index} of {total}")
         destination = os.path.join(output_dir, os.path.relpath(path, scans_dir))
         try:
             os.makedirs(os.path.dirname(destination), exist_ok=True)
             sitk.WriteImage(resample_image(sitk.ReadImage(path), spacing, centre), destination)
             written.append(destination)
         except Exception as exc:  # noqa: BLE001 - one scan must not cost the cohort
-            logger.exception("VFACE could not resample one volume")
+            # Position, class and message, never the file name: the line
+            # reaches the operator page, and "scan 3 of 10" is what lets the
+            # operator find it in the cohort they were sent.
+            logger.warning("VFACE: scan %d of %d: resample failed (%s)",
+                           index, total, describe_failure(exc))
+            failures.append(exc)
             if report is not None:
                 report.setdefault("not_resampled", {})[
                     os.path.relpath(path, scans_dir)
@@ -125,11 +139,15 @@ def resample_cohort(scans_dir: str, output_dir: str, spacing=DEFAULT_SPACING,
     if not written:
         # Counted on what was WRITTEN, not on what the walk found: a guard that
         # counted the files it walked past would pass on a cohort where every
-        # single one failed to read.
-        raise ToolInputError(
-            f"None of the {len(found)} volume(s) found could be resampled. The "
-            "per-scan errors are in the run report."
-        )
+        # single one failed to read. The cause is said here, in the error,
+        # because the run report that holds the per-scan detail is deleted
+        # with the job when the run fails.
+        raise nothing_succeeded(total, "volume(s) resampled", failures)
+    if failures:
+        logger.warning("VFACE: %d of %d volume(s) resampled to %s mm, %d failed",
+                       len(written), total, "x".join(str(value) for value in spacing),
+                       len(failures))
+        return output_dir
     logger.info("VFACE: %d of %d volume(s) resampled to %s mm",
                 len(written), len(found), "x".join(str(value) for value in spacing))
     return output_dir

@@ -75,29 +75,53 @@ def _events(path) -> list:
 
 
 def test_each_step_says_which_tool_the_run_is_inside(tmp_path):
-    """The three waypoints, which `FakeSup.messages` has recorded and nothing
-    read until now.
+    """The waypoints, in the order a fully-automated run makes its calls.
 
     They are what a watcher has instead of a frozen bar: a fully-automated run
     spends most of its time inside ALI and ASO, and without them the panel
-    cannot say which. They rise, and none of them names a file.
+    cannot say which. They rise, and none of them names a file. They used to be
+    fixed numbers that fell in call order -- ASO at 0.5, then ALI_CBCT at 0.1.
     """
     planted = tmp_path / "planted"
     planted.mkdir()
     sup = FakeSup(tmp_path, {name: (lambda params: planted) for name in
-                             ("ALI_CBCT", "ALI_IOS", "ASO")})
+                             ("ALI_CBCT", "ALI_IOS", "ASO", "Crown_Seg")})
+    spans = dispatch._spans(catalogs.AUTOMATION_FULLY, predict_ios=True, predict_cbct=True)
 
-    tools.predict_cbct_landmarks(sup, str(tmp_path), "")
-    tools.predict_ios_landmarks(sup, str(tmp_path), "")
-    tools.orient_cbct(sup, str(tmp_path), str(tmp_path), "")
+    tools.orient_cbct(sup, str(tmp_path), str(tmp_path), "", span=spans["orient"])
+    tools.label_crowns(sup, str(tmp_path), "", span=spans["crowns"])
+    tools.predict_ios_landmarks(sup, str(tmp_path), "", span=spans["ios_landmarks"])
+    tools.predict_cbct_landmarks(sup, str(tmp_path), "", span=spans["cbct_landmarks"])
 
     fractions = [fraction for fraction, _message in sup.messages]
-    assert fractions == [0.1, 0.3, 0.5]
+    assert fractions == sorted(fractions)
+    assert fractions == [0.0, 0.25, 0.35, 0.45]
     assert [message for _fraction, message in sup.messages] == [
-        "predicting CBCT landmarks with ALI_CBCT",
-        "predicting intraoral landmarks with ALI_IOS",
         "orienting the CBCT with ASO",
+        "labelling the intraoral crowns with Crown_Seg",
+        "predicting intraoral landmarks with ALI_IOS",
+        "predicting CBCT landmarks with ALI_CBCT",
     ]
+    # Each call is handed exactly its own slice, and never as an argument.
+    assert sup.spans == [
+        ("ASO", (0.0, 0.25)), ("Crown_Seg", (0.25, 0.35)),
+        ("ALI_IOS", (0.35, 0.45)), ("ALI_CBCT", (0.45, 0.65)),
+    ]
+    assert all("_progress" not in params for _tool, params in sup.calls)
+
+
+def test_the_spans_tile_the_bar_in_every_mode():
+    """Each step starts where the one before ended, and registration ends it."""
+    for automation in (catalogs.AUTOMATION_FULLY, catalogs.AUTOMATION_SEMI):
+        for predict_ios in (True, False):
+            for predict_cbct in (True, False):
+                spans = list(dispatch._spans(automation, predict_ios, predict_cbct).values())
+                assert spans[0][0] == 0.0
+                assert spans[-1][1] == 1.0
+                for (_s0, e0), (s1, _e1) in zip(spans, spans[1:]):
+                    assert e0 == s1
+    assert dispatch._spans(catalogs.AUTOMATION_REGISTRATION, True, True) == {
+        "register": (0.0, 1.0)}
 
 
 def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monkeypatch):
@@ -125,7 +149,7 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
     # landmarks, silently and with an "ok" in the report.
     monkeypatch.setattr(
         dispatch, "_landmarks_by_jaw",
-        lambda root: {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
+        lambda root, side="": {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
                       for name in ("P1", "P2")},
     )
     # A stand-in that answers the one call the loop makes on a mesh. Returning
@@ -151,18 +175,21 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
         ),
     )
 
-    for start, expected in ((0.0, [0.0, 0.5]), (0.6, [0.6, 0.8])):
+    for span, expected in (((0.0, 1.0), [0.0, 0.5]), ((0.6, 1.0), [0.6, 0.8])):
         events_file.write_text("")
         report = {"patients": {}}
         dispatch.register(
             ios_dir=str(tmp_path / "ios"), cbct_dir=str(tmp_path / "cbct"),
             ios_landmark_dir=str(tmp_path), cbct_landmark_dir=str(tmp_path),
             output_dir=str(tmp_path / "out"), suffix="Reg", report=report,
-            max_dist=1.0, progress_start=start,
+            max_dist=1.0, progress_span=span,
         )
         events = _events(events_file)
-        assert [event["message"] for event in events] == ["patient 1 of 2", "patient 2 of 2"]
-        assert [event["fraction"] for event in events] == expected
+        # "reading landmarks" first, at the start of the span: walking and
+        # parsing every landmark file is not instant on a large batch.
+        assert [event["message"] for event in events] == [
+            "reading landmarks", "patient 1 of 2", "patient 2 of 2"]
+        assert [event["fraction"] for event in events] == [expected[0]] + expected
 
 
 # ---------------------------------------------------------------------------
@@ -348,9 +375,9 @@ def test_the_rules_run_before_anything_is_read():
 
 def test_an_unreadable_input_is_reported_rather_than_crashing_the_batch(tmp_path):
     """`discover` walks a folder that is not there without complaining, so the
-    refusal is the pairing one -- which names what it was looking for."""
+    refusal is the empty-side one -- which names the argument it looked in."""
     cohort(tmp_path)
-    with pytest.raises(ToolInputError, match="No patient has both"):
+    with pytest.raises(ToolInputError, match="No CBCT scan found in 'cbct'"):
         run_registration(tmp_path, cbct="/nonexistent/cbct")
 
 

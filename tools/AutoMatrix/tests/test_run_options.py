@@ -587,24 +587,31 @@ def test_one_bad_file_of_a_patient_does_not_lose_the_others(tmp_path, volume,
 
 
 def test_when_everything_fails_the_refusal_carries_the_reason(tmp_path, volume):
-    """Not the counts: "0 file(s) had no transform" is what hid a transform
-    SimpleITK could not read."""
+    """Not the counts alone: "0 file(s) had no transform" is what hid a
+    transform SimpleITK could not read. The cause leads, the argument it came
+    in is named, and the caller's file names are not repeated -- the server
+    keeps the reason after the job directory is gone."""
     volume(tmp_path / "in" / "P1_T1.nii.gz")
     (tmp_path / "tfm").mkdir()
     (tmp_path / "tfm" / "P1_transform.tfm").write_text("greetings\n")
 
+    # A ValueError: an unreadable transform is the caller's to fix.
     with pytest.raises(ValueError) as failure:
         sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
                             output_dir=tmp_path / "out")
 
     message = str(failure.value)
-    assert "AutoMatrix transformed nothing" in message
-    assert "P1_T1.nii.gz" in message
-    assert "P1_transform.tfm" in message
+    assert message.startswith("0 of 1 files transformed; most common failure: "
+                              "ValueError: a 'transforms' file could not be read")
     assert "neither an ITK transform nor a 4x4 matrix" in message
+    assert message.endswith("(1 of 1)")
+    assert "P1_T1.nii.gz" not in message and "P1_transform.tfm" not in message
+    assert isinstance(failure.value.__cause__, ValueError)
 
 
-def test_the_refusal_names_several_failures_not_only_the_first(tmp_path, volume):
+def test_the_refusal_counts_the_most_common_failure(tmp_path, volume):
+    """Three patients failing the same way read as one cause, counted, rather
+    than three copies of it that differ only by the names in them."""
     (tmp_path / "tfm").mkdir()
     for patient in ("P1", "P2", "P3"):
         volume(tmp_path / "in" / f"{patient}_T1.nii.gz")
@@ -615,7 +622,39 @@ def test_the_refusal_names_several_failures_not_only_the_first(tmp_path, volume)
                             output_dir=tmp_path / "out")
 
     message = str(failure.value)
-    assert all(f"{patient}_T1.nii.gz" in message for patient in ("P1", "P2", "P3"))
+    assert message.startswith("0 of 3 files transformed")
+    assert message.endswith("(3 of 3)")
+    assert not any(patient in message for patient in ("P1", "P2", "P3"))
+
+
+def test_a_failure_that_is_not_the_callers_is_a_runtime_error(tmp_path, volume,
+                                                              transform_file,
+                                                              monkeypatch):
+    """Every input read, and the resample itself failed: the server must answer
+    that as its own fault, not tell the caller to fix what they sent."""
+    import sadt_automatrix as tool
+
+    volume(tmp_path / "in" / "P1_T1.nii.gz")
+    volume(tmp_path / "in" / "P2_T1.nii.gz")
+    transform_file(tmp_path / "tfm" / "P1_transform.tfm")
+    transform_file(tmp_path / "tfm" / "P2_transform.tfm")
+
+    def broken(*args, **kwargs):
+        raise MemoryError("could not allocate the output grid")
+
+    monkeypatch.setattr(tool, "resample", broken)
+
+    with pytest.raises(RuntimeError) as failure:
+        tool.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
+                 output_dir=tmp_path / "out")
+
+    assert not isinstance(failure.value, ValueError)
+    assert str(failure.value) == (
+        "0 of 2 files transformed; most common failure: MemoryError: could not "
+        "allocate the output grid (2 of 2)"
+    )
+    assert isinstance(failure.value.__cause__, MemoryError)
+    assert not (tmp_path / "out" / "AutoMatrix_report.json").exists()
 
 
 def test_nothing_paired_says_so_in_counts_rather_than_in_failures(tmp_path, volume,
@@ -629,7 +668,9 @@ def test_nothing_paired_says_so_in_counts_rather_than_in_failures(tmp_path, volu
     volume(tmp_path / "in" / "P2_T1.nii.gz")
     transform_file(tmp_path / "tfm" / "P9_transform.tfm")
 
-    with pytest.raises(ValueError, match="2 file\\(s\\) had no transform, "
+    with pytest.raises(ValueError, match="2 of 2 patients in 'files' matched no "
+                                         "transform in 'transforms'; "
+                                         "2 file\\(s\\) had no transform, "
                                          "1 transform\\(s\\) had no file"):
         sadt_automatrix.run(files=tmp_path / "in", transforms=tmp_path / "tfm",
                             output_dir=tmp_path / "out")
@@ -717,7 +758,7 @@ def test_the_whole_tool_is_simpleitk_and_the_shared_pairing_rule():
     forbidden names, so a dependency added without a thought fails here whatever
     it is called."""
     third_party = _imported_modules() - {
-        "json", "logging", "os", "time", "pathlib", "typing",
+        "json", "logging", "os", "re", "time", "pathlib", "typing", "collections",
     }
 
     # numpy is here for `looks_like_a_label_map`, which is what lets the

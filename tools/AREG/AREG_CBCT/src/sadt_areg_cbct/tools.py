@@ -36,6 +36,7 @@ import json
 import logging
 import os
 
+from sadt_areg_common import pairing
 from sadt_areg_common.errors import SupervisorRequired
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,19 @@ def _returned(produced) -> str:
     return str(produced)
 
 
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing, which is what a caller with no bar of its own wants.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
-                 landmark_model: str = "", **extra) -> str:
+                 landmark_model: str = "", span=None, **extra) -> str:
     """Orient every case under `scan_dir` onto `reference_path`.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
@@ -113,7 +125,7 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
         if labels:
             parameters["cbct_landmarks"] = labels
     parameters.update(extra)
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
 def reference_landmarks(reference_path: str) -> list:
@@ -130,11 +142,21 @@ def reference_landmarks(reference_path: str) -> list:
         for directory, _subdirs, names in sorted(os.walk(reference_path)):
             candidates += [os.path.join(directory, name) for name in sorted(names)
                            if name.endswith(".mrk.json") and not name.startswith(".")]
-    for path in candidates:
+    for index, path in enumerate(candidates, start=1):
         try:
             with open(path, encoding="utf-8") as handle:
                 document = json.load(handle)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            # Skipped, not fatal -- another markups file may still name the
+            # landmarks -- but said: when it was the only one, ASO falls back
+            # to its own default set, which is the wrong frame for any
+            # reference other than the Frankfurt one.
+            logger.warning(
+                "orientation reference: markups file %d of %d could not be read (%s: %s)",
+                # `strerror` for an OSError, whose own text ends in the path.
+                index, len(candidates), type(exc).__name__,
+                getattr(exc, "strerror", None) or exc,
+            )
             continue
         labels = []
         for markup in document.get("markups") or []:
@@ -147,7 +169,17 @@ def reference_landmarks(reference_path: str) -> list:
     return []
 
 
-def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
+def count_scans(root: str) -> int:
+    """How many scans a step's folder holds, the way the pairing will count them.
+
+    A supervised step that drops a subject does not fail: the subject is simply
+    missing from its output, and further down that reads as a T1 nobody paired.
+    Counting before and after each step is what tells the two apart.
+    """
+    return len(pairing.discover(str(root), "")) if root and os.path.isdir(str(root)) else 0
+
+
+def segment_masks(sup, scan_dir: str, model_path: str, mask_structures, span=None) -> str:
     """Segment every scan under `scan_dir` into the requested mask structures.
 
     Returns the directory holding AMASSS's output, which `cbct.pipeline.find_masks`
@@ -176,4 +208,5 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
         merge=["SEPARATE"],
         prediction_ID="seg",
         generate_surface=False,
+        **_span(span),
     ))

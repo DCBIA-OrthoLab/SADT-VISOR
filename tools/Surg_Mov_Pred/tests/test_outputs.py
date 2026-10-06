@@ -96,7 +96,7 @@ def test_a_failed_run_writes_no_partial_result(tmp_path, model_folder):
     table = tmp_path / "wrong.csv"
     pd.DataFrame({"PatientID": [1], "unrelated": [0]}).to_csv(table, index=False)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         run(measurements=table, model=model_folder, output_dir=tmp_path / "out")
 
     assert not (tmp_path / "out").exists()

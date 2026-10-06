@@ -27,7 +27,7 @@ import inspect
 import logging
 import os
 
-from . import low_memory
+from . import low_memory, progress
 from .errors import ModelNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,12 @@ def resolve_device(requested: str = None) -> str:
     wanted = (requested or "cpu").strip().lower()
     if wanted.startswith("cuda") and not torch.cuda.is_available():
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
+        # The operator's concern: the result is the same, only many times
+        # slower, and the fix is in the deployment.
+        progress.log(
+            "a GPU was requested but none is visible; segmenting on the CPU",
+            "warning",
+        )
         return "cpu"
     return wanted
 
@@ -185,7 +191,15 @@ def _enable_gpu_resampling(predictor, device: str) -> bool:
     # And then the probabilities end is narrowed further: same arithmetic,
     # one class at a time, so the card never holds the whole block. See
     # low_memory.py for why that is exact rather than approximate.
-    low_memory.install(predictor)
+    if not low_memory.install(predictor):
+        # WARNING, not the INFO low_memory itself logs: without the per-class
+        # path the card holds every class's probabilities at once, which on a
+        # many-class bundle is what runs it out of memory -- and a run dying
+        # of that should not have to be traced back to an INFO line.
+        logger.warning(
+            "low-memory per-class resampling was not applied; the GPU holds every "
+            "class's probabilities at once, so a many-class model may run out of memory"
+        )
     return True
 
 
@@ -198,38 +212,97 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    predictor = _build_predictor(device, tile_step_size)
-    # An explicit path, never nnUNet's `nnUNet_results` environment variable:
-    # os.environ is process-global and the variable would outlive the call.
-    predictor.initialize_from_trained_model_folder(
-        model_folder,
-        use_folds=(0,),
-        checkpoint_name=CHECKPOINT_NAME,
-    )
+    try:
+        predictor = _build_predictor(device, tile_step_size)
+        # An explicit path, never nnUNet's `nnUNet_results` environment
+        # variable: os.environ is process-global and would outlive the call.
+        predictor.initialize_from_trained_model_folder(
+            model_folder,
+            use_folds=(0,),
+            checkpoint_name=CHECKPOINT_NAME,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"loading the nnUNet model failed ({type(exc).__name__}: {_last_line(exc)})"
+        ) from exc
 
     on_gpu = bool(gpu_resampling) and _enable_gpu_resampling(predictor, device)
+    logger.info(
+        "nnUNet predicting on %s (tile_step_size=%s, gpu_resampling=%s)",
+        device, tile_step_size, on_gpu,
+    )
 
-    if on_gpu:
-        # `predict_from_files` fans preprocessing and export out to SPAWNED
-        # processes, each of which would need its own CUDA context to run a
-        # GPU resampler. The GPU path therefore runs everything in this
-        # process, trading away the CPU/GPU overlap on multi-scan batches --
-        # a smaller loss than the resampling win.
-        predictor.predict_from_files_sequential(
-            input_dir,
-            output_dir,
-            save_probabilities=False,
-            overwrite=True,
-        )
-    else:
-        predictor.predict_from_files(
-            input_dir,
-            output_dir,
-            save_probabilities=False,
-            overwrite=True,
-            num_processes_preprocessing=2,
-            num_processes_segmentation_export=2,
-        )
+    in_process = on_gpu or not device.startswith("cuda")
+    try:
+        if in_process:
+            _predict_in_process(predictor, input_dir, output_dir)
+        else:
+            _predict_with_workers(predictor, input_dir, output_dir)
+    except Exception as exc:
+        raise RuntimeError(f"nnUNet prediction failed on {device} ({_cause(exc)})") from exc
+
+
+def _predict_in_process(predictor, input_dir: str, output_dir: str) -> None:
+    """Every stage in this process.
+
+    With GPU resamplers because `predict_from_files` fans preprocessing and
+    export out to SPAWNED processes, each of which would need its own CUDA
+    context to run them -- trading away the CPU/GPU overlap, a smaller loss
+    than the resampling win. On a CPU device because there is no overlap to
+    keep: the workers would compete with the network for the same cores, and a
+    worker that dies -- almost always the kernel reclaiming RAM -- surfaces
+    only as "Background workers died", its cause printed to a stderr no
+    operator sees. Both paths run the same preprocessor, network call and
+    export on the same float32 data, so the masks are the same.
+    """
+    predictor.predict_from_files_sequential(
+        input_dir,
+        output_dir,
+        save_probabilities=False,
+        overwrite=True,
+    )
+
+
+def _predict_with_workers(predictor, input_dir: str, output_dir: str) -> None:
+    """The card with scipy resamplers: nnUNet's own worker processes.
+
+    The workers are what overlap one scan's resampling with the next one's
+    inference, and that resampling is most of a run, so they stay -- with
+    their death translated by `_cause`.
+    """
+    predictor.predict_from_files(
+        input_dir,
+        output_dir,
+        save_probabilities=False,
+        overwrite=True,
+        num_processes_preprocessing=2,
+        num_processes_segmentation_export=2,
+    )
+
+
+def _cause(exc: BaseException) -> str:
+    """"Type: last line", or what a dead nnUNet worker actually means.
+
+    nnUNet reports a worker process that died as "Background workers died" or
+    "Segmentation export worker died", and the real error went to that
+    worker's stderr, which nothing forwards. The usual cause is the kernel
+    killing it for RAM, so that is said instead of the line that says nothing.
+    """
+    text = str(exc)
+    if "worker" in text.lower() and "died" in text.lower():
+        return (f"{type(exc).__name__}: an nnUNet worker process died, most often for "
+                "lack of RAM; its own error went to stderr only")
+    return f"{type(exc).__name__}: {_last_line(exc)}"
+
+
+def _last_line(exc: BaseException) -> str:
+    """The last non-empty line of an exception's message, or its class name.
+
+    nnUNet's errors are long and end on their cause, and the server cuts a
+    reason at about 300 characters -- so the cause is what is kept.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return lines[-1] if lines else type(exc).__name__
 
 
 __all__ = [

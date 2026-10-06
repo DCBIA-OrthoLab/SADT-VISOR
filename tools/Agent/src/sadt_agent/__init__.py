@@ -15,11 +15,19 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from . import catalog, execution, llm, ranking, routing
+from . import catalog, execution, llm, progress, ranking, routing
 from .conversation import parse_history
 from .errors import ToolInputError
 
 logger = logging.getLogger("Agent")
+
+# Where each routing stage starts on this tool's bar. The routing is a few model
+# round trips before `execution.EXECUTION_SPAN` begins, so it shares the slice
+# below that span's start; the numbers only have to rise, and the message is
+# what tells the operator which round trip a stalled run is waiting on.
+STAGE_CATALOGUE = 0.0
+STAGE_FIRST_CALL = 0.02
+STAGE_EXTRACTION = 0.06
 
 # What the caller gets, and what a client renders.
 DECISION_NAME = "routing.json"
@@ -123,7 +131,14 @@ def run(
     turns = parse_history(history)
     folder_list = [str(folder) for folder in (folders or []) if str(folder).strip()]
 
+    progress.emit(STAGE_CATALOGUE, "reading catalogue")
+    began = time.monotonic()
     tools, source = catalog.load_catalog(catalog_file, timeout_seconds)
+    logger.info(
+        "catalogue read: %d tools from the %s in %.1f s", len(tools),
+        "live registry" if source.startswith("registry:") else "catalog_file",
+        time.monotonic() - began,
+    )
     selected, scores, narrowed = ranking.select_candidates(tools, prompt, candidates)
 
     resolved_endpoint = llm.resolve_endpoint(endpoint)
@@ -133,12 +148,25 @@ def run(
         "" if narrowed else " (unnarrowed)", model_tag,
     )
 
-    def client(messages, json_format):
-        return llm.chat(
-            resolved_endpoint, model_tag, messages,
-            json_format=json_format, temperature=temperature, seed=seed,
-            timeout_seconds=timeout_seconds,
-        )
+    def client(messages, json_format, call="model call"):
+        # Timed here rather than in `llm.chat` so a stubbed model is timed the
+        # same way, and logged on failure too: "failed after 300.0 s" and
+        # "failed after 0.0 s" are two different problems.
+        began = time.monotonic()
+        try:
+            answer = llm.chat(
+                resolved_endpoint, model_tag, messages,
+                json_format=json_format, temperature=temperature, seed=seed,
+                timeout_seconds=timeout_seconds, call=call,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s failed after %.1f s (%s)", call, time.monotonic() - began,
+                type(exc).__name__,
+            )
+            raise
+        logger.info("%s answered in %.1f s", call, time.monotonic() - began)
+        return answer
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -174,6 +202,7 @@ def run(
 
 def _ask(client, prompt, selected, turns, output_dir, report):
     """Advice only. Nothing is proposed and nothing is run."""
+    progress.emit(STAGE_FIRST_CALL, "advice call")
     advice = routing.advise(client, prompt, selected, turns)
     (output_dir / ADVICE_NAME).write_text(advice, encoding="utf-8")
     report["advice_characters"] = len(advice)
@@ -191,6 +220,7 @@ def _ask(client, prompt, selected, turns, output_dir, report):
 def _route(client, prompt, selected, folder_list, turns, scores,
            execute, sup, output_dir, report):
     """Pick a tool, fill its parameters, and run it if that was asked for."""
+    progress.emit(STAGE_FIRST_CALL, "router call")
     tool, confidence, reasoning, rejected = routing.choose_tool(
         client, prompt, selected, folder_list, turns
     )
@@ -219,8 +249,10 @@ def _route(client, prompt, selected, folder_list, turns, scores,
             "No candidate tool matches this request."
         )
         decision["executed"] = False
+        _log_outcome(decision)
         return decision
 
+    progress.emit(STAGE_EXTRACTION, "extraction call (tool {})".format(tool["name"]))
     values, parameter_confidence, errors, unknown = routing.extract_arguments(
         client, prompt, tool, folder_list, turns
     )
@@ -230,6 +262,7 @@ def _route(client, prompt, selected, folder_list, turns, scores,
     decision["errors"] = errors
     if unknown:
         decision["dropped_arguments"] = unknown
+    _log_outcome(decision)
 
     allowed, reason = routing.can_execute(decision)
     if not execute:
@@ -250,6 +283,20 @@ def _route(client, prompt, selected, folder_list, turns, scores,
         "returned": produced,
     }
     return decision
+
+
+def _log_outcome(decision):
+    """One line an operator can read the whole routing decision from.
+
+    Counts rather than contents: the errors and the missing arguments are in
+    `routing.json`, and their text can quote the request.
+    """
+    logger.info(
+        "routing outcome: tool=%s, confidence=%.2f, %d error(s), "
+        "%d required argument(s) missing",
+        decision["tool"] or "none", decision["confidence"],
+        len(decision["errors"]), len(decision["missing_required"]),
+    )
 
 
 def _alternatives(selected, chosen, scores):

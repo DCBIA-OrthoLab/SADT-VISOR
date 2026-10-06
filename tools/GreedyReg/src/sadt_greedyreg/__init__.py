@@ -6,15 +6,19 @@ import os
 import shutil
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
 from sadt_areg_common import catalogs, pairing
+from sadt_areg_common.errors import ToolInputError
 
 from . import progress
 from .pipeline import (
     binarise_mask,
     check_choices,
+    describe,
+    final_metric,
     registration_command,
     resample_command,
     run_greedy,
@@ -90,6 +94,15 @@ def run(
     # not have is a bad request, and answering it with forty identical
     # per-patient failures would hide that.
     check_choices(metric, transform_type)
+    # Each folder checked by its own name, before pairing walks it: "no
+    # patient appears in both" is the wrong answer to a T2 path that does not
+    # exist, and the operator cannot tell the two arguments apart from it.
+    for name, folder in (("t1", t1), ("t2", t2)):
+        _check_folder(name, folder)
+    if masks:
+        _check_folder("masks", masks)
+    if initial_transforms:
+        _check_folder("initial_transforms", initial_transforms)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -123,6 +136,17 @@ def run(
 
     mask_by_patient = _discover_masks(str(masks)) if masks else {}
     init_by_patient = _discover_transforms(str(initial_transforms)) if initial_transforms else {}
+    # A folder that was GIVEN and holds nothing usable is a request the caller
+    # got wrong, not an optional input to skip: a run that silently goes ahead
+    # unmasked looks, from the outside, exactly like one that used the mask.
+    if masks and not mask_by_patient:
+        raise ToolInputError(
+            "'masks' folder holds no mask: expected one NIfTI volume per patient, "
+            "named after the patient's T1 scan.")
+    if initial_transforms and not init_by_patient:
+        raise ToolInputError(
+            "'initial_transforms' folder holds no transform: expected one .mat "
+            "file per patient, named after the patient.")
 
     # A mask or an initial transform that matched no patient is REPORTED, not
     # dropped. It is the same silence this port exists to remove: a run that
@@ -133,8 +157,17 @@ def run(
     for kind in ("unused_masks", "unused_initial_transforms"):
         if report[kind]:
             logger.warning("GreedyReg: %d %s matched no patient", len(report[kind]), kind)
+    total = len(matched.matched)
+    for given, found, what, fallback in (
+        (masks, mask_by_patient, "mask", "registered unmasked"),
+        (initial_transforms, init_by_patient, "initial transform", "started from identity"),
+    ):
+        missing = sum(1 for patient in matched.matched if patient not in found)
+        if given and missing:
+            logger.warning("%d of %d patients have no %s; %s", missing, total, what, fallback)
 
     registered = 0
+    failures: list = []
     for index, (patient, files) in enumerate(matched.matched.items(), start=1):
         # The counter, never the patient key: the key comes from the caller's
         # file names, and a progress message is stored and shown.
@@ -151,7 +184,7 @@ def run(
             _register_one(
                 patient, fixed, moving, output_dir, scratch,
                 mask_by_patient.get(patient), init_by_patient.get(patient),
-                metric, transform_type, output_suffix, entry,
+                metric, transform_type, output_suffix, entry, (index, total),
             )
             registered += 1
         except Exception as exc:
@@ -160,10 +193,17 @@ def run(
             # them. One patient failing costs one patient. The counter again,
             # and for a sharper reason than the progress call above: a failed
             # run's stderr is copied into the server's own persistent log.
-            logger.exception(
-                "GreedyReg failed on patient %d of %d", index, len(matched.matched)
+            # Warning, not exception: the record a server shows is the message
+            # plus "(Type: str)", so the class and greedy's last line are put in
+            # the message itself, after the step that failed.
+            step = entry.pop("step", "preparation")
+            logger.warning(
+                "GreedyReg failed on patient %d of %d: %s failed (%s: %s)",
+                index, total, step, type(exc).__name__, exc,
             )
+            failures.append(exc)
             entry["status"] = "failed"
+            entry["failed_step"] = step
             entry["reason"] = f"{type(exc).__name__}: {exc}"
         finally:
             if scratch:
@@ -177,17 +217,34 @@ def run(
     }
     report["duration_seconds"] = round(time.monotonic() - started, 2)
 
+    failed = len(report["cases"]) - registered
+    (logger.warning if failed else logger.info)(
+        "%d of %d patients registered, %d failed", registered, total, failed)
+
     if not registered:
-        raise ValueError(
-            "GreedyReg registered none of the pairs it was given. "
-            + "; ".join(
-                f"{name}: {detail.get('reason', 'unknown')}"
-                for name, detail in report["cases"].items()
-            )
-        )
+        # The most common cause, not every patient's: the patient keys are
+        # file names, and a message naming forty of them would be cut long
+        # before the cause. The per-patient reasons are in the warnings above.
+        counts = Counter(f"{type(exc).__name__}: {exc}" for exc in failures)
+        cause, times = counts.most_common(1)[0]
+        message = (f"0 of {total} patients registered; most common failure: "
+                   f"{cause} ({times} of {total})")
+        # Only when EVERY patient failed on what the caller sent is the batch
+        # the caller's fault; a greedy error on one of them is the server's.
+        if all(isinstance(exc, (ValueError, FileNotFoundError)) for exc in failures):
+            raise ToolInputError(message) from failures[0]
+        raise RuntimeError(message) from failures[0]
 
     (output_dir / "GreedyReg_report.json").write_text(json.dumps(report, indent=2))
     return output_dir
+
+
+def _check_folder(name: str, folder) -> None:
+    """Refuse a folder argument that does not exist or is a file, by its name."""
+    if not os.path.exists(str(folder)):
+        raise ToolInputError(f"'{name}' path does not exist.")
+    if not os.path.isdir(str(folder)):
+        raise ToolInputError(f"'{name}' must be a folder, but a file was given.")
 
 
 def _listed(keys: list, limit: int = 10) -> str:
@@ -249,8 +306,13 @@ def _discover_transforms(root: str) -> dict:
 
 
 def _register_one(patient, fixed, moving, output_dir, scratch, mask, init,
-                  metric, transform_type, suffix, entry) -> None:
-    """One pair: affine search, then resample the moving image into the fixed."""
+                  metric, transform_type, suffix, entry, position=(1, 1)) -> None:
+    """One pair: affine search, then resample the moving image into the fixed.
+
+    `entry["step"]` is kept current so a failure can say which step it was;
+    it is dropped again once the pair is through.
+    """
+    index, total = position
     registered_path = output_dir / f"{patient}_{suffix}.nii.gz"
     transform_path = output_dir / f"{patient}_transform.mat"
     # A patient key carries the directory it was found in, so the output
@@ -266,15 +328,36 @@ def _register_one(patient, fixed, moving, output_dir, scratch, mask, init,
 
     if mask:
         entry["mask"] = os.path.basename(mask)
+        entry["step"] = "mask reading"
         binarised = os.path.join(scratch, "mask.nii.gz")
-        binarise_mask(mask, binarised)
+        try:
+            binarise_mask(mask, binarised)
+        except Exception as exc:
+            # nibabel's message names the file and the formats it tried; what
+            # the caller can act on is which patient's mask, and what it must be.
+            raise ToolInputError(
+                f"mask for patient {index} of {total} could not be read (NIfTI only; "
+                f"{type(exc).__name__})"
+            ) from exc
         mask = binarised
 
-    run_greedy(registration_command(
+    registration = registration_command(
         fixed, moving, str(transform_path), init, metric, transform_type, mask or "",
-    ))
+    )
+    entry["step"] = f"greedy {describe(registration)}"
+    logger.info("patient %d of %d: %s%s", index, total, entry["step"],
+                ", from the given initial transform" if "initial_transform" in entry else "")
+    printed = run_greedy(registration)
+    metric_value = final_metric(printed)
+    if metric_value is not None:
+        entry["final_metric"] = metric_value
+        logger.info("patient %d of %d: final %s metric %.6g", index, total, metric, metric_value)
+
+    entry["step"] = "greedy resample"
+    logger.info("patient %d of %d: %s", index, total, entry["step"])
     run_greedy(resample_command(fixed, moving, str(registered_path), str(transform_path)))
 
+    del entry["step"]
     entry["status"] = "ok"
     entry["transform_maps"] = "the T2 image -> the T1 frame (what greedy -r consumes)"
     # Relative to the output directory, not just the base name: a nested

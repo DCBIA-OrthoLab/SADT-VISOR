@@ -6,6 +6,7 @@ failing used to lose patients 4 to 40.
 """
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
@@ -16,6 +17,7 @@ import numpy as np
 import pytest
 
 import sadt_greedyreg
+from sadt_areg_common.errors import ToolInputError
 from conftest import Recorder, cohort, make_scan
 
 
@@ -289,15 +291,17 @@ def test_an_initial_transform_that_matches_nobody_is_reported(tmp_path, greedy):
 
 
 def test_files_that_are_not_transforms_are_not_read_as_transforms(tmp_path, greedy):
+    """A folder holding no `.mat` at all was GIVEN, so it is refused by its
+    argument name rather than silently starting every patient from identity."""
     t1, t2 = cohort(tmp_path, ["A1"])
     (tmp_path / "init").mkdir()
     (tmp_path / "init" / "A1_notes.txt").write_text("not a transform\n")
 
-    out = sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
-                             initial_transforms=tmp_path / "init")
+    with pytest.raises(ToolInputError, match="'initial_transforms' folder holds no transform"):
+        sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
+                           initial_transforms=tmp_path / "init")
 
-    assert "initial_transform" not in report_of(out)["cases"]["A1"]
-    assert report_of(out)["unused_initial_transforms"] == []
+    assert greedy.commands == []
 
 
 def test_a_nested_initial_transform_follows_the_patient_into_its_subfolder(tmp_path, greedy):
@@ -466,25 +470,46 @@ def test_a_case_that_times_out_is_one_failed_patient(tmp_path, failing_greedy):
 
 
 def test_every_patient_failing_raises_rather_than_reporting_success(tmp_path, failing_greedy):
+    """Greedy failing on every pair is the server's fault, not the caller's:
+    a RuntimeError (500), never a ValueError (422)."""
     failing_greedy("A1", "B2")
     t1, t2 = cohort(tmp_path, ["A1", "B2"])
 
-    with pytest.raises(ValueError) as failure:
+    with pytest.raises(RuntimeError) as failure:
         sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out")
 
-    assert "registered none" in str(failure.value)
+    assert not isinstance(failure.value, ValueError)
+    assert str(failure.value).startswith("0 of 2 patients registered")
 
 
-def test_every_patient_failing_names_each_patients_reason(tmp_path, failing_greedy):
+def test_every_patient_failing_names_the_most_common_cause_and_no_patient(
+    tmp_path, failing_greedy
+):
     failing_greedy("A1", "B2")
     t1, t2 = cohort(tmp_path, ["A1", "B2"])
 
-    with pytest.raises(ValueError) as failure:
+    with pytest.raises(RuntimeError) as failure:
         sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out")
 
     message = str(failure.value)
-    assert "A1: RuntimeError: greedy: convergence failed" in message
-    assert "B2: RuntimeError" in message
+    assert message == ("0 of 2 patients registered; most common failure: "
+                       "RuntimeError: greedy: convergence failed (2 of 2)")
+    assert "A1" not in message and "B2" not in message
+
+
+def test_every_patient_failing_on_its_input_keeps_the_input_class(tmp_path, greedy):
+    """Every mask unreadable is something the caller sent, so it stays a 422."""
+    t1, t2 = cohort(tmp_path, ["A1", "B2"])
+    (tmp_path / "masks").mkdir()
+    for patient in ("A1", "B2"):
+        (tmp_path / "masks" / f"{patient}_mask.nii.gz").write_bytes(b"not a volume")
+
+    with pytest.raises(ToolInputError, match="0 of 2 patients registered") as failure:
+        sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
+                           masks=tmp_path / "masks")
+
+    assert "could not be read (NIfTI only" in str(failure.value)
+    assert greedy.commands == []
 
 
 def test_a_batch_that_registered_nothing_writes_no_report(tmp_path, failing_greedy):
@@ -493,7 +518,7 @@ def test_a_batch_that_registered_nothing_writes_no_report(tmp_path, failing_gree
     failing_greedy("A1")
     t1, t2 = cohort(tmp_path, ["A1"])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError):
         sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out")
 
     assert not (tmp_path / "out" / "GreedyReg_report.json").exists()
@@ -562,3 +587,136 @@ def test_no_scratch_directory_survives_a_failed_patient(tmp_path, failing_greedy
     left = {name for name in set(os.listdir(tempfile.gettempdir())) - before
             if name.startswith("greedyreg_")}
     assert left == set()
+
+
+# ---------------------------------------------------------------------------
+# What an operator reads when a run goes wrong
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("argument", ["t1", "t2"])
+def test_a_missing_scan_folder_is_refused_by_its_argument_name(tmp_path, greedy, argument):
+    t1, t2 = cohort(tmp_path, ["A1"])
+    folders = {"t1": t1, "t2": t2, argument: tmp_path / "nowhere"}
+
+    with pytest.raises(ToolInputError, match=f"^'{argument}' path does not exist"):
+        sadt_greedyreg.run(output_dir=tmp_path / "out", **folders)
+
+
+def test_a_file_given_as_a_scan_folder_is_refused_by_its_argument_name(tmp_path, greedy):
+    t1, _t2 = cohort(tmp_path, ["A1"])
+    single = make_scan(tmp_path / "single" / "A1_T2.nii.gz")
+
+    with pytest.raises(ToolInputError, match="^'t2' must be a folder"):
+        sadt_greedyreg.run(t1=t1, t2=single, output_dir=tmp_path / "out")
+
+
+@pytest.mark.parametrize("argument", ["masks", "initial_transforms"])
+def test_a_missing_optional_folder_is_refused_rather_than_ignored(tmp_path, greedy, argument):
+    with pytest.raises(ToolInputError, match=f"^'{argument}' path does not exist"):
+        run_batch(tmp_path, **{argument: tmp_path / "nowhere"})
+    assert greedy.commands == []
+
+
+def test_an_empty_masks_folder_is_refused_rather_than_ignored(tmp_path, greedy):
+    (tmp_path / "masks").mkdir()
+
+    with pytest.raises(ToolInputError, match="^'masks' folder holds no mask"):
+        run_batch(tmp_path, masks=tmp_path / "masks")
+
+
+def test_patients_without_a_mask_are_counted_in_a_warning(tmp_path, greedy, caplog):
+    t1, t2 = cohort(tmp_path, ["A1", "B2", "C3"])
+    make_scan(tmp_path / "masks" / "A1_mask.nii.gz", data=np.ones((4, 4, 4), np.float32))
+
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
+                           masks=tmp_path / "masks")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "2 of 3 patients have no mask; registered unmasked" in warnings
+
+
+def test_patients_without_an_initial_transform_are_counted_in_a_warning(tmp_path, greedy, caplog):
+    t1, t2 = cohort(tmp_path, ["A1", "B2"])
+    (tmp_path / "init").mkdir()
+    (tmp_path / "init" / "A1_transform.mat").write_text("1 0 0 0\n")
+
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
+                           initial_transforms=tmp_path / "init")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "1 of 2 patients have no initial transform; started from identity" in warnings
+
+
+def test_an_unreadable_mask_names_the_patient_position_and_not_the_file(tmp_path, greedy, caplog):
+    t1, t2 = cohort(tmp_path, ["A1", "B2"])
+    make_scan(tmp_path / "masks" / "A1_mask.nii.gz", data=np.ones((4, 4, 4), np.float32))
+    (tmp_path / "masks" / "B2_mask.nii.gz").write_bytes(b"not a volume")
+
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        out = sadt_greedyreg.run(t1=t1, t2=t2, output_dir=tmp_path / "out",
+                                 masks=tmp_path / "masks")
+
+    entry = report_of(out)["cases"]["B2"]
+    assert entry["failed_step"] == "mask reading"
+    assert entry["reason"].startswith(
+        "ToolInputError: mask for patient 2 of 2 could not be read (NIfTI only")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("GreedyReg failed on patient 2 of 2: mask reading failed "
+                            "(ToolInputError: ") for m in warnings), warnings
+    assert not any("B2" in m for m in warnings), warnings
+
+
+def test_each_greedy_step_is_logged_before_it_runs(tmp_path, greedy, caplog):
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        run_batch(tmp_path, ["A1", "B2"], metric="NMI", transform_type="Affine")
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert "patient 1 of 2: greedy registration (NMI, 12 dof)" in messages
+    assert "patient 2 of 2: greedy resample" in messages
+
+
+def test_the_final_metric_is_logged_and_reported(tmp_path, monkeypatch, caplog):
+    class Printing(Recorder):
+        def __call__(self, command):
+            super().__call__(command)
+            if "-a" in command:
+                return ("Level   0  LastIter   Metrics  -8762.396413  Energy = -8762.396413\n"
+                        "Level   1  LastIter   Metrics  -7929.584809  Energy = -7929.584809\n")
+            return ""
+
+    monkeypatch.setattr(sadt_greedyreg, "run_greedy", Printing())
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        out = run_batch(tmp_path)
+
+    assert report_of(out)["cases"]["A1"]["final_metric"] == pytest.approx(-7929.584809)
+    assert "patient 1 of 1: final NCC metric -7929.58" in [r.getMessage() for r in caplog.records]
+
+
+def test_the_summary_is_info_when_everything_registered(tmp_path, greedy, caplog):
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        run_batch(tmp_path, ["A1", "B2"])
+
+    summary = [r for r in caplog.records if r.getMessage() == "2 of 2 patients registered, 0 failed"]
+    assert summary and summary[0].levelno == logging.INFO
+
+
+def test_the_summary_is_a_warning_when_partial(tmp_path, failing_greedy, caplog):
+    failing_greedy("B2")
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        run_batch(tmp_path, ["A1", "B2"])
+
+    summary = [r for r in caplog.records if r.getMessage() == "1 of 2 patients registered, 1 failed"]
+    assert summary and summary[0].levelno == logging.WARNING
+
+
+def test_a_timed_out_patient_is_logged_with_its_position(tmp_path, failing_greedy, caplog):
+    failing_greedy("B2", raises=lambda patient: TimeoutError(
+        "greedy registration did not finish within 600s"))
+    with caplog.at_level(logging.INFO, logger="GreedyReg"):
+        run_batch(tmp_path, ["A1", "B2"])
+
+    assert ("GreedyReg failed on patient 2 of 2: greedy registration (NCC, 6 dof) failed "
+            "(TimeoutError: greedy registration did not finish within 600s)"
+            in [r.getMessage() for r in caplog.records])

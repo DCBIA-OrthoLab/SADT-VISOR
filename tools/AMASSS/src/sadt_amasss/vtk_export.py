@@ -149,7 +149,25 @@ def _write(polydata, output_path: str) -> None:
     # reading one back moved points by up to 5e-05mm. This writes what marching
     # cubes actually produced.
     writer.SetFileTypeToBinary()
-    writer.Write()
+    # VTK reports a failed write (unwritable folder, full disk) by returning 0
+    # and printing to stderr, which nobody reads -- so without this check a
+    # run ended "ok" naming a surface that was never written. The path stays
+    # out of the message: the operator reads it redacted to `<path>` anyway.
+    if writer.Write() != 1 or writer.GetErrorCode() != 0:
+        raise RuntimeError(
+            f"writing a surface failed (VTK error code {writer.GetErrorCode()})"
+        )
+
+
+def _warn_if_empty(polydata, what: str, where: str) -> None:
+    """An empty surface is written all the same, but never silently.
+
+    A mask with voxels always contours to something, so zero triangles means
+    the mask was empty -- worth a line, because the file looks fine until it is
+    opened.
+    """
+    if polydata.GetNumberOfCells() == 0:
+        logger.warning("%ssurface for %s is empty (0 triangles); written anyway", where, what)
 
 
 def _meshes_in_parallel(jobs, workers: int = 1) -> list:
@@ -178,14 +196,15 @@ def _meshes_in_parallel(jobs, workers: int = 1) -> list:
 
 def write_separate_surfaces(masks, reference, label_colors: dict, labels: dict,
                             smoothing: int, decimation: int, output_dir: str,
-                            name_of, workers: int = 1) -> list:
+                            name_of, workers: int = 1, where: str = "") -> list:
     """Every structure's own .vtk, built side by side and written in order.
 
     The plural exists because the meshes are what cost: building them one at a
     time left the machine on one core for two thirds of a run's wall clock,
     with the card already idle. `masks` is an ordered mapping, and the list
     returned follows it -- so the report names the files in the run's own
-    order whatever order the threads finished in.
+    order whatever order the threads finished in. `where` prefixes the log
+    lines with the scan's position, e.g. "scan 2 of 5: ".
     """
     import os
 
@@ -199,15 +218,18 @@ def write_separate_surfaces(masks, reference, label_colors: dict, labels: dict,
     written = []
     for code, polydata in zip(codes, meshes):
         path = os.path.join(output_dir, name_of(code))
+        _warn_if_empty(polydata, code, where)
         _write(polydata, path)
-        logger.info("Wrote surface for %s (%d triangles)", code, polydata.GetNumberOfCells())
+        logger.info("%sWrote surface for %s (%d triangles)", where, code,
+                    polydata.GetNumberOfCells())
         written.append(path)
     return written
 
 
 def write_separate_surface(mask, reference, structure_code: str,
                            label_colors: dict, labels: dict,
-                           smoothing: int, output_path: str, decimation: int = 0) -> str:
+                           smoothing: int, output_path: str, decimation: int = 0,
+                           where: str = "") -> str:
     """One binary structure -> one .vtk.
 
     `structure_code` is passed in by the caller instead of being parsed back
@@ -216,9 +238,11 @@ def write_separate_surface(mask, reference, structure_code: str,
     label_index = labels.get(structure_code)
     color = label_colors.get(label_index, (255, 255, 255))
     polydata = _mesh_from_mask(mask, reference, smoothing, color, decimation)
+    _warn_if_empty(polydata, structure_code, where)
     _write(polydata, output_path)
     logger.info(
-        "Wrote surface for %s (%d triangles)", structure_code, polydata.GetNumberOfCells()
+        "%sWrote surface for %s (%d triangles)", where, structure_code,
+        polydata.GetNumberOfCells(),
     )
     return output_path
 
@@ -226,7 +250,7 @@ def write_separate_surface(mask, reference, structure_code: str,
 def write_merged_surface(merged, reference, names_from_labels: dict,
                          label_colors: dict, smoothing: int,
                          output_path: str, decimation: int = 0,
-                         workers: int = 1) -> str:
+                         workers: int = 1, where: str = "") -> str:
     """A multi-label volume -> one .vtk holding every structure's surface.
 
     One mesh per label, and they are built side by side: VTK's filters are
@@ -245,7 +269,8 @@ def write_merged_surface(merged, reference, names_from_labels: dict,
         if structure_code is None:
             # Unknown label: skip it rather than raise. The original indexed
             # NAMES_FROM_LABELS directly and died on anything unexpected.
-            logger.warning("Skipping unknown label %s while building merged surface", label)
+            logger.warning("%sskipping unknown label %s while building the merged surface",
+                           where, label)
             continue
         wanted.append(label)
 
@@ -255,15 +280,16 @@ def write_merged_surface(merged, reference, names_from_labels: dict,
         workers,
     )
     append = vtk.vtkAppendPolyData()
-    for mesh in meshes:
+    for label, mesh in zip(wanted, meshes):
+        _warn_if_empty(mesh, names_from_labels[label], where)
         append.AddInputData(mesh)
     surfaces = len(meshes)
 
     if surfaces == 0:
-        logger.warning("No labels found in merged volume; no surface written")
+        logger.warning("%sno labels found in the merged volume; no surface written", where)
         return ""
 
     append.Update()
     _write(append.GetOutput(), output_path)
-    logger.info("Wrote merged surface with %d structure(s)", surfaces)
+    logger.info("%sWrote merged surface with %d structure(s)", where, surfaces)
     return output_path

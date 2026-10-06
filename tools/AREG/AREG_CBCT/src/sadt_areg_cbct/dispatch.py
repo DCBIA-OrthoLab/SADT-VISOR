@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import shutil
+from collections import Counter
 
 from sadt_areg_common.errors import ToolInputError
 
@@ -196,8 +197,10 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
         if not reference:
             raise ToolInputError(
                 "Oriented + Fully-Automated CBCT orients the T1 scans before "
-                "registering onto them, which needs an orientation reference: name "
-                "one in 'cbct_reference' (see GET /tools/AREG_CBCT/data)."
+                "registering onto them, which needs an orientation reference, and "
+                "this deployment publishes none for the frame asked for: pick a "
+                "frame in 'orientation' whose bundle is installed, or name a "
+                "bundle from this tool's data listing in 'cbct_reference'."
             )
         # `landmark_model` is NOT required here any more. Which weights the
         # landmark tool predicts with is that tool's business -- ALI_CBCT
@@ -213,10 +216,11 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
         # weights it should load.
         raise ToolInputError(
             f"{automation} CBCT segments the T1 scans before registering, which "
-            f"needs the segmentation weights. This deployment publishes none: "
-            f"no '{_SEGMENTATION_BUNDLE}' under DATA/{_DATA_NAME}/models/. Add it "
-            f"(scripts/setup-models.sh --tool AREG), or name another bundle in "
-            f"'segmentation_model' (see GET /tools/AREG_CBCT/data)."
+            f"needs the segmentation weights. This deployment publishes none: the "
+            f"{_DATA_NAME} models folder of the data root holds no "
+            f"'{_SEGMENTATION_BUNDLE}' bundle. Install it with the setup-models "
+            f"script for the {_DATA_NAME} tool, or name another bundle from this "
+            f"tool's data listing in 'segmentation_model'."
         )
 
 
@@ -288,6 +292,35 @@ def _collect_oriented(oriented_dir, output_dir, report) -> None:
     )
 
 
+# How a CBCT run shares its bar, as fractions of the whole. The supervised
+# steps come first because they run first, and the registration loop takes
+# what is left. Orientation is a full ASO run, landmark prediction through ALI
+# included; segmentation is AMASSS over the T1 cohort; registration is elastix
+# per region per subject, the longest of the three on any real cohort, so it
+# keeps the larger share. A weighting, not a measurement: what is exact is the
+# counter in each message.
+ORIENT_SHARE = 0.25
+SEGMENT_SHARE = 0.25
+
+
+def _cbct_spans(orient: bool, segment: bool) -> tuple:
+    """(orientation, segmentation, registration) spans, None for a step not run.
+
+    Each step starts where the one before it ended, so the bar only moves
+    forward, and a step a mode skips takes no slice at all rather than leaving
+    a jump where it would have been.
+    """
+    position = 0.0
+    orientation = segmentation = None
+    if orient:
+        orientation = (position, position + ORIENT_SHARE)
+        position += ORIENT_SHARE
+    if segment:
+        segmentation = (position, position + SEGMENT_SHARE)
+        position += SEGMENT_SHARE
+    return orientation, segmentation, (position, 1.0)
+
+
 def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
@@ -311,10 +344,18 @@ def _run_cbct(
     # The two timepoints are asked separately: a cohort half exported as DICOM
     # and half already converted is somebody's real Tuesday, and one flag for
     # both would have made them choose which half to break.
+    #
+    # Announced before it starts: a cohort of DICOM series takes minutes to
+    # convert, and a failure in it would otherwise be reported against whatever
+    # the bar last said.
     if dicom_input or dicom.holds_a_series(t1_root):
-        t1_root = dicom.convert_tree(t1_root, os.path.join(work_dir, "dicom_t1"))
+        progress.emit(0.0, "converting DICOM (T1)")
+        t1_root = dicom.convert_tree(t1_root, os.path.join(work_dir, "dicom_t1"),
+                                     label="T1", argument="t1")
     if dicom_input or dicom.holds_a_series(t2_root):
-        t2_root = dicom.convert_tree(t2_root, os.path.join(work_dir, "dicom_t2"))
+        progress.emit(0.0, "converting DICOM (T2)")
+        t2_root = dicom.convert_tree(t2_root, os.path.join(work_dir, "dicom_t2"),
+                                     label="T2", argument="t2")
 
     # Descended ONCE, here, before anything reads either folder: a hosted test
     # entry is a whole cohort (`<name>/{T1,T2}/`) because that is all a picker
@@ -327,15 +368,30 @@ def _run_cbct(
     report["regions"] = list(regions)
     report["segmentation_label"] = segmentation_label or None
 
+    orient_span, segment_span, register_span = _cbct_spans(
+        orient=automation == catalogs.AUTOMATION_ORIENTED,
+        segment=automation != catalogs.AUTOMATION_SEMI,
+    )
+
     # Step 1 -- orient the T1 scans, when the mode asks for it. The T2 is NOT
     # oriented: it is about to be resampled into the T1's frame anyway, and
     # orienting it first would be one more interpolation of the same data.
     if automation == catalogs.AUTOMATION_ORIENTED:
+        progress.emit(orient_span[0], "orienting the T1 scans with ASO")
+        sent = tools.count_scans(t1_root)
         oriented = tools.orient_scans(
             sup,
             t1_root, orientation_reference, catalogs.MODALITY_CBCT,
             landmark_model=landmark_model or "",
+            span=orient_span,
         )
+        # ASO drops a scan it cannot orient rather than failing the run, and a
+        # dropped T1 surfaces below as a subject nobody paired -- which reads as
+        # a naming problem. Counted here, where it is still ASO's.
+        returned = tools.count_scans(oriented)
+        if returned < sent:
+            logger.warning("ASO returned %d of %d oriented T1 scans; the others "
+                           "cannot be paired or registered", returned, sent)
         report["oriented_t1"] = True
         _collect_oriented(oriented, output_dir, report)
         t1_root = oriented
@@ -355,20 +411,34 @@ def _run_cbct(
         wanted = [catalogs.SEGMENTATION_CODES[name]
                   for name in _selected(segmentations, catalogs.SEGMENTATION_CHOICES)]
         structures = masks + [code for code in wanted if code not in masks]
-        amasss_dir = tools.segment_masks(sup, t1_root, segmentation_model, structures)
+        progress.emit(segment_span[0], "segmenting the T1 scans with AMASSS")
+        amasss_dir = tools.segment_masks(
+            sup, t1_root, segmentation_model, structures, span=segment_span
+        )
         mask_roots.append(amasss_dir)
         report["segmented_t1"] = sorted(structures)
         _collect_segmentations(amasss_dir, wanted, output_dir, report)
 
     # Step 3 -- pair the timepoints, then register once per region.
+    register_start, register_end = register_span
+    progress.emit(register_start, "pairing timepoints")
     matched = pairing.pair(t1_root, t2_root, suffix)
     report["unmatched"] = matched.unmatched_report()
+    # Counts only: the keys are built from the caller's file names.
+    logger.log(
+        logging.WARNING if (matched.t1_only or matched.t2_only) else logging.INFO,
+        "paired %d subject(s); %d T1-only, %d T2-only",
+        len(matched), len(matched.t1_only), len(matched.t2_only),
+    )
     if not matched:
+        # The rule in words: an example file name would reach the operator
+        # redacted to a placeholder, and is the one part of the sentence that
+        # carries the rule.
         raise ToolInputError(
             "No subject appears in both the T1 and the T2 folder. They are paired by "
-            "name, up to the timepoint token and a trailing "
-            f"{', '.join(catalogs.PATIENT_SUFFIXES[:4])}... -- so 'P1_T1_scan.nii.gz' "
-            f"in one folder pairs with 'P1_T2.nii.gz' in the other. Found "
+            "name: a T1 scan and a T2 scan are the same subject when their file names "
+            "are identical once the timepoint token (T1, T2) and a trailing descriptor "
+            "such as _scan, _Seg or _Or are removed. Found "
             f"{len(matched.t1_only)} T1-only and {len(matched.t2_only)} T2-only subject(s)."
         )
 
@@ -377,17 +447,40 @@ def _run_cbct(
     # machine pays for. Each is still one elastix thread and the same
     # deterministic computation, so running them side by side changes the
     # order they finish in and nothing they produce.
+    total = len(matched.matched)
+    position = {key: index for index, key in enumerate(sorted(matched.matched), start=1)}
+    failures = []
     jobs = []
     for code in codes:
+        region = catalogs.region_name(code)
         masks = cbct_pipeline.find_masks(mask_roots, code, scan_keys=matched.matched)
+        unmasked = sum(1 for key in matched.matched if not masks.get(key))
+        if unmasked:
+            # Counted per region, after the pairing: a subject the segmentation
+            # skipped is otherwise one more "failed" entry in a report the
+            # operator never sees.
+            if automation != catalogs.AUTOMATION_SEMI and not t1_masks_path:
+                logger.warning("AMASSS produced no %s mask for %d of %d subjects",
+                               region, unmasked, total)
+            else:
+                logger.warning("no %s mask matched for %d of %d subjects",
+                               region, unmasked, total)
+        if not masks:
+            # Every subject of this region is about to fail on the same missing
+            # mask. Said once, to the clinician who asked for the region: their
+            # result will hold none of it, and the report says so only per
+            # subject.
+            _log(sup, f"no {catalogs.region_name(code)} mask for any subject; "
+                      "that region is not registered", level="warning", user=True)
         for key, entry in sorted(matched.matched.items()):
             record = report["patients"].setdefault(key, {"status": "ok", "regions": {}})
             mask_path = masks.get(key)
             if not mask_path:
-                record["regions"][code] = {
-                    "status": "failed",
-                    "reason": _no_mask_reason(automation, code),
-                }
+                reason = _no_mask_reason(automation, code)
+                record["regions"][code] = {"status": "failed", "reason": reason}
+                # Counted above, per region, rather than one line per subject.
+                failures.append(_failure(
+                    "missing mask", reason, automation == catalogs.AUTOMATION_SEMI))
                 continue
             jobs.append((code, key, {
                 "t1_path": entry["t1"],
@@ -405,19 +498,66 @@ def _run_cbct(
     # Declared around the registrations and nowhere else: the peak is there,
     # one pair of volumes per channel, and what runs before it is the chain's.
     progress.set_width(width)
+    # Said BEFORE the registrations start, not only as each one ends: they are
+    # the long step, and a failure inside them is diagnosed by the last thing
+    # this tool said it was doing.
+    progress.emit(register_start, "registering {} region(s) of {} subject(s)".format(
+        len(codes), len(matched.matched)))
     try:
         finished = cbct_pipeline.register_all(
             [kwargs for _code, _key, kwargs in jobs], width,
+            # Inside the registration's span of the bar, which starts where the
+            # supervised steps above ended -- not 0..1 again.
             on_done=lambda done, total: progress.emit(
-                done / total, "registration {} of {}".format(done, total)),
+                register_start + (register_end - register_start) * done / total,
+                "registration {} of {}".format(done, total)),
         )
     finally:
         progress.set_width(None)
-    # In the order they were listed, whatever order they finished in.
+    # In the order they were listed, whatever order they finished in. A failed
+    # registration is logged HERE, in this process: the workers that ran them
+    # are spawned and their own log lines never reach the operator.
     for (code, key, _kwargs), entry in zip(jobs, finished):
+        kind = entry.pop("error", None)
+        cause = entry.pop("cause", None)
         report["patients"][key]["regions"][code] = entry
+        if entry.get("status") != "failed":
+            continue
+        kind = kind or "RegistrationError"
+        logger.warning("subject %d of %d: %s registration failed (%s: %s)",
+                       position[key], total, catalogs.region_name(code), kind,
+                       entry.get("reason"))
+        failures.append(_failure(kind, entry.get("reason"),
+                                 _caller_fault_cause(cause, automation)))
 
     _roll_up_regions(report["patients"])
+    return failures
+
+
+def _failure(kind: str, reason: str, caller: bool, exc: BaseException = None) -> dict:
+    """One registration that did not happen, as `_summarize` weighs it."""
+    return {"kind": kind, "reason": reason, "caller": caller, "exc": exc}
+
+
+def _caller_fault_cause(cause, automation: str) -> bool:
+    """`_caller_fault` for a registration that ran in a worker, which hands
+    back its failure's `cause` rather than the exception itself."""
+    if cause == "input":
+        return True
+    return cause == "mask" and automation == catalogs.AUTOMATION_SEMI
+
+
+def _caller_fault(exc: BaseException, automation: str) -> bool:
+    """Whether a failed registration is the caller's to fix.
+
+    A mask that does not fit its scan is the caller's when they sent it, and the
+    segmentation step's when it made it. Anything that is not a
+    RegistrationError came from the engine.
+    """
+    cause = getattr(exc, "cause", None)
+    if cause == "input":
+        return True
+    return cause == "mask" and automation == catalogs.AUTOMATION_SEMI
 
 
 def _registration_width(sup, wanted: int, declared: int = 0) -> int:
@@ -444,6 +584,18 @@ def _registration_width(sup, wanted: int, declared: int = 0) -> int:
         logger.warning("Could not ask for channels; registering one at a time",
                        exc_info=True)
         return 1
+
+
+def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
+    """`sup.log` when there is a supervisor, the progress file's log otherwise.
+
+    Never a file name: the line reaches the operator page, and with `user`
+    the clinician's panel.
+    """
+    if sup is not None and hasattr(sup, "log"):
+        sup.log(message, level=level, user=user)
+    else:
+        progress.log(message, level=level, user=user)
 
 
 def _no_mask_reason(automation: str, code: str) -> str:
@@ -518,20 +670,45 @@ def _as_directory(path: str, destination: str) -> str:
     return destination
 
 
-def _summarize(report: dict) -> None:
+def _summarize(report: dict, failures=()) -> None:
     statuses = [entry.get("status") for entry in report["patients"].values()]
     report["summary"] = {
         "patients": len(statuses),
         "registered": statuses.count("ok"),
         "failed": statuses.count("failed"),
     }
-    logger.info(
-        "AREG %s %s: %d/%d registered",
-        report["modality"],
-        report["automation"],
-        report["summary"]["registered"],
-        report["summary"]["patients"],
+    summary = report["summary"]
+    # WARNING as soon as any registration failed, even of a subject another
+    # region saved: the result is missing something the caller asked for.
+    logger.log(
+        logging.WARNING if failures else logging.INFO,
+        "AREG %s %s: %d of %d subjects registered, %d failed (%d registration(s) failed)",
+        report["modality"], report["automation"], summary["registered"],
+        summary["patients"], summary["failed"], len(failures),
     )
+
+
+def _raise_if_nothing_registered(report: dict, failures) -> None:
+    """A run that registered nobody is a failed run, not an empty archive.
+
+    The per-subject reasons are in the report, but the report is deleted with
+    the job when the run fails -- so the exception carries the most common one
+    itself, cause first. The caller's input class is kept only when every
+    failure was theirs; otherwise the server owns at least part of it.
+    """
+    summary = report["summary"]
+    if summary["registered"] or not summary["patients"] or not failures:
+        return
+    counts = Counter((failure["kind"], failure["reason"]) for failure in failures)
+    (kind, reason), count = counts.most_common(1)[0]
+    message = (
+        f"0 of {summary['patients']} subjects registered; most common failure: "
+        f"{kind}: {reason} ({count} of {len(failures)} registrations)"
+    )
+    first = next((failure["exc"] for failure in failures if failure["exc"]), None)
+    if all(failure["caller"] for failure in failures):
+        raise ToolInputError(message) from first
+    raise RuntimeError(message) from first
 
 
 def register(
@@ -556,6 +733,10 @@ def register(
 
     Each path is a directory or a `.zip`. `regions` are the display names
     declared in `catalogs.REGION_CHOICES` (CBCT only).
+
+    A subject that fails is reported and the batch goes on; a run in which NO
+    subject registered raises -- ToolInputError when every failure was the
+    caller's input, RuntimeError otherwise -- after the report is written.
     """
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -581,7 +762,7 @@ def register(
         "patients": {},
     }
 
-    _run_cbct(
+    failures = _run_cbct(
         t1_root=t1_root,
         t2_root=t2_root,
         t1_masks_path=t1_masks_path,
@@ -606,9 +787,10 @@ def register(
     # left under output_dir is results and nothing else.
     shutil.rmtree(work_dir, ignore_errors=True)
 
-    _summarize(report)
+    _summarize(report, failures)
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
+    _raise_if_nothing_registered(report, failures)
     return RegistrationRun(output_dir, report)
 
 

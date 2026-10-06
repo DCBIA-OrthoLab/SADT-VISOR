@@ -122,7 +122,8 @@ def test_a_patient_with_only_one_modality_is_reported_not_dropped(tmp_path):
     assert unpaired == {"2": "no CBCT", "3": "no intraoral scan"}
 
 
-def test_no_pair_at_all_names_both_counts_and_what_was_left_over(tmp_path):
+def test_no_pair_at_all_gives_both_counts_and_no_key(tmp_path):
+    """Counts, never the keys: a key is built from the caller's file names."""
     write_mesh(tmp_path / "ios" / "alpha.vtk")
     write_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz")
 
@@ -131,7 +132,23 @@ def test_no_pair_at_all_names_both_counts_and_what_was_left_over(tmp_path):
     message = str(raised.value)
     assert "1 intraoral key(s)" in message
     assert "1 CBCT key(s)" in message
-    assert "no CBCT" in message
+    assert "alpha" not in message
+    assert "'1'" not in message
+
+
+def test_an_empty_side_names_its_source_and_takes_the_class_it_is_given(tmp_path):
+    """The caller's empty folder is theirs to fix; a supervised tool's is not."""
+    write_mesh(tmp_path / "ios" / "P001_T2_U.vtk")
+    (tmp_path / "cbct").mkdir()
+
+    with pytest.raises(ToolInputError, match="No CBCT scan found in 'cbct'"):
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    with pytest.raises(RuntimeError, match="No CBCT scan found in ASO's output") as raised:
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"),
+                          cbct_source="ASO's output", cbct_error=RuntimeError)
+    assert not isinstance(raised.value, ValueError)
+    with pytest.raises(ToolInputError, match="No intraoral mesh"):
+        pipeline.discover(str(tmp_path / "cbct"), str(tmp_path / "ios"))
 
 
 def test_discovery_is_recursive_on_both_sides(tmp_path):

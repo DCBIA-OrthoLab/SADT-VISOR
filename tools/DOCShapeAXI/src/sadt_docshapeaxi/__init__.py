@@ -14,6 +14,10 @@ logger = logging.getLogger("DOCShapeAXI")
 
 __all__ = ["run"]
 
+# The share of the bar the prediction pass takes when an explanation follows
+# it. See `run`.
+PREDICTION_SHARE = 0.25
+
 
 def run(
     surfaces: Path,
@@ -44,7 +48,7 @@ def run(
         `{"outputs": {...}, "predictions": [...], "report": path}` -- the
         `outputs` mapping is what the server turns into the response.
     """
-    from . import catalog, engine, pipeline
+    from . import catalog, engine, pipeline, progress
 
     # The runner hands a tool `pathlib.Path` for every `path` argument, while
     # everything here works in strings. Coerced once, at the door.
@@ -54,7 +58,12 @@ def run(
     analysis = catalog.analysis_for(os.path.basename(model))
 
     if not os.path.exists(model):
-        raise FileNotFoundError(f"The checkpoint '{os.path.basename(model)}' was not found.")
+        # Named by argument and analysis first: the file name that follows is
+        # redacted on its way to an operator's log.
+        raise FileNotFoundError(
+            f"'model': the {analysis.anatomy} {analysis.task} checkpoint was "
+            f"not found ('{os.path.basename(model)}')."
+        )
 
     found = pipeline.discover_surfaces(surfaces)
     if not found:
@@ -62,6 +71,11 @@ def run(
             f"No .vtk surface was found under '{os.path.basename(surfaces)}'. "
             f"DOCShapeAXI reads surfaces, not volumes."
         )
+    # Both before the checkpoint is loaded, which is the slow part: a batch
+    # that cannot finish is refused while refusing it is cheap.
+    pipeline.check_surfaces(found)
+    if explain:
+        pipeline.check_unique_names(found)
 
     device = pipeline.resolve_device(device)
     os.makedirs(output_dir, exist_ok=True)
@@ -75,8 +89,22 @@ def run(
         len(found), analysis.anatomy, analysis.task, device,
     )
 
-    network = pipeline.load_network(model, analysis.network, device)
-    values = engine.predict(network, analysis, found, mount_point, device)
+    # How the bar is shared between the two passes. Both are counted per
+    # surface; what is chosen here is only where one ends and the next begins.
+    # The explanation computes a GradCAM per class on top of the same forward
+    # pass, which is what makes it several times slower than the prediction,
+    # so the prediction is given the first quarter when both run.
+    split = PREDICTION_SHARE if explain else 1.0
+
+    # The checkpoint load is one opaque call: announced at the start of the
+    # bar rather than given a share of it nothing here measures.
+    progress.emit(0.0, "loading the model")
+    network = pipeline.load_network(
+        model, analysis.network, device, anatomy=analysis.anatomy
+    )
+    values = engine.predict(
+        network, analysis, found, mount_point, device, span=(0.0, split)
+    )
 
     predictions = []
     for path, value in zip(found, values):
@@ -91,7 +119,10 @@ def run(
 
     written = []
     if explain:
-        written = engine.explain(network, analysis, found, mount_point, device, output_dir)
+        written = engine.explain(
+            network, analysis, found, mount_point, device, output_dir,
+            span=(split, 1.0),
+        )
         written = _rename_with_suffix(written, output_suffix)
 
     report_path = os.path.join(output_dir, "DOCShapeAXI_report.json")
@@ -112,6 +143,14 @@ def run(
     outputs = {"report": report_path}
     for path in written:
         outputs[os.path.splitext(os.path.basename(path))[0]] = path
+
+    # Every surface is accounted for or the run has already raised, so this
+    # is the operator's confirmation of how much was done, not a tally of
+    # partial success.
+    logger.info(
+        "%d of %d surfaces classified, %d explained", len(predictions),
+        len(found), len(written),
+    )
     return {"outputs": outputs, "predictions": predictions, "report": report_path}
 
 

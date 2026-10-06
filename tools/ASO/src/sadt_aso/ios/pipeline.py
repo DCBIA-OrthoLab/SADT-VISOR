@@ -214,9 +214,12 @@ def load_reference(reference_dir: str, need_surfaces=None) -> dict:
     else:
         wanted, what = ("markups",), "landmark file"
     if not any(entry[key] for entry in merged.values() for key in wanted):
-        raise ValueError(
-            f"The reference bundle holds no {what} whose name says which jaw it "
-            f"is (e.g. 'Gold_Upper.vtk')."
+        # A RuntimeError, not a ValueError: the reference is a bundle this
+        # server hosts, and a 422 would send the caller to fix a request that
+        # is fine.
+        raise RuntimeError(
+            f"reference bundle unreadable: it holds no {what} whose name says "
+            f"which jaw it is (e.g. 'Gold_Upper.vtk')."
         )
     return merged
 
@@ -293,8 +296,13 @@ def orient_patient(
     max_triplets: int,
     seed: int,
     cache: "FileCache" = None,
+    patient=None,
 ) -> dict:
     """Orient one patient's jaws. Returns a report entry.
+
+    `patient`, when given, is `(index, total)`: a jaw that fails is logged
+    with it, since the report that also records the failure is deleted with
+    the job directory when the whole run fails.
 
     With `driving_jaw` set, that jaw's transform is applied to the other one as
     well -- occlusion is preserved by moving both halves rigidly together, which
@@ -333,6 +341,11 @@ def orient_patient(
                     cache,
                 )
             except (ios_icp.RegistrationError, surfaces.SurfaceError, ValueError) as exc:
+                logger.warning(
+                    "%s%s jaw: registration failed (%s: %s)",
+                    f"patient {patient[0]} of {patient[1]}: " if patient else "",
+                    jaw, type(exc).__name__, exc,
+                )
                 entry["jaws"][jaw] = {"status": "failed", "reason": str(exc)}
                 continue
 
