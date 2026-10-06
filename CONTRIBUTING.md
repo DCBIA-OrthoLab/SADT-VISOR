@@ -229,7 +229,17 @@ def run(scans: Path, reference: Path, output_dir: Path, *, sup=None) -> Path:
   and names the chain. The depth cap (5) is only a backstop for a chain that
   grows without repeating; the deepest real one is `AREG → ASO → ALI_CBCT`.
 - Five members, nothing more: `sup.run(tool, **params)`, `sup.out`, `sup.tmp`,
-  `sup.progress(fraction, message)`, `sup.log(message)`.
+  `sup.progress(fraction, message)`, `sup.log(message, level="info", user=False)`.
+  (The server's supervisor also answers `sup.channels()` and
+  `sup.declareQualityControl()`, which a tool looks up with `hasattr`.)
+- **Give each call its share of your bar.** `sup.run("ALI_CBCT", ...,
+  _progress=(0.2, 0.6))` says the call fills 0.2..0.6 of THIS tool's bar. The
+  server folds the callee's own 0..1 into that slice, at every depth, so the
+  clinician sees one bar that only moves forward instead of each tool's from
+  zero in turn. `_progress` is the supervisor's and never reaches the callee.
+  One slice per call: two calls in a loop each get their own, the way
+  `progress.report(start=, end=)` slices a loop. Without it the call simply
+  weighs nothing on your bar.
 - **`sup.progress` is not a reason to take a supervisor.** It is one of the
   five members and it still works -- it writes to the same place a tool's own
   `progress.py` does -- but reporting progress needs no supervisor at all. See
@@ -293,6 +303,32 @@ for index, scan in enumerate(found, start=1):
   of 5". Interpolating a number a tool cannot know is worse than no bar.
 - `run_tool.py` sets the variable itself and echoes what a tool appends, so
   running a tool from a checkout exercises the same channel the server uses.
+- Each record also carries the supervised call it came from and its depth,
+  read from the environment the server sets for a nested call. That is what
+  lets a caller's `_progress` span fold this tool's bar into its own.
+
+### Say what happened, to the right person
+
+```python
+progress.log("3 of 7 landmarks found; orienting on those", level="warning")
+progress.log("scan 4 of 12 has no mandible and was skipped", level="warning", user=True)
+```
+
+`progress.log(message, level="info", user=False)` -- or `sup.log(...)`, the
+same line, for a tool that already has a supervisor -- writes one log line
+into the run's events. `level` is `debug`, `info`, `warning` or `error`.
+
+- `user=False` (the default) is for whoever runs the server: it reaches the
+  operator page, with paths, file names and identifiers redacted, and a warning
+  or error is kept with the run's history -- the place to say why a run took
+  the path it took.
+- `user=True` is for the clinician who started the run and reaches their
+  panel: an item skipped, a result to double-check.
+- **The progress-message rule holds for both**: position in the batch, never
+  a file or a patient's name. The redaction on the operator's side is a net,
+  not a licence.
+- A failure needs no log line. The server records which tool raised, at which
+  line of its source, during which stage, and shows it to the operator.
 
 Check the result before going further:
 
