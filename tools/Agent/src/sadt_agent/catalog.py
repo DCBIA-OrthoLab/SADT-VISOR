@@ -31,6 +31,7 @@ own bug (`CatalogError`, 500).
 """
 
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -38,6 +39,8 @@ import urllib.request
 
 from .errors import CatalogError, ToolInputError, ToolUnavailableError
 from .llm import is_timeout
+
+logger = logging.getLogger("Agent")
 
 # What the server sets so a tool can reach it. Read only when `catalog` is not
 # supplied, and only to build `<value>/tools`.
@@ -49,12 +52,44 @@ API_ENV = "SADT_API"
 # invents one proposes writing outside the job.
 SERVER_FILLED = ("output_dir",)
 
-# Every type `scripts/describe.py` can emit. Anything else in a catalogue is a
-# tool this agent cannot fill parameters for, so it is refused loudly rather
-# than routed to with values of an unknown shape.
+# Every type `scripts/describe.py` can emit, which is what a `catalog_file`
+# holds. `vec2` is two numbers set together (FlexReg's butterfly corners).
 SCALAR_TYPES = ("path", "str", "int", "float", "bool")
 LIST_TYPES = tuple("list[{}]".format(scalar) for scalar in SCALAR_TYPES)
-KNOWN_TYPES = SCALAR_TYPES + LIST_TYPES
+VEC2_TYPE = "vec2"
+KNOWN_TYPES = SCALAR_TYPES + LIST_TYPES + (VEC2_TYPE,)
+
+# What GET /tools publishes is NOT the schema describe.py wrote: the server
+# folds each schema into its own ArgSpec vocabulary first (VISOR-serve,
+# `server/registry/schema_tool.py`). A `str` or `list[str]` carrying `choices`
+# goes out as "choice" or "multichoice", with `choices` as an
+# {option: selected by default} mapping and no `default`; every list collapses
+# to "list[str]"; and a tool registered in-process declares file types such as
+# "csv_file" or "folder". Each is read back here as the type it stands for, so
+# the rest of the agent sees one vocabulary whatever the source.
+CHOICE_WIRE_TYPE = "choice"
+MULTICHOICE_WIRE_TYPE = "multichoice"
+WIRE_ALIASES = {
+    CHOICE_WIRE_TYPE: "str",
+    MULTICHOICE_WIRE_TYPE: "list[str]",
+    "file": "path",
+    "folder": "path",
+}
+# Every other server file type is named `<something>_file` (`nifti_file`,
+# `surface_or_zip_file`, ...); the set grows with the server, so it is matched
+# by its suffix rather than copied here.
+FILE_TYPE_SUFFIX = "_file"
+
+
+def canonical_type(declared: str):
+    """The agent type a published type stands for, or None when it is unknown."""
+    if declared in KNOWN_TYPES:
+        return declared
+    if declared in WIRE_ALIASES:
+        return WIRE_ALIASES[declared]
+    if declared.endswith(FILE_TYPE_SUFFIX):
+        return "path"
+    return None
 
 
 def load_catalog(catalog_path, timeout_seconds: int = 30):
@@ -223,30 +258,63 @@ def _normalise_argument(tool: str, argument: str, spec):
     declared = spec.get("type")
     if not isinstance(declared, str) or not declared:
         raise ToolInputError("{} declares no 'type'.".format(where))
-    if declared not in KNOWN_TYPES:
-        raise ToolInputError(
-            "{} is of type {!r}, which this agent cannot fill. Known types: "
-            "{}.".format(where, declared, ", ".join(KNOWN_TYPES))
-        )
-
-    choices = spec.get("choices")
-    if choices is not None and not isinstance(choices, list):
-        raise ToolInputError("{} has a non-list 'choices'.".format(where))
 
     normalised = {
         "type": declared,
         "required": bool(spec.get("required", False)),
         "description": (spec.get("description") or "").strip(),
     }
-    if choices is not None:
-        normalised["choices"] = list(choices)
-    if "default" in spec:
-        normalised["default"] = spec["default"]
     # Presentation, carried through untouched so the prompt can leave a
     # technical argument out of what a clinician is asked about.
     for key in ("hidden", "label", "section"):
         if key in spec:
             normalised[key] = spec[key]
+
+    kind = canonical_type(declared)
+    if kind is None:
+        # One argument of a type this agent has never seen must not take the
+        # whole catalogue down with it: the server grows its vocabulary on its
+        # own schedule, and every other tool is still perfectly routable. The
+        # argument is kept OPAQUE -- never offered to the model, never filled --
+        # so a tool that requires it is reported as missing that argument
+        # rather than run with a value of a shape nobody checked.
+        logger.warning(
+            "%s is of type %r, which this agent cannot fill; it is left to the "
+            "caller.", where, declared,
+        )
+        normalised["opaque"] = True
+        return normalised
+    normalised["type"] = kind
+
+    choices = spec.get("choices")
+    default_from_choices = None
+    if isinstance(choices, dict):
+        # The server's shape: {option: selected by default}, in declaration
+        # order. The options are the keys; the ticked ones are the default the
+        # schema's `default` was folded into.
+        ticked = [option for option, selected in choices.items() if selected]
+        default_from_choices = ticked if kind.startswith("list[") else (
+            ticked[0] if ticked else None
+        )
+        choices = list(choices)
+    if choices is not None and not isinstance(choices, list):
+        raise ToolInputError("{} has a non-list 'choices'.".format(where))
+    if choices is not None:
+        normalised["choices"] = list(choices)
+
+    if "default" in spec:
+        normalised["default"] = spec["default"]
+    elif default_from_choices is not None:
+        normalised["default"] = default_from_choices
+    elif spec.get("initial") is not None:
+        # GET /tools publishes a scalar's default as `initial`.
+        normalised["default"] = spec["initial"]
+
+    if kind == VEC2_TYPE:
+        # The ranges are part of what the server validates, not presentation.
+        for key in ("x_range", "y_range"):
+            if spec.get(key) is not None:
+                normalised[key] = spec[key]
     return normalised
 
 
@@ -280,19 +348,39 @@ def fillable_arguments(tool):
     `output_dir` is excluded because the server fills it with the job's own
     output folder; a hidden argument is excluded because it is a technical knob
     the tool's author decided not to put in front of a clinician, and the model
-    has no better basis for setting it than the tool's own default does.
+    has no better basis for setting it than the tool's own default does. An
+    opaque argument is excluded because its shape is unknown here.
     """
     return {
         name: spec
         for name, spec in tool["arguments"].items()
-        if name not in SERVER_FILLED and not spec.get("hidden", False)
+        if name not in SERVER_FILLED
+        and not spec.get("hidden", False)
+        and not spec.get("opaque", False)
     }
 
 
 def missing_required(tool, arguments):
-    """Required arguments the caller still has to supply, in signature order."""
+    """Required arguments the caller still has to supply, in signature order.
+
+    A required opaque argument counts: the agent cannot fill it, so a proposal
+    without it is incomplete, and the run is refused rather than sent to fail.
+    """
     return [
         name
-        for name, spec in fillable_arguments(tool).items()
-        if spec.get("required", False) and name not in arguments
+        for name, spec in tool["arguments"].items()
+        if name not in SERVER_FILLED
+        and not spec.get("hidden", False)
+        and spec.get("required", False)
+        and name not in arguments
+    ]
+
+
+def opaque_arguments(tools):
+    """`tool.argument (type)` for every argument this agent cannot fill."""
+    return [
+        "{}.{} ({})".format(tool["name"], name, spec["type"])
+        for tool in tools
+        for name, spec in tool["arguments"].items()
+        if spec.get("opaque", False)
     ]

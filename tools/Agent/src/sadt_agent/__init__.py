@@ -185,6 +185,12 @@ def run(
         "history_turns": len(turns),
         "warnings": [],
     }
+    opaque = catalog.opaque_arguments(tools)
+    if opaque:
+        report["warnings"].append(
+            "The catalogue declares {} argument(s) of a type this agent cannot "
+            "fill; they are never proposed: {}.".format(len(opaque), ", ".join(opaque))
+        )
 
     if mode == MODE_ASK:
         decision = _ask(client, prompt, selected, turns, output_dir, report)
