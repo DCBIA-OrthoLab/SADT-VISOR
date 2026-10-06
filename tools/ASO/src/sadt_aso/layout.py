@@ -51,6 +51,11 @@ LAYOUT = {
     # CBCT references carry disjoint sets. Still an argument: naming one is how
     # a caller uses a reference of their own.
     "reference": {"section": _INPUTS, "label": "Reference", "hidden": True},
+    # For the tools that call this one: a neighbour asks for a frame BY NAME
+    # and this tool finds the bundle that defines it. A clinician's selection
+    # already settles the frame, as above, so the panel does not ask twice.
+    "frame": {"section": _INPUTS, "label": "Reference frame", "hidden": True,
+              "visible_when": _CBCT_ONLY},
     "modality": {"section": _INPUTS, "label": "Input Type"},
     # Derived from the data, per patient and per jaw: landmarks beside a scan
     # are landmarks to register on, a scan with none is one to predict or to

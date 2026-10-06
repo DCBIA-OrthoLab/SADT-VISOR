@@ -206,6 +206,7 @@ def test_the_published_options_are_the_catalogs_own():
     assert _choices("ios_occlusion") == list(catalogs.OCCLUSION_CHOICES)
     assert _choices("modality") == list(catalogs.MODALITY_CHOICES)
     assert _choices("automation") == list(catalogs.AUTOMATION_CHOICES)
+    assert _choices("frame") == list(catalogs.FRAME_CHOICES)
 
 
 def test_the_published_defaults_are_the_catalogs_own():
@@ -233,11 +234,14 @@ def test_mode_specific_arguments_are_optional():
     optional = (
         "modality", "automation", "landmarks", "landmark_model", "cbct_landmarks",
         "ios_teeth", "ios_landmark_types", "ios_jaws", "ios_occlusion", "dicom_input",
-        "output_suffix",
+        "output_suffix", "frame",
+        # Optional so a neighbour can ask for a frame without naming one of
+        # this tool's bundles; empty means "my own".
+        "reference",
     )
     for name in optional:
         assert parameters[name].default is not inspect.Parameter.empty, name
-    for name in ("input", "reference", "output_dir"):
+    for name in ("input", "output_dir"):
         assert parameters[name].default is inspect.Parameter.empty, name
 
 
@@ -2055,3 +2059,234 @@ def test_a_failed_ios_jaw_is_logged_with_its_patient_position(tmp_path, caplog):
     assert oriented.report["summary"]["failed"] == 1
     assert any(line.startswith("patient 1 of 2: Upper jaw: registration failed (")
                for line in _aso_messages(caplog, "WARNING"))
+
+
+# ---------------------------------------------------------------------------
+# Its own references: a caller names a FRAME, never one of this tool's bundles
+# ---------------------------------------------------------------------------
+
+_OCCLUSAL_POINTS = {
+    "ANS": np.array([0.0, 30.0, 5.0]),
+    "IF": np.array([0.0, 20.0, -5.0]),
+    "PNS": np.array([0.0, -10.0, 0.0]),
+    "UL6O": np.array([20.0, 5.0, -10.0]),
+    "UR1O": np.array([0.0, 28.0, -8.0]),
+    "UR6O": np.array([-20.0, 5.0, -10.0]),
+}
+
+
+def _own_models(tmp_path):
+    """DATA/ASO/models as the manifest stages it: both CBCT planes, the
+    intraoral bundle, and a landmark-weights folder that is no reference."""
+    data_root = tmp_path / "DATA"
+    models = data_root / "ASO" / "models"
+    _write_markups(
+        str(models / catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT] / "gold_lm.mrk.json"),
+        _REFERENCE_POINTS,
+    )
+    _write_markups(
+        str(models / catalogs.FRAME_BUNDLES[catalogs.FRAME_OCCLUSAL] / "gold_lm.mrk.json"),
+        _OCCLUSAL_POINTS,
+    )
+    for jaw, centroids in (("U", _UPPER_CENTROIDS), ("L", _LOWER_CENTROIDS)):
+        _write_mesh(str(models / "IOS_Gold_file" / f"Gold_{jaw}_Seg.vtk"), centroids)
+    (models / "CBCT_landmark_models" / "Ba" / "1").mkdir(parents=True)
+    return data_root
+
+
+def test_a_named_frame_resolves_its_own_bundle_from_the_data_root(tmp_path):
+    """What AREG and VFACE send now: the frame, by name, and no path."""
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input", points=_OCCLUSAL_POINTS)
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path="",
+        frame=catalogs.FRAME_OCCLUSAL,
+        data_root=data_root,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        # Empty: the landmarks the frame's own reference defines.
+        cbct_landmarks=[],
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_OCCLUSAL]
+    assert oriented.report["frame"] == catalogs.FRAME_OCCLUSAL
+    assert oriented.report["requested_landmarks"] == [
+        name for name in catalogs.CBCT_LANDMARKS if name in _OCCLUSAL_POINTS
+    ]
+    assert oriented.report["cases"]["patient1"]["status"] == "ok"
+
+
+def test_run_accepts_a_frame_in_place_of_a_reference(tmp_path):
+    """The same through `run()`, which is what the supervisor calls."""
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input")
+
+    output = run(input=tmp_path / "input", output_dir=tmp_path / "out",
+                 frame=catalogs.FRAME_FRANKFURT, automation=catalogs.AUTOMATION_SEMI,
+                 data_root=data_root)
+
+    report = _report(str(output))
+    assert report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT]
+    assert report["cases"]["patient1"]["status"] == "ok"
+
+
+def test_a_frame_picks_its_bundle_out_of_the_folder_the_server_hands_over(tmp_path):
+    """Over HTTP a hidden hosted-model argument arrives as the whole models
+    FOLDER. A frame named beside it still picks the bundle by name."""
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input", points=_OCCLUSAL_POINTS)
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path=str(data_root / "ASO" / "models"),
+        frame=catalogs.FRAME_OCCLUSAL,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(_OCCLUSAL_POINTS),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_OCCLUSAL]
+
+
+def test_with_no_reference_and_no_frame_the_selection_chooses_among_its_own(tmp_path):
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input")
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path="",
+        data_root=data_root,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(catalogs.DEFAULT_CBCT_LANDMARKS),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT]
+
+
+def test_a_reference_path_still_works_and_wins_over_a_frame(tmp_path):
+    """Path input is what an HTTP client and a caller with a reference of its
+    own still send, and a bundle named outright is obeyed."""
+    _cbct_case(tmp_path / "input")
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path=_cbct_reference(tmp_path),
+        frame=catalogs.FRAME_OCCLUSAL,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(catalogs.DEFAULT_CBCT_LANDMARKS),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == "gold"
+    assert oriented.report["cases"]["patient1"]["status"] == "ok"
+
+
+def test_an_intraoral_run_with_no_reference_finds_its_own_bundle(tmp_path):
+    """AREG's intraoral engine names no reference either: there is one
+    intraoral bundle, and it is this tool's."""
+    data_root = _own_models(tmp_path)
+    _ios_case(tmp_path / "input")
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path="",
+        data_root=data_root,
+        modality=catalogs.MODALITY_IOS,
+        automation=catalogs.AUTOMATION_FULLY,
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == "IOS_Gold_file"
+
+
+def test_a_frame_whose_bundle_is_not_staged_says_what_to_install(tmp_path):
+    data_root = tmp_path / "DATA"
+    (data_root / "ASO" / "models").mkdir(parents=True)
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolInputError) as raised:
+        dispatch.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path="",
+            frame=catalogs.FRAME_FRANKFURT,
+            data_root=data_root,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            output_dir=str(tmp_path / "out"),
+        )
+    assert catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT] in str(raised.value)
+    assert "setup-models" in str(raised.value)
+
+
+def test_no_reference_and_no_data_root_is_refused_clearly(tmp_path):
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolInputError, match="No 'reference' given"):
+        dispatch.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path="",
+            frame=catalogs.FRAME_FRANKFURT,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            output_dir=str(tmp_path / "out"),
+        )
+
+
+def test_an_unknown_frame_and_a_frame_on_intraoral_scans_are_refused(tmp_path):
+    with pytest.raises(ToolInputError, match="Unknown 'frame'"):
+        dispatch.orient(input_path=str(tmp_path), reference_path="", frame="Sideways",
+                        modality=catalogs.MODALITY_CBCT,
+                        automation=catalogs.AUTOMATION_SEMI,
+                        output_dir=str(tmp_path / "out"))
+    with pytest.raises(ToolInputError, match="CBCT reference frame"):
+        dispatch.orient(input_path=str(tmp_path), reference_path="",
+                        frame=catalogs.FRAME_FRANKFURT, modality=catalogs.MODALITY_IOS,
+                        automation=catalogs.AUTOMATION_FULLY,
+                        output_dir=str(tmp_path / "out"))
+
+
+def test_an_empty_selection_with_nothing_to_choose_by_is_refused(tmp_path):
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolInputError, match="name a frame"):
+        dispatch.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path="",
+            data_root=data_root,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            cbct_landmarks=[],
+            output_dir=str(tmp_path / "out"),
+        )
+
+
+def test_the_frame_bundles_are_the_ones_the_manifest_stages_for_aso():
+    """The names `FRAME_BUNDLES` resolves are only right while the manifest
+    unpacks the archives to them, under ASO's own folder."""
+    import importlib.util
+
+    repo = Path(__file__).resolve().parents[3]
+    script = repo / "scripts" / "fetch_data.py"
+    manifest_path = repo / "scripts" / "data-manifest.yml"
+    if not (script.is_file() and manifest_path.is_file()):
+        pytest.skip("the data manifest is not in this checkout")
+    spec = importlib.util.spec_from_file_location("fetch_data", script)
+    fetch_data = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch_data)
+
+    manifest = fetch_data._parse_manifest(str(manifest_path))
+    staged = {
+        os.path.relpath(fetch_data._target_path("DATA", entry),
+                        os.path.join("DATA", "ASO", "models"))
+        for entry in fetch_data._entries(manifest, "models", ["ASO"])
+    }
+    for bundle in catalogs.FRAME_BUNDLES.values():
+        assert bundle in staged, bundle

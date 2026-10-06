@@ -27,8 +27,9 @@ LAYOUT = {
     # way to get it wrong. The server hands a hidden hosted-model argument the
     # whole of `DATA/AMASSS/models/`, and `pipeline.resolve_models` already
     # descends into a bundle wrapped in one top-level folder -- which is exactly
-    # that shape. Still required by `run()`, so a direct call with no server
-    # behaves as it always did.
+    # that shape. Left empty, `run()` resolves the same bundle from the data
+    # root itself, which is what a neighbour calling through the supervisor
+    # relies on.
     "model": {"hidden": True},
     "structures": {
         # Chips rather than a column of check boxes, and no tabs: nine options
