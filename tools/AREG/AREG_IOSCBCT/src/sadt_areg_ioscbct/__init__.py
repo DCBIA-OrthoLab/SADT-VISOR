@@ -69,7 +69,6 @@ def run(
     output_suffix: str = "Reg",
     *,
     sup=None,
-    data_root=None,
 ) -> Path:
     """Register an intraoral scan onto a CBCT of the same patient.
 
@@ -88,8 +87,9 @@ def run(
             first, which needs a reference.
         ios_landmarks: Registration mode. Your own intraoral landmarks.
         cbct_landmarks: Registration mode. Your own CBCT landmarks.
-        cbct_reference: The frame the CBCT volumes are oriented onto before
-            registering.
+        cbct_reference: A reference bundle to orient the CBCT volumes onto
+            instead of the Frankfurt horizontal frame ASO holds. Left empty --
+            the normal case -- ASO resolves its own.
         landmark_model: The CBCT landmark bundle, for the modes that predict.
         ios_landmark_model: The intraoral landmark bundle.
         crown_model: The crown-labelling checkpoint, for the modes that label.
@@ -115,6 +115,5 @@ def run(
         ios_landmark_model=ios_landmark_model, crown_model=crown_model,
         max_dist=max_dist, output_suffix=output_suffix,
         orient_cbct_first=orient_cbct_first, sup=sup,
-        data_root=data_root,
     )
     return output_dir

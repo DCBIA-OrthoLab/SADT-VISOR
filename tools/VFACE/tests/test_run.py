@@ -34,10 +34,9 @@ def request(tmp_path, **overrides):
         "study": catalogs.STUDY_ASYMMETRY,
         "outputs": catalogs.OUTPUT_QUANTITATIVE,
         "measurements": write_measurement_lists(tmp_path / "lists"),
-        "cranial_base_reference": str(tmp_path / "models" / "cb_gold"),
-        "maxilla_reference": str(tmp_path / "models" / "max_gold"),
+        # VFACE's own bundle. AMASSS's model and ASO's references are named by
+        # nobody: each of those tools resolves its own.
         "mirror_reference": str(tmp_path / "models" / "mirror.tfm"),
-        "segmentation_model": str(tmp_path / "models" / "amasss"),
         "landmark_model": str(tmp_path / "models" / "ali"),
     }
     arguments.update(overrides)
@@ -393,10 +392,54 @@ def test_a_measurement_folder_missing_a_region_names_which(tmp_path):
     assert "Mandible" in str(raised.value)
 
 
-def test_registering_with_no_segmentation_bundle_is_refused(tmp_path):
+def test_no_other_tools_model_or_reference_is_sent(tmp_path):
+    """Every tool owns its model. AMASSS is asked for structures and names no
+    weights; ASO is asked for a frame by name and handed none of its own
+    bundles. Both resolve theirs from their own data folders."""
     sup = PipelineSup(tmp_path)
-    with pytest.raises(ToolInputError, match="segmentation_model"):
-        run(sup=sup, **request(tmp_path, segmentation_model=""))
+    run(sup=sup, **request(tmp_path))
+
+    for params in sup.asked("AMASSS"):
+        assert "model" not in params
+    sent = sup.asked("ASO")
+    assert sent
+    for params in sent:
+        assert "reference" not in params
+    assert sorted(params["frame"] for params in sent) == [
+        "Frankfurt horizontal", "Occlusal plane"]
+
+
+def test_a_deployment_with_none_of_the_neighbours_bundles_still_runs(tmp_path):
+    """What production looked like: DATA/VFACE/ holds VFACE's own bundles and
+    nothing of AMASSS's or ASO's. The run used to refuse there."""
+    data_root = tmp_path / "DATA"
+    (data_root / "VFACE" / "models" / "Mirror_matrix").mkdir(parents=True)
+    (data_root / "VFACE" / "models" / "Mirror_matrix" / "Matrix_mirror.tfm").write_text("")
+    sup = PipelineSup(tmp_path)
+
+    run(sup=sup, data_root=data_root, **request(tmp_path, mirror_reference=""))
+
+    assert sup.asked("AMASSS") and sup.asked("ASO")
+    for params in sup.asked("AutoMatrix"):
+        if params.get("same_transform_for_every_patient"):
+            assert params["transforms"] == str(
+                data_root / "VFACE" / "models" / "Mirror_matrix")
+
+
+def test_a_segmentation_model_or_reference_named_explicitly_is_still_obeyed(tmp_path):
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(
+        tmp_path,
+        segmentation_model=str(tmp_path / "models" / "amasss"),
+        cranial_base_reference=str(tmp_path / "models" / "cb_gold"),
+    ))
+
+    assert {params["model"] for params in sup.asked("AMASSS")} == {
+        str(tmp_path / "models" / "amasss")}
+    by_frame = {params["frame"]: params for params in sup.asked("ASO")}
+    assert by_frame["Frankfurt horizontal"]["reference"] == str(
+        tmp_path / "models" / "cb_gold")
+    assert "reference" not in by_frame["Occlusal plane"]
 
 
 def test_the_request_is_refused_before_a_single_volume_is_read(tmp_path):

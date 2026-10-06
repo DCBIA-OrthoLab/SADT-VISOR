@@ -149,9 +149,9 @@ LAYOUT = {
         "groups": catalogs.SEGMENTATION_GROUPS,
         "option_help": dict(catalogs.SEGMENTATION_CODES),
     },
-    # Not offered: the modes that segment segment with AMASSS, and the bundle
-    # is the one the deployment already publishes (see dispatch._own_segmentation).
-    # The argument stays, so a caller with a reason can still name another one.
+    # Not offered: the modes that segment segment with AMASSS, and AMASSS
+    # resolves its own model -- AREG names none. The argument stays, so a
+    # caller with a reason can still name another one.
     "segmentation_model": {
         "section": _REGISTRATION, "label": "Segmentation model",
         "visible_when": _SEGMENTED, "hidden": True,
@@ -179,10 +179,9 @@ LAYOUT = {
     # bundles deep -- which ASO cannot orient onto. The dropdown therefore
     # offered a list where every entry but one was wrong.
     #
-    # `dispatch._own_reference` answers instead: there is one frame the oriented
-    # mode means, the Frankfort horizontal and the mid-sagittal plane, and
-    # picking another silently changes what the registration is expressed in.
-    # The argument stays, so a caller with a reason can still name one.
+    # `orientation` answers instead: AREG asks ASO for that frame by name, and
+    # ASO resolves the reference bundle that defines it from its own data
+    # folder. The argument stays, so a caller with a reason can still name one.
     "reference": {
         "hidden": True,
         "section": _ADVANCED, "label": "Orientation reference",

@@ -91,8 +91,14 @@ def _span(span) -> dict:
 
 
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
-                 landmark_model: str = "", span=None, **extra) -> str:
-    """Orient every case under `scan_dir` onto `reference_path`.
+                 landmark_model: str = "", span=None, frame: str = "", **extra) -> str:
+    """Orient every case under `scan_dir` into `frame`, or onto `reference_path`.
+
+    `frame` is the frame as ASO names it ("Frankfurt horizontal", "Occlusal
+    plane"). The reference bundles that define the frames are ASO's own, under
+    ASO's data folder, and ASO resolves the one a frame names -- AREG holds no
+    copy. `reference_path` is for a caller that named a bundle of its own, and
+    wins when given.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
     landmarks through ALI, for IOS it is the tooth-centroid alignment. Either
@@ -105,11 +111,14 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     logger.info("AREG: asking 'ASO' for oriented %s scans", modality)
     parameters = {
         "input": scan_dir,
-        "reference": reference_path,
         "modality": modality,
         "automation": "Fully-Automated",
         "output_suffix": "Or",
     }
+    if reference_path:
+        parameters["reference"] = reference_path
+    elif frame:
+        parameters["frame"] = frame
     # CBCT orientation is itself landmark-driven, and ASO needs the bundle
     # NAMED: it used to be optional because the server picked one matching the
     # input, and a tool no longer resolves paths. Forgetting it is a failure
@@ -120,10 +129,17 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     # ASO falls back to its own defaults -- the Frankfurt set -- which only
     # happen to match the Frankfurt reference: the occlusal one defines none of
     # them, and every run with it was refused before ALI was even asked.
+    #
+    # A reference named here is read for them. A frame is not AREG's to read:
+    # an EMPTY selection asks ASO for every landmark the frame's own reference
+    # defines, which is the same answer from the tool that holds the file.
     if modality == "CBCT" and "cbct_landmarks" not in extra:
-        labels = reference_landmarks(reference_path)
-        if labels:
-            parameters["cbct_landmarks"] = labels
+        if reference_path:
+            labels = reference_landmarks(reference_path)
+            if labels:
+                parameters["cbct_landmarks"] = labels
+        elif frame:
+            parameters["cbct_landmarks"] = []
     parameters.update(extra)
     return _returned(sup.run("ASO", **parameters, **_span(span)))
 
@@ -190,12 +206,17 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures, span=Non
     the packaged tool takes codes directly. The in-process version had to
     translate them into display names through AMASSS's own table; the schema
     publishes the codes now, so the translation is gone rather than restated.
+
+    `model_path` is sent only when a caller named one. There is one AMASSS
+    model and AMASSS resolves it from its own data folder; AREG naming it meant
+    keeping a copy under DATA/AREG/.
     """
     logger.info("AREG: asking 'AMASSS' for T1 masks (%s)", ", ".join(mask_structures))
+    weights = {"model": model_path} if model_path else {}
     return _returned(sup.run(
         "AMASSS",
         scans=scan_dir,
-        model=model_path,
+        **weights,
         structures=list(mask_structures),
         # One binary file per structure: `find_masks` looks each region's mask
         # up by name, and a merged multi-label volume would make every region

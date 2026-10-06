@@ -179,14 +179,9 @@ ORIENTATION_CHOICES = {
     ORIENTATION_OCCLUSAL: False,
 }
 
-# The bundle each frame is defined BY -- a reference defines its frame through
-# what it carries, so naming the bundle is naming the frame. These are the names
-# `scripts/data-manifest.yml` unpacks the two archives to under
-# DATA/AREG/models/.
-ORIENTATION_BUNDLES = {
-    ORIENTATION_FRANKFURT: "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
-    ORIENTATION_OCCLUSAL: "CBCT_Gold_Occlusal_Midsagittal_Plane",
-}
+# Which reference bundle defines each frame is ASO's to know: AREG asks ASO for
+# the frame by name (`AREG_CBCT.dispatch.ASO_FRAMES`) and ASO resolves the
+# bundle from its own data folder.
 
 
 # Tokens that name a region inside a mask's file name, matched as WHOLE tokens

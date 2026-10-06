@@ -87,7 +87,7 @@ def test_a_supervisor_that_is_there_is_not_refused(sup):
 def test_the_orientation_is_fully_automated_on_cbct(sup, tmp_path):
     frame = catalogs.FRAMES[catalogs.FRAME_CRANIAL_BASE]
     tools.orient_scans(
-        sup, str(tmp_path / "scans"), str(tmp_path / "ref"),
+        sup, str(tmp_path / "scans"), frame["aso_frame"],
         frame["landmarks"], frame["suffix"], str(tmp_path / "bundle"),
         label=catalogs.FRAME_CRANIAL_BASE,
     )
@@ -106,14 +106,14 @@ def test_each_frame_is_fitted_on_its_own_landmarks(sup, tmp_path):
     landmarks against the other's reference orients the scan onto nothing."""
     for frame_name, frame in catalogs.FRAMES.items():
         tools.orient_scans(
-            sup, str(tmp_path / "scans"), str(tmp_path / frame["reference"]),
+            sup, str(tmp_path / "scans"), frame["aso_frame"],
             frame["landmarks"], frame["suffix"], label=frame_name,
         )
     sent = [params for name, params in sup.calls if name == "ASO"]
     assert [params["cbct_landmarks"] for params in sent] == [
         catalogs.FRAMES[name]["landmarks"] for name in catalogs.FRAMES
     ]
-    assert len({params["reference"] for params in sent}) == len(catalogs.FRAMES)
+    assert len({params["frame"] for params in sent}) == len(catalogs.FRAMES)
 
 
 def test_the_two_orientations_land_apart_without_naming_a_folder(sup, tmp_path):
@@ -128,7 +128,7 @@ def test_the_two_orientations_land_apart_without_naming_a_folder(sup, tmp_path):
     produced = []
     for frame_name, frame in catalogs.FRAMES.items():
         produced.append(tools.orient_scans(
-            sup, str(tmp_path / "scans"), str(tmp_path / "ref"),
+            sup, str(tmp_path / "scans"), frame["aso_frame"],
             frame["landmarks"], frame["suffix"], label=frame_name))
     assert len(set(produced)) == len(produced)
     assert not [params for name, params in sup.calls
@@ -136,12 +136,40 @@ def test_the_two_orientations_land_apart_without_naming_a_folder(sup, tmp_path):
 
 
 def test_an_orientation_with_no_bundle_named_does_not_send_an_empty_one(sup, tmp_path):
-    """ASO resolves nothing itself. An empty path is not "use the default", it
-    is a path that does not exist."""
+    """An empty path is not "use the default", it is a path that does not
+    exist. Left out, ALI_CBCT resolves its own weights."""
     frame = catalogs.FRAMES[catalogs.FRAME_MAXILLA]
-    tools.orient_scans(sup, str(tmp_path / "scans"), str(tmp_path / "ref"),
+    tools.orient_scans(sup, str(tmp_path / "scans"), frame["aso_frame"],
                        frame["landmarks"], frame["suffix"])
     assert "landmark_model" not in sup.asked("ASO")
+
+
+def test_the_orientation_names_the_frame_and_never_one_of_asos_bundles(sup, tmp_path):
+    """The reference bundles are ASO's own. VFACE names the frame, and ASO
+    resolves the bundle that defines it from its own data folder."""
+    for frame_name, frame in catalogs.FRAMES.items():
+        tools.orient_scans(sup, str(tmp_path / "scans"), frame["aso_frame"],
+                           frame["landmarks"], frame["suffix"], label=frame_name)
+    sent = [params for name, params in sup.calls if name == "ASO"]
+    assert [params["frame"] for params in sent] == [
+        "Frankfurt horizontal", "Occlusal plane"]
+    assert not [params for params in sent if "reference" in params]
+
+
+def test_a_reference_the_caller_named_is_forwarded_as_an_override(sup, tmp_path):
+    frame = catalogs.FRAMES[catalogs.FRAME_MAXILLA]
+    tools.orient_scans(sup, str(tmp_path / "scans"), frame["aso_frame"],
+                       frame["landmarks"], frame["suffix"],
+                       reference=str(tmp_path / "own_reference"))
+    assert sup.asked("ASO")["reference"] == str(tmp_path / "own_reference")
+
+
+def test_the_frames_are_the_ones_aso_publishes():
+    """A frame name ASO does not offer is refused by ASO, after VFACE has
+    resampled the cohort. Spelled out rather than imported: the two tools
+    share no virtualenv."""
+    assert {entry["aso_frame"] for entry in catalogs.FRAMES.values()} == {
+        "Frankfurt horizontal", "Occlusal plane"}
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +179,7 @@ def test_an_orientation_with_no_bundle_named_does_not_send_an_empty_one(sup, tmp
 def test_the_masks_are_asked_for_one_file_per_structure(sup, tmp_path):
     """A region's mask is looked up by name. A merged multi-label volume makes
     every region resolve to the same file."""
-    tools.segment_masks(sup, str(tmp_path / "oriented"), str(tmp_path / "bundle"),
+    tools.segment_masks(sup, str(tmp_path / "oriented"),
                         ["CBMASK", "MANDMASK"], label="CB")
     asked = sup.asked("AMASSS")
     assert asked["merge"] == ["SEPARATE"]
@@ -164,9 +192,21 @@ def test_the_structures_of_a_frame_are_asked_for_in_one_call(sup, tmp_path):
     the cranial base frame's structures in one call is one pass over the scans
     rather than two."""
     structures = catalogs.structures_for(catalogs.FRAME_CRANIAL_BASE, catalogs.REGIONS)
-    tools.segment_masks(sup, str(tmp_path / "oriented"), str(tmp_path / "bundle"),
-                        structures, label="CB")
+    tools.segment_masks(sup, str(tmp_path / "oriented"), structures, label="CB")
     assert sup.asked("AMASSS")["structures"] == ["CBMASK", "MANDMASK"]
+
+
+def test_the_masks_are_asked_for_without_naming_amassss_model(sup, tmp_path):
+    """There is one AMASSS model and it is AMASSS's: it resolves it from its
+    own data folder. VFACE naming it meant holding a copy under its own."""
+    tools.segment_masks(sup, str(tmp_path / "oriented"), ["CBMASK"], label="CB")
+    assert "model" not in sup.asked("AMASSS")
+
+
+def test_a_segmentation_model_the_caller_named_is_forwarded(sup, tmp_path):
+    tools.segment_masks(sup, str(tmp_path / "oriented"), ["CBMASK"], label="CB",
+                        model=str(tmp_path / "bundle"))
+    assert sup.asked("AMASSS")["model"] == str(tmp_path / "bundle")
 
 
 def test_the_structures_asked_for_are_masks_not_segmentations():
@@ -269,7 +309,7 @@ def test_the_surfaces_are_asked_for_with_the_bundle_named(sup, tmp_path):
 # ---------------------------------------------------------------------------
 
 class TestTheBundlesVfaceResolvesItself:
-    """`models/` holds six bundles at once, so an unnamed argument arrived as
+    """`models/` holds every bundle at once, so an unnamed argument arrived as
     that FOLDER and the run died after the segmentation and the orientation had
     already been paid for. None of them is a clinical choice, so the panel asks
     for none and the deployment names them instead."""
@@ -295,8 +335,54 @@ class TestTheBundlesVfaceResolvesItself:
         from sadt_vface import dispatch
 
         root = self._root(tmp_path)
-        assert dispatch._own_bundle(root, "segmentation_model") == ""
-        assert dispatch._own_bundle(None, "segmentation_model") == ""
+        assert dispatch._own_bundle(root, "classifier_model") == ""
+        assert dispatch._own_bundle(None, "classifier_model") == ""
+
+    @pytest.mark.parametrize("argument", [
+        "segmentation_model", "cranial_base_reference", "maxilla_reference",
+    ])
+    def test_another_tools_bundle_is_not_resolved_here(self, tmp_path, argument):
+        """Every tool owns its model. The segmentation weights are AMASSS's and
+        the orientation references ASO's, and each resolves its own -- so
+        VFACE neither names them nor keeps copies under DATA/VFACE/."""
+        from sadt_vface import dispatch
+
+        assert argument not in dispatch._BUNDLES
+        root = self._root(tmp_path, "AMASSS_Models",
+                          "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
+                          "CBCT_Gold_Occlusal_Midsagittal_Plane")
+        assert dispatch._own_bundle(root, argument) == ""
+
+    def test_every_bundle_it_resolves_is_staged_by_its_manifest_entries(self):
+        """The names in `_BUNDLES` are only right while the manifest unpacks
+        VFACE's archives to them. A name the manifest does not stage is a
+        bundle no deployment has -- which is how the classifier came to be
+        asked for as `VFACE_classifier` while it was unpacked as
+        `V_FACE_Models`, and the mirror never staged at all. Read with the
+        fetch script's own parser, so the two cannot disagree on what a
+        manifest entry means."""
+        import importlib.util
+        from pathlib import Path
+
+        from sadt_vface import dispatch
+
+        repo = Path(__file__).resolve().parents[3]
+        script = repo / "scripts" / "fetch_data.py"
+        manifest_path = repo / "scripts" / "data-manifest.yml"
+        if not (script.is_file() and manifest_path.is_file()):
+            pytest.skip("the data manifest is not in this checkout")
+        spec = importlib.util.spec_from_file_location("fetch_data", script)
+        fetch_data = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fetch_data)
+
+        manifest = fetch_data._parse_manifest(str(manifest_path))
+        models = os.path.join("DATA", dispatch._DATA_NAME, "models")
+        staged = {
+            os.path.relpath(fetch_data._target_path("DATA", entry), models)
+            for entry in fetch_data._entries(manifest, "models", [dispatch._DATA_NAME])
+        }
+        missing = sorted(set(dispatch._BUNDLES.values()) - staged)
+        assert not missing, f"not staged by any VFACE manifest entry: {missing}"
 
     def test_the_landmark_bundle_is_not_resolved_here(self, tmp_path):
         """ALI_CBCT resolves its own weights from the same data root, so the

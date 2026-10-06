@@ -126,7 +126,7 @@ answer where "deploy a tool" is not.
 |---|---|
 | Inputs | `t1`: a folder of CBCT volumes. `t2` for a longitudinal study only. `measurements`: one measurement list per region. `feature_template`: the features the classifier was trained on. `registration_transforms` for `File already Registered`. |
 | Outputs | `Measurements/Measurements_{CB,MAND,MAX}.xlsx`, `Measurements/PostProcess_Measurements.xlsx`, `Classification/Classification.xlsx`, `Heat maps/<region>/`, plus `VFACE_report.json`. |
-| Model files | `segmentation_model` (AMASSS), `landmark_model` (ALI_CBCT), `surface_model` (Batch_Dental_Seg), `classifier_model` (the three asymmetry models), `cranial_base_reference` / `maxilla_reference` (orientation), `mirror_reference` (the reflection). All named so the server publishes them as hosted names rather than uploads. |
+| Model files | VFACE's own, resolved from `DATA/VFACE/models/` when left empty: `classifier_model` (`VFACE_classifier`, the three asymmetry models), `mirror_reference` (`Mirror_matrix`, the reflection), `measurements` / `feature_template` (`DefaultList`). The neighbours own theirs: AMASSS segments with its own model, ASO orients into each frame (named, not pathed) with its own reference, ALI_CBCT predicts with its own weights. `segmentation_model`, `cranial_base_reference` / `maxilla_reference` and `landmark_model` remain as overrides a caller may name. `surface_model` (Batch_Dental_Seg) must still be named for heat maps. All named so the server publishes them as hosted names rather than uploads. |
 | GPU | None of its own. Every network it needs belongs to another tool. |
 
 Four things worth knowing before reading a result:

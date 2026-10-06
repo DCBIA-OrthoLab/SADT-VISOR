@@ -93,7 +93,8 @@ def _span(span) -> dict:
 
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
                  landmark_model: str = "", span=None, **extra) -> str:
-    """Orient every case under `scan_dir` onto `reference_path`.
+    """Orient every case under `scan_dir` onto `reference_path`, or onto ASO's
+    own reference when none is named.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
     landmarks through ALI, for IOS it is the tooth-centroid alignment. Either
@@ -106,7 +107,6 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     logger.info("AREG: asking 'ASO' for oriented %s scans", modality)
     parameters = {
         "input": scan_dir,
-        "reference": reference_path,
         "modality": modality,
         "automation": "Fully-Automated",
         "output_suffix": "Or",
@@ -117,6 +117,10 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     # three tools down, so it is passed explicitly and required by _check_cbct.
     if modality == "CBCT" and landmark_model:
         parameters["landmark_model"] = landmark_model
+    # Sent only when a caller named one. The reference bundles are ASO's own,
+    # and with none named ASO orients onto the one it holds for the modality.
+    if reference_path:
+        parameters["reference"] = reference_path
     parameters.update(extra)
     return _returned(sup.run("ASO", **parameters, **_span(span)))
 

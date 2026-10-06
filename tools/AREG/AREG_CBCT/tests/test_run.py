@@ -435,7 +435,7 @@ def test_a_reference_without_markups_leaves_aso_its_own_choice(tmp_path):
 def test_the_real_shipped_references_name_their_own_landmarks():
     """Read from the bundles this deployment stages, when they are here."""
     import os as _os
-    root = _os.environ.get("AREG_REFERENCE_ROOT", "/home/luciacev/code/VISOR-serve/DATA/AREG/models")
+    root = _os.environ.get("AREG_REFERENCE_ROOT", "/home/luciacev/code/VISOR-serve/DATA/ASO/models")
     occlusal = _os.path.join(root, "CBCT_Gold_Occlusal_Midsagittal_Plane")
     frankfurt = _os.path.join(root, "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane")
     if not (_os.path.isdir(occlusal) and _os.path.isdir(frankfurt)):
@@ -477,8 +477,8 @@ class TestArgumentRules:
             with pytest.raises(ToolInputError, match="masks you provide"):
                 self._main()
 
-    def test_the_oriented_mode_without_a_reference_is_refused(self):
-            with pytest.raises(ToolInputError, match="orientation reference"):
+    def test_the_oriented_mode_without_a_frame_is_refused(self):
+            with pytest.raises(ToolInputError, match="needs a frame to orient into"):
                 self._main(automation=catalogs.AUTOMATION_ORIENTED)
 
     def test_a_suffix_that_is_a_path_is_refused(self):
@@ -510,62 +510,45 @@ class TestArgumentRules:
 
 
 
-def test_fully_automated_without_segmentation_weights_is_refused_up_front():
-    """AMASSS receives None otherwise, and fails on
+def test_amasss_is_asked_for_masks_without_naming_its_model(tmp_path):
+    """There is one AMASSS model and AMASSS resolves it from its own data
+    folder. AREG naming it meant keeping a copy under DATA/AREG/."""
+    planted = tmp_path / "masks"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted})
 
-        TypeError: expected str, bytes or os.PathLike object, not NoneType
+    tools.segment_masks(sup, str(tmp_path / "scans"), "", ["CBMASK"])
 
-    fifteen seconds in, inside a child process, reaching the caller as "Tool
-    execution failed". The tool is reachable; what is missing is which weights.
-    """
-    with pytest.raises(ToolInputError, match="segmentation_model"):
-        dispatch._check_cbct(
-            automation=catalogs.AUTOMATION_FULLY,
-            regions=["Cranial base"],
-            t1_masks=None,
-            reference=None,
-            segmentation_model=None,
-            sup=FakeSup("/tmp/areg-rules"),
-        )
+    tool, params = sup.calls[0]
+    assert tool == "AMASSS"
+    assert "model" not in params
+    assert params["structures"] == ["CBMASK"]
 
 
-def test_the_segmentation_bundle_is_found_without_anybody_naming_it(tmp_path):
-    """The modes that segment segment with AMASSS, and one bundle answers.
+def test_a_segmentation_model_the_caller_named_is_forwarded(tmp_path):
+    planted = tmp_path / "masks"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted})
 
-    Asking a clinician which folder to use was asking a question with a single
-    possible answer, in a panel where getting it wrong surfaces fifteen seconds
-    into a child process. So the tool looks where the deployment puts it.
-    """
-    bundle = tmp_path / "AREG" / "models" / "AMASSS_Models"
-    (bundle / "MAND").mkdir(parents=True)
-    assert dispatch._own_segmentation(tmp_path) == str(bundle)
+    tools.segment_masks(sup, str(tmp_path / "scans"), "/models/AMASSS", ["CBMASK"])
+
+    assert sup.calls[0][1]["model"] == "/models/AMASSS"
 
 
-def test_a_data_root_without_the_bundle_resolves_to_nothing(tmp_path):
-    """Not an exception: the ONE refusal below is what tells the caller what is
-    missing, and two places saying it is two places to keep in step."""
-    (tmp_path / "AREG" / "models").mkdir(parents=True)
-    assert dispatch._own_segmentation(tmp_path) == ""
+def test_aso_is_asked_for_a_frame_by_name_when_no_reference_is_named(tmp_path):
+    """The reference bundles are ASO's own. An empty `cbct_landmarks` asks
+    for every landmark the frame's reference defines, which only ASO can read."""
+    planted = tmp_path / "oriented"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
 
+    tools.orient_scans(sup, str(tmp_path / "scans"), "", "CBCT",
+                       frame="Occlusal plane")
 
-def test_no_data_root_resolves_to_nothing_rather_than_guessing():
-    """A tool run from a checkout has no data root at all; it must not turn
-    that into a path relative to the working directory."""
-    assert dispatch._own_segmentation(None) == ""
-
-
-def test_the_refusal_says_which_bundle_is_missing_and_where():
-    """"Name a bundle" is unactionable when the panel no longer offers the
-    field: what the operator needs is the folder to populate."""
-    with pytest.raises(ToolInputError, match="AMASSS_Models"):
-        dispatch._check_cbct(
-            automation=catalogs.AUTOMATION_FULLY,
-            regions=["Cranial base"],
-            t1_masks=None,
-            reference=None,
-            segmentation_model=None,
-            sup=FakeSup("/tmp/areg-rules"),
-        )
+    params = sup.calls[0][1]
+    assert params["frame"] == "Occlusal plane"
+    assert "reference" not in params
+    assert params["cbct_landmarks"] == []
 
 
 # ---------------------------------------------------------------------------

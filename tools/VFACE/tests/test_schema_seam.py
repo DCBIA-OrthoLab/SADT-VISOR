@@ -112,14 +112,14 @@ def assert_sends_only_declared_arguments(name, params):
 def test_the_orientation_request_matches_asos_schema(tmp_path):
     sup = RecordingSup(tmp_path)
     frame = catalogs.FRAMES[catalogs.FRAME_CRANIAL_BASE]
-    tools.orient_scans(sup, str(tmp_path / "scans"), "/models/gold",
+    tools.orient_scans(sup, str(tmp_path / "scans"), frame["aso_frame"],
                        frame["landmarks"], frame["suffix"], "/models/ali")
     assert_sends_only_declared_arguments("ASO", sup.calls[0][1])
 
 
 def test_the_mask_request_matches_amasss_schema(tmp_path):
     sup = RecordingSup(tmp_path)
-    tools.segment_masks(sup, str(tmp_path / "oriented"), "/models/amasss", ["CB", "MAND"])
+    tools.segment_masks(sup, str(tmp_path / "oriented"), ["CB", "MAND"])
     assert_sends_only_declared_arguments("AMASSS", sup.calls[0][1])
 
 

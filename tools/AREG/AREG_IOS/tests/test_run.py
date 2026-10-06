@@ -1024,12 +1024,45 @@ class TestTheModelFieldsThisEngineFillsItself:
         assert dispatch._own_bundle(root, dispatch._REGISTRATION_BUNDLE) == str(
             tmp_path / "AREG" / "models" / "AREG_model")
 
-    def test_the_orientation_reference_is_found_the_same_way(self, tmp_path):
+    def test_the_orientation_reference_is_not_resolved_here(self, tmp_path):
+        """The intraoral reference arches are ASO's own. A copy staged under
+        DATA/AREG/ is ignored, and ASO is asked with no reference at all."""
         from sadt_areg_ios import dispatch
 
-        root = self._data_root(tmp_path, "IOS_Gold_files")
-        assert dispatch._own_bundle(root, dispatch._ORIENTATION_REFERENCE) == str(
-            tmp_path / "AREG" / "models" / "IOS_Gold_files")
+        root = self._data_root(tmp_path, "AREG_model", "IOS_Gold_files")
+        captured = {}
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop here")
+
+        original = dispatch.register
+        dispatch.register = spy
+        try:
+            dispatch.main(
+                automation="Fully-Automated", t1=str(tmp_path), t2=str(tmp_path),
+                output_dir=str(tmp_path), data_root=root,
+                sup=object(),
+            )
+        except RuntimeError:
+            pass
+        finally:
+            dispatch.register = original
+        assert captured.get("orientation_reference") is None
+        assert not hasattr(dispatch, "_ORIENTATION_REFERENCE")
+
+    def test_aso_is_asked_to_orient_with_no_reference_of_areg(self, tmp_path):
+        from sadt_areg_ios import tools
+
+        planted = tmp_path / "oriented"
+        planted.mkdir()
+        sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
+        tools.orient_scans(sup, str(tmp_path / "scans"), "", "IOS")
+
+        tool, params = sup.calls[0]
+        assert tool == "ASO"
+        assert "reference" not in params
+        assert params["modality"] == "IOS"
 
     def test_a_deployment_publishing_neither_gets_an_empty_string(self, tmp_path):
         """Empty, not a path that does not exist: the checks downstream say what

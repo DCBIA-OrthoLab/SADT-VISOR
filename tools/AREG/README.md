@@ -92,7 +92,7 @@ usually is not -- and it is what makes this usable standalone.
 |---|---|
 | Inputs | `t1` and `t2`: folders of CBCT scans, or of intra-oral meshes, paired by patient name. `output_dir`: where results go. |
 | Outputs | Per patient and per region: the registered T2 and the transform that produced it, plus `AREG_report.json`. |
-| Model files | `segmentation_model` (AMASSS bundle), `cbct_reference` / `ios_reference` (orientation), `registration_model` (the IOS patch network). All named so the server publishes them as hosted names rather than uploads. |
+| Model files | `registration_model` (the IOS patch network), resolved from `DATA/AREG/models/` when left empty. The masks and the orientation are other tools' work, and each owns its model: AMASSS segments with its own bundle, ASO orients into the frame AREG names with its own reference. `segmentation_model`, `reference` / `cbct_reference` / `ios_reference` remain as overrides a caller may name. All named so the server publishes them as hosted names rather than uploads. |
 | GPU | The IOS patch network uses it. The CBCT engine is elastix on the CPU. |
 
 Three behaviours worth knowing before reading a result:

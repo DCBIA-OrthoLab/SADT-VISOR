@@ -151,8 +151,9 @@ def _returned(produced) -> str:
 # The calls
 # ---------------------------------------------------------------------------
 
-def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
-                 landmark_model: str = "", label: str = "", span=None) -> str:
+def orient_scans(sup, scans: str, frame: str, landmarks, suffix: str,
+                 landmark_model: str = "", label: str = "", span=None,
+                 reference: str = "") -> str:
     """Orient a cohort into one frame.
 
     Fully-Automated, which for CBCT means ASO predicts the landmarks through
@@ -161,14 +162,19 @@ def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
     for the packaged tool rather than restaging its three parts is what keeps
     one description of "how a CBCT is oriented" in the repository.
 
+    `frame` is the frame as ASO names it, and ASO resolves the reference
+    bundle that defines it from its own data folder: the bundles are ASO's, and
+    VFACE holding their paths meant holding a copy of them. A `reference` a
+    caller named explicitly is still forwarded, as an override.
+
     `landmarks` is the frame's own list, and it is not a detail: the cranial
     base frame is fitted on Ba/S/N/Po/Or and the maxillary frame on the
-    occlusal points, and each `reference` is built on its own set.
+    occlusal points, and each reference is built on its own set.
     """
     logger.info("VFACE: asking 'ASO' to orient into the %s frame", label or "requested")
     parameters = {
         "input": scans,
-        "reference": reference,
+        "frame": frame,
         "modality": "CBCT",
         "automation": "Fully-Automated",
         "cbct_landmarks": list(landmarks),
@@ -180,28 +186,34 @@ def orient_scans(sup, scans: str, reference: str, landmarks, suffix: str,
     # request, not a forgotten one.
     if landmark_model:
         parameters["landmark_model"] = landmark_model
+    if reference:
+        parameters["reference"] = reference
     return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
-def segment_masks(sup, scans: str, model: str, structures, label: str = "",
-                  span=None) -> str:
+def segment_masks(sup, scans: str, structures, label: str = "", span=None,
+                  model: str = "") -> str:
     """Segment the bone the registration and the heat maps are keyed on.
 
     `merge=["SEPARATE"]` for the same reason AREG asks for it: one binary file
     per structure, so a region's mask can be looked up by name. A merged
     multi-label volume makes every region resolve to the same file.
+
+    No weights are named: there is one AMASSS model and AMASSS resolves it
+    from its own data folder. A `model` a caller named explicitly is still
+    forwarded, as an override.
     """
     logger.info("VFACE: asking 'AMASSS' for %s masks", ", ".join(structures))
-    return _returned(sup.run(
-        "AMASSS",
-        scans=scans,
-        model=model,
-        structures=list(structures),
-        merge=["SEPARATE"],
-        prediction_ID="seg",
-        generate_surface=False,
-        **_span(span),
-    ))
+    parameters = {
+        "scans": scans,
+        "structures": list(structures),
+        "merge": ["SEPARATE"],
+        "prediction_ID": "seg",
+        "generate_surface": False,
+    }
+    if model:
+        parameters["model"] = model
+    return _returned(sup.run("AMASSS", **parameters, **_span(span)))
 
 
 def mirror(sup, files: str, transform: str, content: str = "Automatic",

@@ -85,7 +85,6 @@ def run(
     num_workers: int = 0,
     *,
     sup=None,
-    data_root=None,
 ) -> Path:
     """Register a follow-up CBCT onto its baseline, so the two can be compared.
 
@@ -111,12 +110,14 @@ def run(
             skin does not register on it, and registering on the mandible does
             not return a mandible you can open. None by default -- a
             registration run returns a registration.
-        segmentation_model: The mask model bundle, for the modes that segment.
-            Left empty -- which is what a panel sends -- the AMASSS bundle this
-            deployment publishes for AREG is used, there being no second answer
-            to the question.
+        segmentation_model: A mask model bundle to use instead of AMASSS's
+            own, for the modes that segment. Left empty -- which is what a
+            panel sends -- AMASSS segments with the model it holds, there being
+            no second answer to the question.
         segmentation_label: Which label value in the masks to register on.
-        reference: The frame the scans are oriented onto before registering.
+        reference: A reference bundle to orient onto instead of the one ASO
+            holds for the frame named in `orientation`. Left empty -- the
+            normal case -- ASO resolves its own.
         landmark_model: The landmark bundle that orientation step predicts
             with.
         dicom_input: The inputs are DICOM series rather than volumes. Detected
@@ -156,5 +157,4 @@ def run(
         output_suffix=output_suffix,
         num_workers=num_workers,
         sup=sup,
-        data_root=data_root,
     )

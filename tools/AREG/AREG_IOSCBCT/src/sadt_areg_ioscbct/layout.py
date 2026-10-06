@@ -124,9 +124,10 @@ LAYOUT = {
     "landmark_model": {
         "hidden": True, "section": _MODELS, "label": "CBCT landmark bundle", "visible_when": _PREDICTED,
     },
-    # Not offered: one frame the chain expects (dispatch._own_reference), so there is nothing here for a
-    # clinician to decide and a wrong pick is a chain that predicts with the
-    # wrong weights.
+    # Not offered: one frame the chain expects (dispatch._ORIENTATION_FRAME),
+    # which ASO resolves from its own data folder, so there is nothing here for
+    # a clinician to decide and a wrong pick is a chain oriented into the wrong
+    # frame.
     "cbct_reference": {
         "hidden": True, "section": _MODELS, "label": "Orientation reference", "visible_when": _ORIENTED,
     },

@@ -224,28 +224,18 @@ def _match_landmarks(mesh_path: str, candidates: dict) -> dict:
     return {}
 
 
-# The DATA folder this engine's bundles live in, and the orientation reference
-# inside it. Written rather than derived, as AREG_CBCT writes its own: which
-# folder serves which engine is a deployment fact (the three AREG engines share
-# `DATA/AREG/`), and the bundle name is the one the manifest unpacks that
-# archive to.
+# The frame the CBCT is oriented into, in ASO's own words. ASO owns the
+# reference bundles that define its frames and resolves the one this names from
+# its own data folder; this engine holds no copy.
 #
-# Frankfurt rather than Occlusal, and this is a CHOICE a deployment can
-# reverse by naming the other in `cbct_reference`: the two planes carry
-# DISJOINT landmark sets, Frankfurt is the frame the shipped test data is
-# oriented into, and it is the anatomical convention a CBCT is read in. What it
-# must not be is a question asked of a clinician who has no way to know which
-# one the rest of the chain expects.
-_DATA_NAME = "AREG"
-_ORIENTATION_REFERENCE = "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane"
-
-
-def _own_reference(data_root):
-    """The orientation reference this deployment publishes, or ""."""
-    if not data_root:
-        return ""
-    candidate = os.path.join(str(data_root), _DATA_NAME, "models", _ORIENTATION_REFERENCE)
-    return candidate if os.path.isdir(candidate) else ""
+# Frankfurt rather than Occlusal, and this is a CHOICE a caller can override by
+# naming a reference bundle in `cbct_reference`: the two planes carry DISJOINT
+# landmark sets, Frankfurt is the frame the shipped test data is oriented into,
+# and it is the anatomical convention a CBCT is read in. What it must not be is
+# a question asked of a clinician who has no way to know which one the rest of
+# the chain expects. ASO's default landmark selection is this frame's set, so
+# nothing else needs naming.
+_ORIENTATION_FRAME = "Frankfurt horizontal"
 
 
 # How a run shares its bar, as fractions of the whole, per supervised call.
@@ -471,7 +461,7 @@ def derive_automation(automation: str, ios_landmarks, cbct_landmarks,
 def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landmarks=None,
          cbct_reference=None, landmark_model=None, ios_landmark_model=None,
          crown_model=None, max_dist=None, output_suffix="Reg",
-         orient_cbct_first=True, sup=None, data_root=None):
+         orient_cbct_first=True, sup=None):
     """Validate, fetch whatever the mode does not supply, then register."""
     started_at = time.monotonic()
     # Two of the three modes are written in the request; the third is a choice.
@@ -483,8 +473,8 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
     # `orient_cbct_first`, a box that says what it does, instead of being hidden
     # inside a three-valued mode nobody could map onto their own files.
     #
-    # `cbct_reference` cannot stand in for it either: this deployment resolves
-    # its own (`_own_reference`), so one is always present.
+    # `cbct_reference` cannot stand in for it either: it is an override, and
+    # left empty ASO orients into `_ORIENTATION_FRAME` with its own bundle.
     automation, automation_source = derive_automation(
         automation, ios_landmarks, cbct_landmarks, orient_cbct_first
     )
@@ -531,22 +521,12 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
                 tools.require(sup, name, f"{automation} IOSCBCT registration")
             if automation == catalogs.AUTOMATION_FULLY:
                 tools.require(sup, "ASO", "Fully-Automated IOSCBCT registration")
-                # Resolved here rather than asked for: there is one frame the
-                # rest of this chain expects, and picking the other silently
-                # changes what the landmarks mean.
-                cbct_reference = cbct_reference or _own_reference(data_root)
-                if not cbct_reference:
-                    raise ToolInputError(
-                        "Fully-Automated orients the CBCT first, which needs an "
-                        f"orientation reference. This deployment publishes none: "
-                        f"no '{_ORIENTATION_REFERENCE}' under "
-                        f"DATA/{_DATA_NAME}/models/. Add it "
-                        "(scripts/setup-models.sh --tool AREG), or name another "
-                        "in 'cbct_reference'."
-                    )
+                # The frame, not a bundle: there is one frame the rest of this
+                # chain expects, and ASO resolves the reference that defines it.
                 scans_sent = _count(cbct_root, _is_scan)
                 cbct_root = tools.orient_cbct(
-                    sup, cbct_root, cbct_reference, landmark_model, span=spans["orient"]
+                    sup, cbct_root, str(cbct_reference or ""), landmark_model,
+                    span=spans["orient"], frame=_ORIENTATION_FRAME,
                 )
                 _compare("ASO", "oriented CBCT(s)", scans_sent, _count(cbct_root, _is_scan))
                 produced_by["cbct"] = "ASO"
