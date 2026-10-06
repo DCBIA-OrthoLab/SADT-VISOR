@@ -649,29 +649,29 @@ def _register_cohort(root, out, **extra):
         regions=["Cranial base"], output_dir=str(out), **extra)
 
 
-def test_registrations_side_by_side_produce_what_one_at_a_time_does(tmp_path):
-    """Each registration is the same one-thread elastix run whichever process
-    it lands in, so the order they finish in is all that changes -- with one
-    caveat, measured: elastix's preprocessing sums in an order set by ITK's
-    thread count, and a worker gets its share of the run's threads rather than
-    all of them. Same thread count, identical to the bit; different, the
-    transform moves by about 1e-10 mm. That already happens between two runs
-    the server granted different cores, and it is noise by eight orders of
-    magnitude against the 0.03 mm separating this port from the original.
+def test_registrations_side_by_side_produce_exactly_what_one_at_a_time_does(tmp_path, monkeypatch):
+    """Each registration is the same one-thread-optimised elastix run whichever
+    process it lands in. Its preprocessing sums in an order set by ITK's thread
+    count, so both paths pin that count -- in SimpleITK and in elastix's itk --
+    to what the server granted one registration. Same count, same bits: the
+    first version of this test compared a serial run on the machine's default
+    against workers on half of it, and failed on a four-core CI runner.
     """
+    monkeypatch.setenv("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "2")
     TestSemiAutomatedCBCT._cohort(tmp_path, subjects=("P1", "P2"))
     serial = _register_cohort(tmp_path, tmp_path / "serial", num_workers=1)
     wide = _register_cohort(tmp_path, tmp_path / "wide", num_workers=2)
 
     assert serial.report["patients"] == wide.report["patients"]
     for subject in ("P1", "P2"):
-        one = sitk.ReadTransform(str(tmp_path / "serial" / "CB" / f"{subject}_CB_Reg_transform.tfm"))
-        two = sitk.ReadTransform(str(tmp_path / "wide" / "CB" / f"{subject}_CB_Reg_transform.tfm"))
-        assert np.allclose(one.GetParameters(), two.GetParameters(), rtol=0, atol=1e-8)
-        a = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "serial" / "CB" / f"{subject}_CB_Reg.nii.gz")))
-        b = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "wide" / "CB" / f"{subject}_CB_Reg.nii.gz")))
-        differing = a != b
-        assert differing.mean() < 1e-4 and np.abs(a.astype(int) - b)[differing].max(initial=0) <= 1
+        for name in (f"{subject}_CB_Reg.nii.gz", f"{subject}_CB_Reg_transform.tfm"):
+            a = tmp_path / "serial" / "CB" / name
+            b = tmp_path / "wide" / "CB" / name
+            if name.endswith(".tfm"):
+                assert a.read_text() == b.read_text()
+            else:
+                assert np.array_equal(sitk.GetArrayFromImage(sitk.ReadImage(str(a))),
+                                      sitk.GetArrayFromImage(sitk.ReadImage(str(b))))
 
 
 def test_the_width_is_asked_of_the_supervisor_and_capped_by_the_caller():
