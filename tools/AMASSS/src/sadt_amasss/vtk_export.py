@@ -188,6 +188,11 @@ def _meshes_in_parallel(jobs, workers: int = 1) -> list:
     width = max(1, min(int(workers or 1), len(jobs)))
     if width == 1 or len(jobs) < 2:
         return [_mesh_from_mask(*job) for job in jobs]
+    # Imported here, before the threads, so that none of them is the first to
+    # import VTK or its numpy bridge: each finds both complete in sys.modules.
+    import vtk  # noqa: F401
+    from vtk.util import numpy_support  # noqa: F401
+
     with futures.ThreadPoolExecutor(max_workers=width) as pool:
         # `map` keeps the input order, which is what makes the appended file
         # reproducible whatever order the threads finish in.
