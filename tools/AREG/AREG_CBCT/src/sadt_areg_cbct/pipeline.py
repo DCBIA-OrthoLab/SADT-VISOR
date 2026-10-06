@@ -148,14 +148,23 @@ def _register_safely(job: dict) -> dict:
 
 
 def _threads_per_worker(width: int) -> int:
-    """The threads this run was granted, shared between its workers -- for the
-    resampling and the I/O around elastix, which itself runs on one."""
+    """The threads ONE registration may open.
+
+    elastix speeds up with ITK's thread count -- 97 s on ten threads, 43 s on
+    fifty-six, for one region of the test pair -- so this is the number that
+    decides how long a registration takes. Under a server it is what the
+    server set for one CHANNEL: AREG_CBCT's channels each bring their own share
+    of cores (`cores_per_channel` in the server's deployment.toml), so the
+    variable already holds one registration's threads and is taken as it is.
+    With no server, the machine's cores are shared between the workers.
+    """
     try:
         granted = int(os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS") or 0)
     except ValueError:
         granted = 0
-    granted = granted or (os.cpu_count() or 1)
-    return max(1, granted // max(1, width))
+    if granted > 0:
+        return granted
+    return max(1, (os.cpu_count() or 1) // max(1, width))
 
 
 def _worker_setup(threads: int) -> None:
