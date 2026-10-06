@@ -309,7 +309,7 @@ tools:
       - name: AMASSS_Models.zip
         dest: AMASSS_Models
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AMASSS_CBCT/AMASSS_Models.zip
-        size: 1163164147
+        size: 2078744372
         extract: true
       # 'cbct_reference' -- the frame the T1 scans are oriented into by the
       # Oriented + Fully-Automated mode. Two published planes; the landmark
@@ -673,11 +673,46 @@ tools:
   # VFACE -- facial asymmetry; drives six neighbours through the supervisor.
   # =========================================================================
   VFACE:
+    # Every `dest` below is a name `sadt_vface.dispatch._BUNDLES` looks for under
+    # DATA/VFACE/models/ -- a test in tools/VFACE/tests holds the two together.
+    # Without them the tool refused every run at the door: the classifier was
+    # unpacked as V_FACE_Models while the code asked for VFACE_classifier, and
+    # the segmentation bundle, both orientation references and the mirror were
+    # never staged for this tool at all. A tool reads only DATA/<its own name>/,
+    # so the three shared with AMASSS, ASO and AREG are listed again here.
     models:
+      # 'classifier_model' -- the three LightGBM asymmetry models.
       - name: V_FACE_Models.zip
+        dest: VFACE_classifier
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/VFACE/V_FACE_Models.zip
         sha256: da860a6267ade5d83f28de05c2e98870178a222035f8ecb1ef87713d3c8b8f83
         size: 201281
+        extract: true
+      # 'segmentation_model' -- the masks every registration is confined to.
+      - name: AMASSS_Models.zip
+        dest: AMASSS_Models
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AMASSS_CBCT/AMASSS_Models.zip
+        size: 2078744372
+        extract: true
+      # 'cranial_base_reference' / 'maxilla_reference' -- the two frames a scan
+      # is oriented into, one per region it is measured in.
+      - name: Frankfurt_Horizontal_Midsagittal_Plane.zip
+        dest: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Frankfurt_Horizontal_Midsagittal_Plane.zip
+        size: 174378374
+        extract: true
+      - name: Occlusal_Midsagittal_Plane.zip
+        dest: CBCT_Gold_Occlusal_Midsagittal_Plane
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Occlusal_Midsagittal_Plane.zip
+        size: 55722763
+        extract: true
+      # 'mirror_reference' -- the one transform that reflects a scan across the
+      # mid-sagittal plane, which is what an asymmetry assessment registers.
+      - name: Mirror.zip
+        dest: Mirror_matrix
+        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixMirror/Mirror.zip
+        sha256: 0cfb3871c3a34554ecd6579bdd59019a02b116a28ee752a1b6c1d0513c86df4b
+        size: 468
         extract: true
       - name: DefaultList.zip
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/VFACE/DefaultList.zip
