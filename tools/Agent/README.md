@@ -115,6 +115,14 @@ So the catalogue is an **input**, and its default source is the registry:
 
 Neither available is a refusal naming both. It never guesses.
 
+Both shapes are read: the schema `scripts/describe.py` writes (`path`, `str`,
+`int`, `float`, `bool`, `list[...]`, `vec2`), and what `GET /tools` publishes
+after the server folds it into its own vocabulary (`choice`, `multichoice` with
+an `{option: selected}` mapping, `initial` for a default, and server file types
+such as `csv_file` or `folder`). An argument of any other type is kept
+**opaque**: logged, never offered to the model, and still counted as missing
+when required -- one new type never takes the whole catalogue down.
+
 ### Why not the supervisor
 
 The obvious question is whether `sup` can enumerate the tools, which would make

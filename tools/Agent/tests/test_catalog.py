@@ -217,13 +217,13 @@ def test_an_argument_with_no_type_is_refused():
     assert "no 'type'" in str(raised.value)
 
 
-def test_an_unknown_type_is_refused_and_lists_the_known_ones():
-    """A type this agent cannot fill would be proposed as a value of unknown
-    shape and 422'd by the server. Better said here."""
+def test_an_unknown_type_is_kept_opaque_rather_than_refusing_the_catalogue():
+    """A type this agent cannot fill is never proposed a value, but the rest of
+    the catalogue stays routable. See test_registry_shape.py."""
     entries = [{"name": "T", "arguments": {"a": {"type": "dict[str, path]"}}}]
-    with pytest.raises(ToolInputError) as raised:
-        catalog.normalise(entries)
-    assert "list[path]" in str(raised.value)
+    tools = catalog.normalise(entries)
+    assert tools[0]["arguments"]["a"]["opaque"] is True
+    assert catalog.fillable_arguments(tools[0]) == {}
 
 
 def test_every_type_describe_py_can_emit_is_accepted():
