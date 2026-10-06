@@ -600,11 +600,18 @@ def test_progress_counts_the_registrations_as_they_finish(tmp_path, monkeypatch)
         output_dir=str(tmp_path / "out"),
     )
 
-    events = _events(events_file)
+    records = _events(events_file)
+    events = [record for record in records if record.get("kind") != "log"]
     assert [event["message"] for event in events] == [
+        "registering 2 region(s) of 2 subject(s)",
         "registration 1 of 2", "registration 2 of 2",
     ]
-    assert [event["fraction"] for event in events] == [0.5, 1.0]
+    assert [event["fraction"] for event in events] == [0.0, 0.5, 1.0]
+    # The region no subject has a mask for is said once, to the clinician, at
+    # warning level -- with no supervisor, through the progress file's log.
+    logs = [record for record in records if record.get("kind") == "log"]
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert "Mandible" in logs[0]["message"]
 
 
 def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
@@ -634,7 +641,7 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
 
     assert sup.messages == []
     assert [event["message"] for event in _events(events_file)] == [
-        "registration 1 of 1",
+        "registering 1 region(s) of 1 subject(s)", "registration 1 of 1",
     ]
 
 
@@ -687,3 +694,38 @@ def test_the_width_is_asked_of_the_supervisor_and_capped_by_the_caller():
     assert dispatch._registration_width(Sup(), 6, declared=2) == 2
     assert dispatch._registration_width(None, 6) == 1
     assert dispatch._registration_width(None, 6, declared=4) == 4
+
+
+# ---------------------------------------------------------------------------
+# Progress -- the supervised steps and the registration share one bar
+# ---------------------------------------------------------------------------
+
+class TestSpans:
+    def test_each_mode_tiles_the_bar_in_the_order_its_steps_run(self):
+        assert dispatch._cbct_spans(orient=False, segment=False) == (None, None, (0.0, 1.0))
+        assert dispatch._cbct_spans(orient=False, segment=True) == (
+            None, (0.0, 0.25), (0.25, 1.0))
+        assert dispatch._cbct_spans(orient=True, segment=True) == (
+            (0.0, 0.25), (0.25, 0.5), (0.5, 1.0))
+
+    def test_the_supervised_calls_carry_their_span(self, tmp_path):
+        """`_progress` reaches the supervisor and never the callee's parameters."""
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted,
+                                 "ASO": lambda params: planted})
+
+        tools.segment_masks(sup, str(tmp_path), "/models", ["CBMASK"], span=(0.25, 0.5))
+        tools.orient_scans(sup, str(tmp_path), str(tmp_path), "CBCT", span=(0.0, 0.25))
+
+        assert sup.spans == [("AMASSS", (0.25, 0.5)), ("ASO", (0.0, 0.25))]
+        assert all("_progress" not in params for _tool, params in sup.calls)
+
+    def test_without_a_span_the_call_is_unchanged(self, tmp_path):
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted})
+
+        tools.segment_masks(sup, str(tmp_path), "/models", ["CBMASK"])
+
+        assert sup.spans == [("AMASSS", None)]

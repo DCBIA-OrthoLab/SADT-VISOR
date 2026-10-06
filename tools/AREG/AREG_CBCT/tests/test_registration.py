@@ -148,7 +148,7 @@ def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
     assert registered.GetPixelID() == sitk.sitkInt16
 
 
-def _oriented_run(tmp_path):
+def _oriented_run(tmp_path, sups=None):
     """An Oriented + Fully-Automated run, ASO and AMASSS planted, elastix real.
 
     The T1 comes back from 'ASO' centred on the origin, as the real one does; the
@@ -176,6 +176,9 @@ def _oriented_run(tmp_path):
 
     reference = tmp_path / "reference"
     reference.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    if sups is not None:
+        sups.append(sup)
     run = dispatch.register(
         t1_path=str(tmp_path / "T1"),
         t2_path=str(tmp_path / "T2"),
@@ -184,9 +187,26 @@ def _oriented_run(tmp_path):
         segmentation_model="/models/AMASSS",
         orientation_reference=str(reference),
         output_dir=str(tmp_path / "out"),
-        sup=FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss}),
+        sup=sup,
     )
     return run, fixed
+
+
+def test_an_oriented_run_moves_its_bar_forward_through_every_step(tmp_path, monkeypatch):
+    """ASO, then AMASSS, then the registration, each in its own slice and in
+    that order. Before the spans the bar showed each child's 0..1 and then
+    AREG's own, which reads as three runs starting over."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    sups = []
+
+    _oriented_run(tmp_path, sups)
+
+    assert sups[0].spans == [("ASO", (0.0, 0.25)), ("AMASSS", (0.25, 0.5))]
+    events = [json.loads(line) for line in events_file.read_text().splitlines()]
+    fractions = [event["fraction"] for event in events if "fraction" in event]
+    assert fractions == sorted(fractions)
+    assert fractions == [0.0, 0.25, 0.5, 1.0]
 
 
 def test_an_oriented_run_returns_the_t1_the_t2_was_registered_onto(tmp_path):

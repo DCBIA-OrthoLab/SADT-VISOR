@@ -718,10 +718,15 @@ class FakeSup:
         self.out = tmp_path
         self.tmp = tmp_path
         self.calls = []
+        self.spans = []
         self.messages = []
         self.call_index = 0
 
     def run(self, tool, **params):
+        # `_progress` is the caller's span of its own bar, and the supervisor
+        # removes it before the callee sees it -- so it is recorded apart and
+        # never left among the parameters a tool would be handed.
+        self.spans.append((tool, params.pop("_progress", None)))
         # The input is captured HERE, not after the run: it lives in the
         # working directory, which is removed before `orient` returns.
         self.calls.append((tool, params))
@@ -752,7 +757,7 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
 
 
@@ -1609,6 +1614,34 @@ def test_the_landmark_waypoint_reaches_the_supervisor(tmp_path):
     )
 
     assert (0.2, f"predicting landmarks with {dispatch.LANDMARK_TOOL}") in sup.messages
+
+
+def test_the_landmark_tool_is_given_the_slice_between_the_phases(tmp_path, monkeypatch):
+    """The landmark tool fills 0.2..0.6 of ASO's bar, exactly the gap its own
+    phases leave: recentring ends where the span starts, registration starts
+    where it ends. Anything else and the folded bar steps back or jumps."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "patient2": _predicted()}, tmp_path)
+
+    _run_aso(
+        tmp_path, input=str(root), reference=_cbct_reference(tmp_path),
+        modality="CBCT", automation="Fully-Automated",
+        landmark_model="Bundle", cbct_landmarks=list(_REFERENCE_POINTS), sup=sup,
+    )
+
+    assert sup.spans == [(dispatch.LANDMARK_TOOL, (0.2, 0.6))]
+    _tool, params = sup.calls[0]
+    assert "_progress" not in params
+    fractions = [event["fraction"] for event in _events(events_file)]
+    centring = [f for f in fractions if f < 0.2 + 1e-9]
+    registering = [f for f in fractions if f > 0.2 + 1e-9]
+    assert fractions == sorted(fractions)
+    assert max(centring) <= 0.2
+    assert min(registering) >= 0.6
 
 
 # ---------------------------------------------------------------------------

@@ -597,6 +597,15 @@ def predict_landmarks(
             f"{asked}. It provides: {', '.join(sorted(weights)) or 'nothing'}."
         )
 
+    if without_model:
+        # Asked for and not deliverable by this bundle. The report names them;
+        # the panel says how many, at the start, so a clinician waiting on a
+        # point that will never come knows it now rather than after the run.
+        progress.log(
+            f"{len(without_model)} of the requested landmarks have no model in "
+            f"this bundle and will not be placed", "warning", user=True,
+        )
+
     preprocessed_dir = os.path.join(work_dir, "preprocessed")
     logger.info(
         "ALI CBCT: %d scan(s), %d landmark(s), device=%s", len(scans), len(runnable), device
@@ -773,6 +782,10 @@ def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
             if record["landmarks_found"]:
                 record["status"] = "ok"
             else:
+                progress.log(
+                    f"scan {scan_index} of {len(scans)}: no landmark could be "
+                    f"placed", "warning", user=True,
+                )
                 record["status"] = "failed"
                 record["error"] = (
                     "no landmark could be placed on this scan: "
@@ -782,6 +795,10 @@ def _predict_every_scan(scans, scan_reports, weights, runnable, device, budget,
         except Exception as exc:
             # One unreadable or hopeless scan must not cost the other 199.
             logger.exception("ALI CBCT failed on one scan")
+            progress.log(
+                f"scan {scan_index} of {len(scans)} could not be processed; the "
+                f"report says why", "warning", user=True,
+            )
             record["status"] = "failed"
             record["error"] = str(exc)
         record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
@@ -858,7 +875,15 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
         # networks per worker is resident whatever the number of agents.
 
         def announce(index):
-            """One line every tenth of the batch, wherever the workers are."""
+            """One line every tenth of the batch, wherever the workers are.
+
+            And one progress event at the same cadence. `index` is the number
+            of landmark searches that have come BACK, in whatever order the
+            workers returned them, so the bar's position is (scan, landmark)
+            pairs finished across the cohort -- a count, not an estimate. A
+            search is about a minute, so a scan of 119 landmarks no longer
+            holds the bar still for the length of it.
+            """
             if index % progress_every and index != len(runnable):
                 return
             elapsed = time.monotonic() - search_started
@@ -867,6 +892,16 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
                 scan_index, scan_total, index, len(runnable), elapsed,
                 (elapsed / index) * (len(runnable) - index),
             )
+            # Not for the scan's last landmark: the next scan's own event
+            # stands at that same point, and after the cohort's last one the
+            # bar would claim a finished run before the report is written.
+            if index < len(runnable):
+                progress.emit(
+                    (scan_index - 1 + index / float(len(runnable))) / scan_total,
+                    "scan {} of {}: {} of {} landmarks searched".format(
+                        scan_index, scan_total, index, len(runnable)
+                    ),
+                )
 
         results, broken = ({}, False)
         if pool is not None and len(runnable) > 1:
@@ -877,6 +912,13 @@ def _predict_one_scan(scan_path, key, record, weights, runnable, device, budget,
                     "landmark(s); finishing this scan one at a time. A worker "
                     "was killed -- the host out of memory, most often.",
                     len(results), len(runnable),
+                )
+                # The operator's to look at: the result is unchanged, only
+                # slower, and a killed worker usually means the host is short
+                # of memory.
+                progress.log(
+                    "the landmark worker pool stopped answering; finishing one "
+                    "at a time", "warning",
                 )
 
         # Whatever the pool did not return, including everything when there is

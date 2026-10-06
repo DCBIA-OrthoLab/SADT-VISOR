@@ -61,6 +61,13 @@ WORK_DIRNAME = ".aso_work"
 # fifteen minutes into a job.
 LANDMARK_TOOL = "ALI_CBCT"
 
+# The slice of a fully-automated CBCT run's bar the landmark tool fills. Passed
+# to the supervisor as `_progress`, so the server folds that tool's own 0..1
+# into it and the clinician sees one bar instead of ALI's and then ASO's in
+# turn. Recentring occupies the bar up to its start and registration from its
+# end; the landmark walk is the longest single step, hence the widest slice.
+LANDMARK_SPAN = (0.2, 0.6)
+
 
 
 class OrientationRun:
@@ -523,7 +530,7 @@ def _predict_landmarks(
     58 agents to use 7 -- and one agent is a full two-scale walk of the volume.
     """
     if sup is not None and hasattr(sup, "progress"):
-        sup.progress(0.2, f"predicting landmarks with {LANDMARK_TOOL}")
+        sup.progress(LANDMARK_SPAN[0], f"predicting landmarks with {LANDMARK_TOOL}")
 
     # Only the landmarks are asked for. Which weights place them is that tool's
     # business, and it finds its own -- this used to compose a path into ALI's
@@ -539,6 +546,7 @@ def _predict_landmarks(
         input=centered_root,
         landmarks=list(requested),
         **({"model": landmark_model} if landmark_model else {}),
+        _progress=LANDMARK_SPAN,
     )
     # A tool returns a Path, or a dict of named ones. The landmark tool returns
     # its output directory; a dict is accepted so a future one naming its
@@ -705,7 +713,7 @@ def _run_cbct(
     # landmark tool from there, registration on the tail. What is exact is the
     # counter in the message; the split between phases is a weighting.
     for index, (key, entry) in enumerate(sorted(patients.items()), start=1):
-        progress.report(index, len(patients), "centring scan", end=0.2)
+        progress.report(index, len(patients), "centring scan", end=LANDMARK_SPAN[0])
         _, extension = split_scan_extension(os.path.basename(entry["scan"]))
         destination = (
             os.path.join(
@@ -758,7 +766,7 @@ def _run_cbct(
     # Phase 3 -- register and write. It starts where the landmark tool left
     # off, which is only where semi-automated ends its own phase 1: there is no
     # prediction between them, so the bar must not skip the slice it never used.
-    registration_start = 0.6 if fully else 0.2
+    registration_start = LANDMARK_SPAN[1] if fully else LANDMARK_SPAN[0]
     for index, (key, entry) in enumerate(sorted(prepared.items()), start=1):
         progress.report(index, len(prepared), "orienting patient", start=registration_start)
         if not entry["landmarks"]:

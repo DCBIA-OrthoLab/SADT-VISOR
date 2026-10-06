@@ -40,6 +40,15 @@ logger = logging.getLogger("Agent")
 # decision and the run it produced never collide over a file name.
 RUN_DIRECTORY = "run"
 
+# The slice of this tool's bar the chosen tool fills. Passed to the supervisor
+# as `_progress`, so the server folds the callee's own 0..1 into it and the
+# clinician sees one bar rather than the router's and then the callee's. The
+# routing before it is a few model round-trips, seconds against the minutes or
+# the hour of whatever imaging tool it picks, so the run takes nearly all of it:
+# starting the callee at 60%, as the waypoint used to, left the bar parked
+# there for almost the whole job.
+EXECUTION_SPAN = (0.1, 1.0)
+
 
 def invoke(supervisor, tool_name: str, arguments: dict, output_dir):
     """Run `tool_name` through the supervisor and return what it returned.
@@ -63,11 +72,11 @@ def invoke(supervisor, tool_name: str, arguments: dict, output_dir):
 
     logger.info("running '%s' through the supervisor", tool_name)
     if hasattr(supervisor, "progress"):
-        supervisor.progress(0.6, "running {}".format(tool_name))
+        supervisor.progress(EXECUTION_SPAN[0], "running {}".format(tool_name))
 
     # `supervisor`, not `sup` -- see this module's docstring. The name is the
     # only thing that differs; this is an ordinary supervised call.
-    produced = supervisor.run(tool_name, **parameters)
+    produced = supervisor.run(tool_name, **parameters, _progress=EXECUTION_SPAN)
 
     return destination, _describe(produced)
 

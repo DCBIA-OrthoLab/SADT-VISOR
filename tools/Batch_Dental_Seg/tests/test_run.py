@@ -8,6 +8,7 @@ report.
 
 import json
 import os
+import shutil
 
 import numpy as np
 import pytest
@@ -756,25 +757,63 @@ def test_real_model_segments_a_real_scan(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Progress -- both ends of a run whose middle is opaque
+# Progress -- the two ends counted, and the middle counted off nnUNet's masks
 # ---------------------------------------------------------------------------
 
-def test_progress_reports_the_two_ends_and_says_nothing_it_cannot_know(
-    tmp_path, stub_nnunet, monkeypatch
-):
-    """The whole cohort goes to nnUNet in ONE call, so there is no per-scan
-    position to report between the reading and the writing.
+def _events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in
+               Path(events_file).read_text().splitlines() if line]
+    return ([r for r in records if r.get("kind") != "log"],
+            [r for r in records if r.get("kind") == "log"])
 
-    The bar therefore stops at 10% for the length of the segmentation. That is
-    the truth: interpolating a position from the number of scans would put a
-    number on the bar that nothing in the run measured, and the moment one scan
-    took twice as long as another it would be wrong in a way nobody could see.
+
+def _stub_writing_one_case_at_a_time(monkeypatch, events_file, write_only=None):
+    """nnUNet as it behaves: one mask per case, written as each case finishes.
+
+    After each mask the stub waits until the watcher has reported it, so the
+    test does not depend on how fast this machine is.
+    """
+    import time
+
+    write_one = _stub_prediction((1, 2, 3))
+    monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 0.01)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested=None: "cpu")
+
+    def predict_folder(model_folder, input_dir, output_dir, device, **kwargs):
+        names = sorted(name for name in os.listdir(input_dir)
+                       if name.endswith("_0000.nii.gz"))
+        for done, name in enumerate(names[:write_only], start=1):
+            single = os.path.join(output_dir, ".one")
+            os.makedirs(single, exist_ok=True)
+            shutil.copy(os.path.join(input_dir, name), os.path.join(single, name))
+            write_one(model_folder, single, output_dir, device)
+            shutil.rmtree(single)
+            if done == len(names):
+                break
+            wanted = "segmenting scan {} of {}".format(done + 1, len(names))
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if wanted in Path(events_file).read_text():
+                    break
+                time.sleep(0.01)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", predict_folder)
+
+
+def test_progress_counts_each_phase_and_the_segmentation_off_the_masks_written(
+    tmp_path, monkeypatch
+):
+    """The whole cohort goes to nnUNet in ONE call, which says nothing on the
+    way -- but it writes each case's mask as soon as that case is done, under
+    a name known in advance. Counting those files is a count, not an estimate,
+    so the bar moves per scan through the segmentation and never ahead of it.
     """
     events_file = tmp_path / "events.jsonl"
     monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
-    stub_nnunet()
-    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
-    _write_scan(str(tmp_path / "in" / "p2.nii.gz"))
+    _stub_writing_one_case_at_a_time(monkeypatch, events_file)
+    for name in ("p1", "p2", "p3"):
+        _write_scan(str(tmp_path / "in" / f"{name}.nii.gz"))
     _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
 
     pipeline.segment(
@@ -783,17 +822,71 @@ def test_progress_reports_the_two_ends_and_says_nothing_it_cannot_know(
         model_path=str(tmp_path / "models" / "DentalSegmentator"),
     )
 
-    events = [json.loads(line) for line in
-              Path(events_file).read_text().splitlines() if line]
+    events, logs = _events(events_file)
     assert [event["message"] for event in events] == [
-        "reading scan 1 of 2", "reading scan 2 of 2",
-        "segmenting 2 scan(s) in one pass",
-        "writing scan 1 of 2", "writing scan 2 of 2",
+        "reading scan 1 of 3", "reading scan 2 of 3", "reading scan 3 of 3",
+        "segmenting 3 scan(s) in one pass",
+        "segmenting scan 2 of 3", "segmenting scan 3 of 3",
+        "writing scan 1 of 3", "writing scan 2 of 3", "writing scan 3 of 3",
     ]
     fractions = [event["fraction"] for event in events]
     assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    segmenting = [event["fraction"] for event in events
+                  if event["message"].startswith("segmenting")]
+    assert all(0.1 <= fraction < 0.9 for fraction in segmenting)
+    assert logs == []
     # The scan's own name is patient metadata and never travels in a message.
     assert not any("p1" in event["message"] for event in events)
+
+
+def test_the_watcher_never_counts_a_mask_left_by_an_earlier_run(tmp_path, monkeypatch):
+    """A file already on disk says nothing about THIS run; counting it would
+    put a scan on the bar that is still to come."""
+    import time
+
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    stale = tmp_path / "case_0000.nii.gz"
+    stale.write_bytes(b"")
+    fresh = tmp_path / "case_0001.nii.gz"
+
+    with pipeline._counting_outputs(
+        [str(stale), str(fresh), str(tmp_path / "case_0002.nii.gz")],
+        "segmenting scan", 0.1, 0.9, interval=0.01,
+    ):
+        time.sleep(0.05)
+        assert not events_file.exists()
+        fresh.write_bytes(b"")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not events_file.exists():
+            time.sleep(0.01)
+
+    events, _ = _events(events_file)
+    assert [event["message"] for event in events] == ["segmenting scan 2 of 3"]
+
+
+def test_a_scan_nnunet_did_not_segment_is_logged_to_the_clinician_by_position(
+    tmp_path, monkeypatch
+):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _stub_writing_one_case_at_a_time(monkeypatch, events_file, write_only=1)
+    _write_scan(str(tmp_path / "in" / "a_Smith_John.nii.gz"))
+    _write_scan(str(tmp_path / "in" / "b_Jones_Mary.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    pipeline.segment(
+        output_dir=str(tmp_path / "out"),
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+    )
+
+    _, logs = _events(events_file)
+    assert [(log["level"], log["audience"], log["message"]) for log in logs] == [
+        ("warning", "user", "scan 2 of 2 produced no segmentation"),
+    ]
+    assert "Jones" not in events_file.read_text()
 @pytest.mark.gpu
 @pytest.mark.models
 @pytest.mark.skipif(

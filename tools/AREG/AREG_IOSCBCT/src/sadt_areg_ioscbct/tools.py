@@ -99,7 +99,34 @@ def _returned(produced) -> str:
     return str(produced)
 
 
-def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing, which is what a caller with no bar of its own wants.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
+def _waypoint(sup, span, message: str) -> None:
+    """Say which tool the run is about to be inside.
+
+    At the start of the call's span when it has one -- which is what keeps the
+    waypoints in the order the calls are made, whatever that order is. With
+    none there is no honest fraction to give, so the line goes to the log
+    instead: a number made up here could send the bar backwards.
+    """
+    if sup is None:
+        return
+    if span and hasattr(sup, "progress"):
+        sup.progress(span[0], message)
+    elif hasattr(sup, "log"):
+        sup.log(message)
+
+
+def label_crowns(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
     """Label the crowns of every mesh under `mesh_dir`.
 
     `skip_segmented` is left at its default: a mesh already carrying a
@@ -110,34 +137,34 @@ def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
     doing the segmenting.
     """
     logger.info("AREG: asking 'Crown_Seg' for tooth-labelled meshes")
+    _waypoint(sup, span, "labelling the intraoral crowns with Crown_Seg")
     parameters = {
         "meshes": mesh_dir,
         "suffix": "Seg",
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("Crown_Seg", **parameters))
+    return _returned(sup.run("Crown_Seg", **parameters, **_span(span)))
 
 
-def predict_cbct_landmarks(sup, scan_dir: str, model_path: str) -> str:
+def predict_cbct_landmarks(sup, scan_dir: str, model_path: str, span=None) -> str:
     """The CBCT landmarks the cross-modality alignment registers on.
 
     Asked for BY NAME, not by region: the registration uses a handful of points,
     and asking by region would run every agent of every region containing one of
     them. One agent is a full two-scale walk of the volume.
     """
-    if sup is not None and hasattr(sup, "progress"):
-        sup.progress(0.1, "predicting CBCT landmarks with ALI_CBCT")
+    _waypoint(sup, span, "predicting CBCT landmarks with ALI_CBCT")
     parameters = {
         "input": scan_dir,
         "landmarks": list(CBCT_LANDMARKS),
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("ALI_CBCT", **parameters))
+    return _returned(sup.run("ALI_CBCT", **parameters, **_span(span)))
 
 
-def predict_ios_landmarks(sup, mesh_dir: str, model_path: str) -> str:
+def predict_ios_landmarks(sup, mesh_dir: str, model_path: str, span=None) -> str:
     """The intraoral landmarks, the other half of the correspondence.
 
     `networks` names the occlusal family alone: the cross-modality alignment
@@ -145,18 +172,18 @@ def predict_ios_landmarks(sup, mesh_dir: str, model_path: str) -> str:
     mucogingival passes would cost a run over every mesh for points nothing
     here reads.
     """
-    if sup is not None and hasattr(sup, "progress"):
-        sup.progress(0.3, "predicting intraoral landmarks with ALI_IOS")
+    _waypoint(sup, span, "predicting intraoral landmarks with ALI_IOS")
     parameters = {
         "input": mesh_dir,
         "networks": ["Occlusal"],
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("ALI_IOS", **parameters))
+    return _returned(sup.run("ALI_IOS", **parameters, **_span(span)))
 
 
-def orient_cbct(sup, scan_dir: str, reference_path: str, landmark_model: str = "") -> str:
+def orient_cbct(sup, scan_dir: str, reference_path: str, landmark_model: str = "",
+                span=None) -> str:
     """Put the CBCT in the reference frame before anything is matched onto it.
 
     ASO's fully-automated CBCT mode: it predicts its own landmarks and registers
@@ -164,8 +191,7 @@ def orient_cbct(sup, scan_dir: str, reference_path: str, landmark_model: str = "
     separate CLI modules (PRE_ASO_CBCT, SEMI_ASO_CBCT, PRE_ASO_IOS); ours is one
     tool taking the mode as data.
     """
-    if sup is not None and hasattr(sup, "progress"):
-        sup.progress(0.5, "orienting the CBCT with ASO")
+    _waypoint(sup, span, "orienting the CBCT with ASO")
     parameters = {
         "input": scan_dir,
         "reference": reference_path,
@@ -174,4 +200,4 @@ def orient_cbct(sup, scan_dir: str, reference_path: str, landmark_model: str = "
     }
     if landmark_model:
         parameters["landmark_model"] = landmark_model
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))

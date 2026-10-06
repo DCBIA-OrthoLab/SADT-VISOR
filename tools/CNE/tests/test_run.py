@@ -1621,3 +1621,64 @@ def test_an_array_of_several_objects_is_refused_rather_than_spanned():
 def test_blank_lines_between_fields_do_not_break_the_ratio():
     data = extraction.parse_extraction("patient_age: 34\n\n\njaw_locking: false\n")
     assert data == {"patient_age": "34", "jaw_locking": "false"}
+
+
+# --------------------------------------------------------------------------
+# Progress and the run's log: a position, never a note's name
+# --------------------------------------------------------------------------
+
+def read_events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in
+               Path(events_file).read_text().splitlines() if line]
+    progress = [record for record in records if record.get("kind") != "log"]
+    logs = [record for record in records if record.get("kind") == "log"]
+    return progress, logs
+
+
+def test_progress_announces_the_load_then_counts_notes(
+    tmp_path, model, llm, monkeypatch
+):
+    """The load is one opaque call, so it gets a message at the start of the
+    bar and no share of it; each note after it is one call to the model, and
+    the position in the batch is what is counted."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_txt(tmp_path / "notes" / "Smith_John.txt")
+    write_txt(tmp_path / "notes" / "Jones_Mary.txt")
+    write_txt(tmp_path / "notes" / "Brown_Ann.txt")
+
+    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+
+    events, logs = read_events(events_file)
+    assert [event["message"] for event in events] == [
+        "loading the language model",
+        "note 1 of 3", "note 2 of 3", "note 3 of 3",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    assert logs == []
+    text = events_file.read_text()
+    assert not any(name in text for name in ("Smith", "Jones", "Brown", ".txt"))
+
+
+def test_a_note_that_fails_is_logged_to_the_clinician_by_position(
+    tmp_path, model, llm, monkeypatch, caplog
+):
+    """The clinician learns that one note of the batch was not extracted and
+    where to look; neither their panel nor the server's log learns its name."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_txt(tmp_path / "notes" / "a_Smith_John.txt")
+    write_txt(tmp_path / "notes" / "b_Jones_Mary.txt", text="   ")
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+
+    _, logs = read_events(events_file)
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert logs[0]["message"].startswith("note 2 of 2 could not be extracted")
+    assert "Jones" not in events_file.read_text()
+    assert not any("Jones" in record.getMessage() for record in caplog.records)
+    assert entry_for(tmp_path / "out", "b_Jones_Mary.txt")["status"] == "failed"

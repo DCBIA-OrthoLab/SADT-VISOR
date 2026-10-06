@@ -31,11 +31,13 @@ unpacks archives before `run()` is called, and `device` / `tile_step_size` are
 arguments rather than server settings.
 """
 
+import contextlib
 import json
 import logging
 import os
 from pathlib import Path
 import shutil
+import threading
 import time
 
 from . import catalogs, mesh_export, nnunet_runner, progress
@@ -63,6 +65,60 @@ WORK_DIRNAME = ".batchdentalseg_work"
 
 # What nnUNet expects an input case to be called: one modality, index 0000.
 _NNUNET_SUFFIX = "_0000.nii.gz"
+
+# How often, in seconds, nnUNet's output folder is looked at during the
+# segmentation. One scan takes about a minute on the card, so two seconds moves
+# the bar promptly and costs nothing.
+WATCH_INTERVAL = 2.0
+
+# Where on the bar the segmentation sits: the reading of the scans before it
+# and the writing of the results after it are each given a tenth.
+_SEGMENTATION_SPAN = (0.1, 0.9)
+
+
+@contextlib.contextmanager
+def _counting_outputs(expected, what, start=0.0, end=1.0, interval=None):
+    """Report "scan k of n" while nnUNet runs, from the masks that exist.
+
+    The whole cohort is ONE nnUNet call that says nothing on the way. But
+    nnUNet exports each case's mask under its own case id as soon as that case
+    is done, and those names are known in advance -- so the number of them on
+    disk IS the number of scans finished, a count rather than an estimate, and
+    a thread looking every few seconds can move the bar truthfully.
+
+    A mask already on disk before the call is not counted: it says nothing
+    about this run. The thread is a daemon, is stopped in a `finally` whatever
+    the call does, and swallows every error of its own -- progress must never
+    fail a run.
+    """
+    interval = WATCH_INTERVAL if interval is None else interval
+    total = len(expected)
+    try:
+        fresh = [path for path in expected if not os.path.exists(path)]
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+        fresh = []
+    stop = threading.Event()
+
+    def watch():
+        reported = 0
+        while not stop.wait(interval):
+            try:
+                done = sum(1 for path in fresh if os.path.exists(path))
+                # The last scan is not reported here: once it exists the call
+                # is about to return, and the writing phase says so itself.
+                if reported < done < total:
+                    reported = done
+                    progress.report(done + 1, total, what, start=start, end=end)
+            except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+                pass
+
+    thread = threading.Thread(target=watch, name="batchdentalseg-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=interval + 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +322,12 @@ def segment(
 
     cases = {}
     failed_conversions = []
-    # Only the two ends of this run can be counted. The segmentation between
-    # them is ONE nnUNet call over the whole folder, so there is no per-scan
-    # position to report inside it -- the bar stops where the reading ends and
-    # moves again when the writing starts, rather than inventing a number.
+    # The two ends of this run are counted as they go. The segmentation between
+    # them is ONE nnUNet call over the whole folder, so its progress is counted
+    # off the masks nnUNet writes as each case finishes -- see
+    # `_counting_outputs` -- never interpolated from the number of scans.
     for index, scan in enumerate(scans):
-        progress.report(index + 1, len(scans), "reading scan", end=0.1)
+        progress.report(index + 1, len(scans), "reading scan", end=_SEGMENTATION_SPAN[0])
         case_id = f"case_{index:04d}"
         try:
             _convert_to_nifti(scan, os.path.join(nnunet_input, f"{case_id}{_NNUNET_SUFFIX}"))
@@ -280,6 +336,10 @@ def segment(
             # inference, so without it one corrupt file in a cohort of forty
             # would abort the whole run before a single scan was segmented.
             logger.exception("BatchDentalSeg: could not read a scan")
+            progress.log(
+                f"scan {index + 1} of {len(scans)} could not be read and was "
+                f"left out", "warning", user=True,
+            )
             failed_conversions.append(
                 {
                     "case_id": case_id,
@@ -298,25 +358,31 @@ def segment(
         )
 
     logger.info("BatchDentalSeg: %d scan(s), model=%s, device=%s", len(cases), model.name, device)
-    progress.emit(0.1, f"segmenting {len(cases)} scan(s) in one pass")
+    progress.emit(_SEGMENTATION_SPAN[0], f"segmenting {len(cases)} scan(s) in one pass")
+    expected = [os.path.join(nnunet_output, f"{case_id}.nii.gz") for case_id in cases]
     try:
-        nnunet_runner.predict_folder(
-            model_folder, nnunet_input, nnunet_output, device,
-            tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
-        )
+        with _counting_outputs(expected, "segmenting scan", *_SEGMENTATION_SPAN):
+            nnunet_runner.predict_folder(
+                model_folder, nnunet_input, nnunet_output, device,
+                tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
+            )
     except Exception:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
     report_cases = {entry["case_id"]: entry for entry in failed_conversions}
     for index, (case_id, scan) in enumerate(cases.items(), start=1):
-        progress.report(index, len(cases), "writing scan", start=0.9)
+        progress.report(index, len(cases), "writing scan", start=_SEGMENTATION_SPAN[1])
         entry = {"case_id": case_id, "input": _describe(scan)}
         predicted = os.path.join(nnunet_output, f"{case_id}.nii.gz")
         if not os.path.isfile(predicted):
             # Reported per scan rather than raised: one unreadable patient in a
             # cohort of forty must not lose the other thirty-nine.
             entry.update(status="failed", error="nnUNet produced no output for this scan")
+            progress.log(
+                f"scan {index} of {len(cases)} produced no segmentation",
+                "warning", user=True,
+            )
             report_cases[case_id] = entry
             continue
 
@@ -355,6 +421,10 @@ def segment(
             entry.update(status="ok", produced=produced)
         except Exception as exc:  # noqa: BLE001 - one bad scan must not end the batch
             logger.exception("BatchDentalSeg: scan failed")
+            progress.log(
+                f"scan {index} of {len(cases)} could not be written; the report "
+                f"says why", "warning", user=True,
+            )
             entry.update(status="failed", error=f"{type(exc).__name__}: {exc}")
 
         report_cases[case_id] = entry

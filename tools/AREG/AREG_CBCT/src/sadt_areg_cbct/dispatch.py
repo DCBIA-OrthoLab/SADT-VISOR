@@ -288,6 +288,35 @@ def _collect_oriented(oriented_dir, output_dir, report) -> None:
     )
 
 
+# How a CBCT run shares its bar, as fractions of the whole. The supervised
+# steps come first because they run first, and the registration loop takes
+# what is left. Orientation is a full ASO run, landmark prediction through ALI
+# included; segmentation is AMASSS over the T1 cohort; registration is elastix
+# per region per subject, the longest of the three on any real cohort, so it
+# keeps the larger share. A weighting, not a measurement: what is exact is the
+# counter in each message.
+ORIENT_SHARE = 0.25
+SEGMENT_SHARE = 0.25
+
+
+def _cbct_spans(orient: bool, segment: bool) -> tuple:
+    """(orientation, segmentation, registration) spans, None for a step not run.
+
+    Each step starts where the one before it ended, so the bar only moves
+    forward, and a step a mode skips takes no slice at all rather than leaving
+    a jump where it would have been.
+    """
+    position = 0.0
+    orientation = segmentation = None
+    if orient:
+        orientation = (position, position + ORIENT_SHARE)
+        position += ORIENT_SHARE
+    if segment:
+        segmentation = (position, position + SEGMENT_SHARE)
+        position += SEGMENT_SHARE
+    return orientation, segmentation, (position, 1.0)
+
+
 def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
@@ -327,14 +356,21 @@ def _run_cbct(
     report["regions"] = list(regions)
     report["segmentation_label"] = segmentation_label or None
 
+    orient_span, segment_span, register_span = _cbct_spans(
+        orient=automation == catalogs.AUTOMATION_ORIENTED,
+        segment=automation != catalogs.AUTOMATION_SEMI,
+    )
+
     # Step 1 -- orient the T1 scans, when the mode asks for it. The T2 is NOT
     # oriented: it is about to be resampled into the T1's frame anyway, and
     # orienting it first would be one more interpolation of the same data.
     if automation == catalogs.AUTOMATION_ORIENTED:
+        progress.emit(orient_span[0], "orienting the T1 scans with ASO")
         oriented = tools.orient_scans(
             sup,
             t1_root, orientation_reference, catalogs.MODALITY_CBCT,
             landmark_model=landmark_model or "",
+            span=orient_span,
         )
         report["oriented_t1"] = True
         _collect_oriented(oriented, output_dir, report)
@@ -355,7 +391,10 @@ def _run_cbct(
         wanted = [catalogs.SEGMENTATION_CODES[name]
                   for name in _selected(segmentations, catalogs.SEGMENTATION_CHOICES)]
         structures = masks + [code for code in wanted if code not in masks]
-        amasss_dir = tools.segment_masks(sup, t1_root, segmentation_model, structures)
+        progress.emit(segment_span[0], "segmenting the T1 scans with AMASSS")
+        amasss_dir = tools.segment_masks(
+            sup, t1_root, segmentation_model, structures, span=segment_span
+        )
         mask_roots.append(amasss_dir)
         report["segmented_t1"] = sorted(structures)
         _collect_segmentations(amasss_dir, wanted, output_dir, report)
@@ -380,6 +419,13 @@ def _run_cbct(
     jobs = []
     for code in codes:
         masks = cbct_pipeline.find_masks(mask_roots, code, scan_keys=matched.matched)
+        if not masks:
+            # Every subject of this region is about to fail on the same missing
+            # mask. Said once, to the clinician who asked for the region: their
+            # result will hold none of it, and the report says so only per
+            # subject.
+            _log(sup, f"no {catalogs.region_name(code)} mask for any subject; "
+                      "that region is not registered", level="warning", user=True)
         for key, entry in sorted(matched.matched.items()):
             record = report["patients"].setdefault(key, {"status": "ok", "regions": {}})
             mask_path = masks.get(key)
@@ -400,16 +446,25 @@ def _run_cbct(
                 "segmentation_label": segmentation_label or None,
             }))
 
+    register_start, register_end = register_span
     width = _registration_width(sup, len(jobs), num_workers)
     logger.info("AREG CBCT: %d registration(s), %d at a time", len(jobs), width)
     # Declared around the registrations and nowhere else: the peak is there,
     # one pair of volumes per channel, and what runs before it is the chain's.
     progress.set_width(width)
+    # Said BEFORE the registrations start, not only as each one ends: they are
+    # the long step, and a failure inside them is diagnosed by the last thing
+    # this tool said it was doing.
+    progress.emit(register_start, "registering {} region(s) of {} subject(s)".format(
+        len(codes), len(matched.matched)))
     try:
         finished = cbct_pipeline.register_all(
             [kwargs for _code, _key, kwargs in jobs], width,
+            # Inside the registration's span of the bar, which starts where the
+            # supervised steps above ended -- not 0..1 again.
             on_done=lambda done, total: progress.emit(
-                done / total, "registration {} of {}".format(done, total)),
+                register_start + (register_end - register_start) * done / total,
+                "registration {} of {}".format(done, total)),
         )
     finally:
         progress.set_width(None)
@@ -444,6 +499,18 @@ def _registration_width(sup, wanted: int, declared: int = 0) -> int:
         logger.warning("Could not ask for channels; registering one at a time",
                        exc_info=True)
         return 1
+
+
+def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
+    """`sup.log` when there is a supervisor, the progress file's log otherwise.
+
+    Never a file name: the line reaches the operator page, and with `user`
+    the clinician's panel.
+    """
+    if sup is not None and hasattr(sup, "log"):
+        sup.log(message, level=level, user=user)
+    else:
+        progress.log(message, level=level, user=user)
 
 
 def _no_mask_reason(automation: str, code: str) -> str:

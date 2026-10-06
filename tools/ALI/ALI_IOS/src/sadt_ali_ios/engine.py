@@ -583,6 +583,7 @@ def predict_landmarks(
     prediction_ID: str = "Pred",
     output_dir: str = None,
     device: str = None,
+    span: tuple = (0.0, 1.0),
 ) -> dict:
     """Place landmarks on every mesh; return the run report.
 
@@ -591,6 +592,10 @@ def predict_landmarks(
     patients named `scan.vtk` in different folders cannot overwrite each other.
     Every mesh must already carry tooth labels: `require_labels` below refuses
     the batch otherwise, naming the tool that produces them.
+
+    `span` is the slice of the run's bar this pass fills. A run that labels
+    part of its batch on the fly calls this twice, and only the caller knows
+    which pass is which; without it the second pass sends the bar back to zero.
     """
     started_at = time.monotonic()
 
@@ -637,7 +642,7 @@ def predict_landmarks(
         # Position in the batch, never the mesh's name -- see the CBCT engine.
         # The progress event carries the same counter, for the same reason.
         logger.info("mesh %d/%d: reading and scaling", mesh_index, len(meshes))
-        progress.report(mesh_index, len(meshes), "mesh")
+        progress.report(mesh_index, len(meshes), "mesh", start=span[0], end=span[1])
 
         try:
             _predict_one_scan(

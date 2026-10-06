@@ -512,3 +512,125 @@ def test_a_named_array_still_wins(tmp_path, stub_shapeaxi):
         output_dir=tmp_path / "out", numbering="FDI", array_name="Universal_ID")
 
     assert stub_shapeaxi[0]["array_name"] == "Universal_ID"
+
+
+# ---------------------------------------------------------------------------
+# Progress -- counted off the outputs shapeaxi writes, one per finished mesh
+# ---------------------------------------------------------------------------
+
+def _events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in
+               Path(events_file).read_text().splitlines() if line]
+    return ([r for r in records if r.get("kind") != "log"],
+            [r for r in records if r.get("kind") == "log"])
+
+
+def _engine_writing_one_mesh_at_a_time(monkeypatch, events_file, write_only=None):
+    """An engine that writes its outputs in order, the way shapeaxi does, and
+    after each one waits until the watcher has seen it -- so the test does not
+    depend on how fast this machine is."""
+    import time
+
+    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
+    monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 0.01)
+
+    def fake_run(csv_path, output_dir, model_path, input_root, array_name, suffix,
+                 device, fdi, num_workers=2):
+        csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
+        with open(csv_path, encoding="utf-8") as handle:
+            meshes = [line.strip() for line in handle.read().splitlines()[1:] if line.strip()]
+        for done, mesh in enumerate(meshes[:write_only], start=1):
+            write_surface(
+                pipeline._predicted_path(output_dir, csv_stem, suffix, mesh, input_root),
+                labelled=True, array_name=array_name,
+            )
+            if done == len(meshes):
+                break
+            wanted = "mesh {} of {}".format(done + 1, len(meshes))
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if wanted in Path(events_file).read_text():
+                    break
+                time.sleep(0.01)
+
+    monkeypatch.setattr(pipeline, "_run_shapeaxi", fake_run)
+
+
+def test_progress_counts_the_meshes_shapeaxi_has_finished(tmp_path, monkeypatch):
+    """shapeaxi takes the batch in one call and says nothing on the way, but
+    it writes each mesh as soon as that mesh is done. Counting those files is
+    a count, not an estimate, so the bar moves per mesh and never ahead."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _engine_writing_one_mesh_at_a_time(monkeypatch, events_file)
+    for name in ("Smith_John", "Jones_Mary", "Brown_Ann"):
+        write_surface(tmp_path / "cohort" / (name + ".vtk"))
+    (tmp_path / "model.pth").write_bytes(b"not a real checkpoint")
+
+    report = pipeline.segment_crowns(
+        input_path=str(tmp_path / "cohort"),
+        model_path=str(tmp_path / "model.pth"),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert report["summary"]["segmented"] == 3
+    events, logs = _events(events_file)
+    assert [event["message"] for event in events] == [
+        "mesh 1 of 3", "mesh 2 of 3", "mesh 3 of 3",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    assert logs == []
+    text = events_file.read_text()
+    assert not any(name in text for name in ("Smith", "Jones", "Brown", ".vtk"))
+
+
+def test_a_mesh_shapeaxi_did_not_write_is_logged_to_the_clinician_by_position(
+    tmp_path, monkeypatch
+):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _engine_writing_one_mesh_at_a_time(monkeypatch, events_file, write_only=1)
+    write_surface(tmp_path / "cohort" / "a_Smith_John.vtk")
+    write_surface(tmp_path / "cohort" / "b_Jones_Mary.vtk")
+    (tmp_path / "model.pth").write_bytes(b"not a real checkpoint")
+
+    report = pipeline.segment_crowns(
+        input_path=str(tmp_path / "cohort"),
+        model_path=str(tmp_path / "model.pth"),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert report["summary"]["failed"] == 1
+    _, logs = _events(events_file)
+    assert [(log["level"], log["audience"], log["message"]) for log in logs] == [
+        ("warning", "user", "mesh 2 of 2 produced no segmentation"),
+    ]
+    assert "Jones" not in events_file.read_text()
+
+
+def test_the_watcher_never_counts_an_output_left_by_an_earlier_run(tmp_path, monkeypatch):
+    """A file already on disk says nothing about THIS run; counting it would
+    put a mesh on the bar that is still to come."""
+    import time
+
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    stale = tmp_path / "stale.vtk"
+    stale.write_bytes(b"")
+    fresh = tmp_path / "fresh.vtk"
+
+    with pipeline._counting_outputs([str(stale), str(fresh), str(tmp_path / "x.vtk")],
+                                    "mesh", interval=0.01):
+        time.sleep(0.05)
+        assert not events_file.exists()
+        fresh.write_bytes(b"")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not events_file.exists():
+            time.sleep(0.01)
+
+    events, _ = _events(events_file)
+    assert [event["message"] for event in events] == ["mesh 2 of 3"]

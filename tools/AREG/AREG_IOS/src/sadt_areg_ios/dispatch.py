@@ -171,6 +171,51 @@ def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, 
         )
 
 
+# How an IOS run shares its bar, as fractions of the whole, per supervised call
+# and per timepoint. The calls come first because they run first, and the
+# per-subject registration takes what is left. Crown_Seg and ALI_IOS each run a
+# network over every mesh of a timepoint; ASO's IOS mode is a tooth-centroid
+# alignment and costs little. A weighting, not a measurement: what is exact is
+# the counter in each message.
+CROWN_SHARE = 0.1
+ORIENT_SHARE = 0.05
+MGL_SHARE = 0.1
+
+
+def _ios_spans(label_and_orient: bool, predict_mgl: bool) -> dict:
+    """{step: (start, end)} for the steps this run makes, in the order it makes
+    them, ending with "register" on whatever is left.
+
+    ONE span per call: the two timepoints are two calls of each tool, so each
+    gets its own slice rather than both filling the same one -- which would
+    show the second as the bar going back.
+    """
+    steps = []
+    if label_and_orient:
+        steps += [("crowns_t1", CROWN_SHARE), ("crowns_t2", CROWN_SHARE),
+                  ("orient_t1", ORIENT_SHARE), ("orient_t2", ORIENT_SHARE)]
+    if predict_mgl:
+        steps += [("mgl_t1", MGL_SHARE), ("mgl_t2", MGL_SHARE)]
+    spans, position = {}, 0.0
+    for name, share in steps:
+        spans[name] = (round(position, 6), round(position + share, 6))
+        position += share
+    spans["register"] = (round(position, 6), 1.0)
+    return spans
+
+
+def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
+    """`sup.log` when there is a supervisor, the progress file's log otherwise.
+
+    Never a file name: the line reaches the operator page, and with `user`
+    the clinician's panel.
+    """
+    if sup is not None and hasattr(sup, "log"):
+        sup.log(message, level=level, user=user)
+    else:
+        progress.log(message, level=level, user=user)
+
+
 def _run_ios(
     t1_root, t2_root, automation, registration_model, crown_model, mgl_model, orientation_reference,
     ios_patch, mgl_landmarks_path, mgl_patch_height,
@@ -196,20 +241,29 @@ def _run_ios(
     if on_palate:
         net.check_dependencies()
 
+    spans = _ios_spans(
+        label_and_orient=automation == catalogs.AUTOMATION_FULLY,
+        predict_mgl=not on_palate and not mgl_landmarks_path,
+    )
+
     prior_transforms: dict = {}
     if automation == catalogs.AUTOMATION_FULLY:
         # Label the crowns, then orient -- the order the Slicer chain used, and
         # the necessary one: ASO's fully-automated IOS mode aligns a mesh by its
         # tooth centroids, so the labels have to exist first.
-        t1_root = tools.label_crowns(sup, t1_root, crown_model or "")
-        t2_root = tools.label_crowns(sup, t2_root, crown_model or "")
+        progress.emit(spans["crowns_t1"][0], "labelling the crowns with Crown_Seg")
+        t1_root = tools.label_crowns(sup, t1_root, crown_model or "", span=spans["crowns_t1"])
+        t2_root = tools.label_crowns(sup, t2_root, crown_model or "", span=spans["crowns_t2"])
+        progress.emit(spans["orient_t1"][0], "orienting the meshes with ASO")
         t1_root = tools.orient_scans(
             sup,
-            t1_root, orientation_reference, catalogs.MODALITY_IOS
+            t1_root, orientation_reference, catalogs.MODALITY_IOS,
+            span=spans["orient_t1"],
         )
         t2_root = tools.orient_scans(
             sup,
-            t2_root, orientation_reference, catalogs.MODALITY_IOS
+            t2_root, orientation_reference, catalogs.MODALITY_IOS,
+            span=spans["orient_t2"],
         )
         report["labelled_and_oriented"] = True
         prior_transforms = _collect_transforms(t2_root, suffix="Or")
@@ -227,6 +281,12 @@ def _run_ios(
             f"{len(matched.no_jaw)} mesh(es) named no jaw, "
             f"{len(matched.unpaired)} subject(s) appear at one timepoint only."
         )
+    if matched.unpaired:
+        # The run goes on without them, and the clinician who sent them would
+        # otherwise learn it only from the report. A count, never a key: the
+        # key is built from the caller's file names.
+        _log(sup, f"{len(matched.unpaired)} subject(s) appear at one timepoint only "
+                  "and are not registered", level="warning", user=True)
 
     if on_palate:
         predictor = butterfly.PatchPredictor(registration_model)
@@ -248,14 +308,15 @@ def _run_ios(
             # -- and one call is one model load instead of two.
             landmark_root = os.path.join(work_dir, "mgl_predicted")
             os.makedirs(landmark_root, exist_ok=True)
-            for root in (t1_root, t2_root):
+            progress.emit(spans["mgl_t1"][0], "predicting the mucogingival landmarks with ALI_IOS")
+            for root, span in ((t1_root, spans["mgl_t1"]), (t2_root, spans["mgl_t2"])):
                 # No model named: ALI picks the hosted bundle matching the input
                 # from the models hosted for IT, which is the right default and
                 # the only one a caller can express -- AREG's own model list
                 # holds the palatal checkpoint and the orientation references,
                 # none of which is a landmark bundle.
                 _merge_into(
-                    tools.predict_mucogingival(sup, root, mgl_model or ""),
+                    tools.predict_mucogingival(sup, root, mgl_model or "", span=span),
                     landmark_root,
                 )
             report["mgl_landmarks"] = "predicted by 'ALI_IOS'"
@@ -266,7 +327,8 @@ def _run_ios(
     for index, (key, jaws) in enumerate(sorted(matched.matched.items()), start=1):
         # The counter, never the patient key: the key is built from the file
         # names the caller sent, and a progress message is stored and shown.
-        progress.report(index, len(matched.matched), "subject")
+        progress.report(index, len(matched.matched), "subject",
+                        start=spans["register"][0], end=spans["register"][1])
         try:
             report["patients"][key] = ios_pipeline.register_patient(
                 jaws=jaws,

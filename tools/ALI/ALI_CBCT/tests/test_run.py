@@ -1264,10 +1264,61 @@ def test_a_batch_says_which_scan_it_is_on(tmp_path, stub_agent, cbct_environment
         regions=CRANIAL_BASE_ONLY,
     )
 
-    events = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    events = [record for record in records if record.get("kind") != "log"]
+    # One landmark per scan, so there is nothing to count inside a scan and no
+    # landmark event: a scan's last landmark stands where the next scan starts.
     assert [event["message"] for event in events] == ["scan 1 of 2", "scan 2 of 2"]
     assert [event["fraction"] for event in events] == [0.0, 0.5]
     assert not any("patient01" in event["message"] for event in events)
+    # The bundle has none of the other cranial-base landmarks, and the
+    # clinician is told so once, by count.
+    logs = [record for record in records if record.get("kind") == "log"]
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert "have no model in this bundle" in logs[0]["message"]
+
+
+def test_the_bar_moves_inside_a_scan_as_its_landmarks_come_back(
+    tmp_path, stub_agent, cbct_environment, monkeypatch
+):
+    """A search is about a minute, so a scan of many landmarks used to hold
+    the bar still for its whole length. The position is now (scan, landmark)
+    pairs finished across the cohort -- a count of searches that came back --
+    at the same tenth-of-the-scan cadence as the log line beside it."""
+    from sadt_ali_cbct import catalog as cbct_catalog_module
+
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_volume(tmp_path / "cohort" / "Smith_John.nii.gz")
+    write_volume(tmp_path / "cohort" / "Jones_Mary.nii.gz")
+    labels = cbct_catalog_module.GROUP_LABELS["CB"][:4]
+    bundle = write_cbct_bundle(tmp_path / "bundle", {"Cranial_Base": labels})
+
+    run(
+        input=tmp_path / "cohort",
+        model=bundle,
+        output_dir=tmp_path / "out",
+        landmarks=labels,
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    events = [record for record in records if record.get("kind") != "log"]
+    assert [event["message"] for event in events] == [
+        "scan 1 of 2",
+        "scan 1 of 2: 1 of 4 landmarks searched",
+        "scan 1 of 2: 2 of 4 landmarks searched",
+        "scan 1 of 2: 3 of 4 landmarks searched",
+        "scan 2 of 2",
+        "scan 2 of 2: 1 of 4 landmarks searched",
+        "scan 2 of 2: 2 of 4 landmarks searched",
+        "scan 2 of 2: 3 of 4 landmarks searched",
+    ]
+    assert [event["fraction"] for event in events] == [
+        0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875,
+    ]
+    assert [record for record in records if record.get("kind") == "log"] == []
+    text = events_file.read_text()
+    assert "Smith" not in text and "Jones" not in text
 
 
 def test_every_description_is_sourced_or_absent():

@@ -29,9 +29,11 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import threading
 import time
 from argparse import Namespace
 
+from . import progress
 from .errors import ToolInputError, ToolUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,11 @@ def array_name_for(numbering: str) -> str:
     return _ARRAY_NAMES.get(numbering, DEFAULT_ARRAY_NAME)
 
 WORK_DIRNAME = ".crownseg_work"
+
+# How often, in seconds, the output tree is looked at while shapeaxi runs. One
+# mesh takes about 52 s on the card, so two seconds is fine-grained enough to
+# move the bar promptly and coarse enough to cost nothing.
+WATCH_INTERVAL = 2.0
 
 # The published crown-segmentation checkpoint, and the token every one of them
 # is named with. Fly-by-CNN publishes its weights under the training run that
@@ -176,6 +183,10 @@ def resolve_device(requested: str = None) -> str:
         return "cuda:0"
     if wanted.startswith("cuda"):
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
+        progress.log(
+            "a GPU was requested but none is visible; segmenting on the CPU",
+            "warning",
+        )
     return "cpu"
 
 
@@ -366,6 +377,51 @@ def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: s
         dental_model_seg.main(args)
 
 
+@contextlib.contextmanager
+def _counting_outputs(expected, what, interval=None):
+    """Report "mesh k of n" while shapeaxi runs, from the outputs that exist.
+
+    shapeaxi takes the whole batch in one call and says nothing on the way, but
+    it writes each mesh's segmented copy as soon as that mesh is done, to a
+    path known in advance. So the number of those files that exist IS the
+    number of meshes finished -- a count, not an estimate -- and a thread that
+    looks at them every few seconds can move the bar truthfully.
+
+    A file that was already there before the call is not counted: it says
+    nothing about this run, and counting it would claim a mesh still to come.
+    The thread is a daemon, is stopped in a `finally` whatever the call does,
+    and swallows every error of its own -- progress must never fail a run.
+    """
+    interval = WATCH_INTERVAL if interval is None else interval
+    total = len(expected)
+    try:
+        fresh = [path for path in expected if not os.path.exists(path)]
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+        fresh = []
+    stop = threading.Event()
+
+    def watch():
+        reported = 0
+        while not stop.wait(interval):
+            try:
+                done = sum(1 for path in fresh if os.path.exists(path))
+                # The last mesh is not reported here: once it exists the call
+                # is about to return, and the run's own next step says so.
+                if reported < done < total:
+                    reported = done
+                    progress.report(done + 1, total, what)
+            except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+                pass
+
+    thread = threading.Thread(target=watch, name="crownseg-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=interval + 1.0)
+
+
 def _predicted_path(output_dir: str, csv_stem: str, suffix: str, mesh: str,
                     input_root: str) -> str:
     """Where shapeaxi's csv branch writes the segmented copy of `mesh`.
@@ -470,6 +526,13 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
         engine_available, engine_error = True, None
     except Exception as exc:  # ToolUnavailableError, or anything its import raises
         engine_available, engine_error = False, f"{type(exc).__name__}: {exc}"
+        # The operator's to fix, not the clinician's: the deployment is missing
+        # an extra. The reason itself stays in the report, where an install
+        # path in it reaches nobody but the caller.
+        progress.log(
+            "the segmentation engine is not installed here; only meshes that "
+            "already carry labels can be served", "warning",
+        )
 
     records = {}
     produced = []
@@ -518,20 +581,28 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                 handle.write(f"{mesh}\n")
 
         logger.info("CrownSeg: segmenting %d mesh(es) on %s", len(to_segment), device)
-        _run_shapeaxi(
-            csv_path=csv_path,
-            output_dir=output_dir,
-            model_path=model_path,
-            input_root=input_root,
-            array_name=array_name,
-            suffix=suffix,
-            device=device,
-            fdi=fdi,
-            num_workers=num_workers,
-        )
-
         csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
-        for mesh in to_segment:
+        expected = [
+            _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
+            for mesh in to_segment
+        ]
+        # The model load inside shapeaxi is not visible from here, so the first
+        # mesh is announced at the start of the bar and the load is part of it.
+        progress.report(1, len(to_segment), "mesh")
+        with _counting_outputs(expected, "mesh"):
+            _run_shapeaxi(
+                csv_path=csv_path,
+                output_dir=output_dir,
+                model_path=model_path,
+                input_root=input_root,
+                array_name=array_name,
+                suffix=suffix,
+                device=device,
+                fdi=fdi,
+                num_workers=num_workers,
+            )
+
+        for index, mesh in enumerate(to_segment, start=1):
             relative = os.path.relpath(mesh, input_root)
             predicted = _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
             if os.path.isfile(predicted):
@@ -540,6 +611,10 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                 produced.append(predicted)
             else:
                 # One mesh shapeaxi could not write must not cost the batch.
+                progress.log(
+                    f"mesh {index} of {len(to_segment)} produced no segmentation",
+                    "warning", user=True,
+                )
                 records[relative] = {
                     "status": "failed",
                     "input": relative,

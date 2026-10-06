@@ -3,6 +3,7 @@
 import logging
 import os
 
+from . import progress
 from .pipeline import GRADCAM_IMAGE_SIZE, scale_attribution
 
 logger = logging.getLogger("DOCShapeAXI")
@@ -34,8 +35,12 @@ def _dataset(model, surfaces, mount_point, device):
     )
 
 
-def predict(model, analysis, surfaces, mount_point, device) -> list:
-    """One prediction per surface, in the order given."""
+def predict(model, analysis, surfaces, mount_point, device, span=(0.0, 1.0)) -> list:
+    """One prediction per surface, in the order given.
+
+    `span` is the slice of the run's bar this pass occupies; the surfaces are
+    counted across it as they are taken off the loader.
+    """
     import torch
     from torch.utils.data import DataLoader
 
@@ -45,7 +50,8 @@ def predict(model, analysis, surfaces, mount_point, device) -> list:
 
     predictions = []
     with torch.no_grad():
-        for vertices, faces, normals in loader:
+        for index, (vertices, faces, normals) in enumerate(loader, start=1):
+            progress.report(index, len(surfaces), "classifying surface", *span)
             vertices = vertices.to(device)
             faces = faces.to(device)
             normals = normals.to(device)
@@ -64,12 +70,16 @@ def predict(model, analysis, surfaces, mount_point, device) -> list:
     return predictions
 
 
-def explain(model, analysis, surfaces, mount_point, device, output_dir) -> list:
+def explain(model, analysis, surfaces, mount_point, device, output_dir,
+            span=(0.0, 1.0)) -> list:
     """One surface per input, carrying a GradCAM array per class.
 
     Written ONCE per surface, after every class has been added. Upstream wrote
     the file inside the per-class loop, to the same path each time, so a
     four-class run rewrote the same file four times.
+
+    `span` is the slice of the run's bar this pass occupies, counted per
+    surface like `predict`.
     """
     from captum.attr import LayerGradCam
     from shapeaxi import post_process, utils
@@ -84,6 +94,7 @@ def explain(model, analysis, surfaces, mount_point, device, output_dir) -> list:
 
     written = []
     for index, (vertices, faces, normals) in enumerate(loader):
+        progress.report(index + 1, len(surfaces), "explaining surface", *span)
         vertices = vertices.to(device)
         faces = faces.to(device)
         normals = normals.to(device)

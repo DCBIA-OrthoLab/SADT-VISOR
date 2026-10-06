@@ -180,6 +180,68 @@ def test_the_run_reports_where_it_has_got_to(tmp_path):
                for _fraction, message in sup.messages), "a patient must not travel in a message"
 
 
+def assert_one_bar(sup):
+    """Every call carries a span, and waypoints and spans only move forward.
+
+    The server folds each call's own 0..1 into the span it was handed, so a
+    span starting before the last one ended, or a waypoint behind a finished
+    call, is the clinician's bar going backwards.
+    """
+    assert sup.timeline, "nothing reported"
+    position = 0.0
+    for what, span in sup.timeline:
+        assert span is not None, f"{what} was called with no span"
+        start, end = span
+        assert position - 1e-9 <= start <= end <= 1.0, (what, span, position)
+        position = end
+
+
+def test_every_call_fills_its_own_slice_of_one_bar(tmp_path):
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(tmp_path))
+    assert_one_bar(sup)
+    assert all("_progress" not in params for _tool, params in sup.calls)
+
+
+def test_a_longitudinal_run_fills_one_bar_through_its_second_orientation(tmp_path):
+    sup = PipelineSup(tmp_path)
+    for patient in PATIENTS:
+        write_volume(tmp_path / "t2" / f"{patient}_T2.nii.gz")
+    run(sup=sup, **request(
+        tmp_path, study=catalogs.STUDY_LONGITUDINAL, t2=str(tmp_path / "t2"),
+    ))
+    assert_one_bar(sup)
+
+
+def test_heat_maps_have_a_stage_of_their_own(tmp_path):
+    """They used to reuse the classification's waypoint, at 0.97, for what is
+    the longest stage left in a heat-map run."""
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(
+        tmp_path, outputs=catalogs.OUTPUT_BOTH,
+        surface_model=str(tmp_path / "models" / "bds"),
+    ))
+    assert_one_bar(sup)
+    surfaces = [span for tool, span in sup.spans if tool == "Batch_Dental_Seg"]
+    assert len(surfaces) == 2 * len(catalogs.REGIONS)
+    assert surfaces[-1][1] == 1.0
+    assert surfaces[0][0] < 0.97
+
+
+def test_the_plan_tiles_the_bar_in_every_mode():
+    for mode in catalogs.MODES:
+        for study in catalogs.STUDIES:
+            for measure in (True, False):
+                for heat in (True, False):
+                    if not (measure or heat):
+                        continue
+                    spans = list(dispatch._plan(mode, study, measure, heat).values())
+                    assert spans[0][0] == dispatch.LEAD
+                    assert spans[-1][1] == 1.0
+                    for (_s0, e0), (s1, _e1) in zip(spans, spans[1:]):
+                        assert e0 == pytest.approx(s1)
+
+
 # ---------------------------------------------------------------------------
 # The classification
 # ---------------------------------------------------------------------------

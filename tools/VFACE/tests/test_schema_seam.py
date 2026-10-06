@@ -69,8 +69,12 @@ class RecordingSup:
         self.tmp = tmp_path / "tmp"
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.calls = []
+        self.spans = []
 
     def run(self, tool, **params):
+        # `_progress` is the supervisor's, removed before the callee sees it,
+        # so it is never among the arguments checked against a schema.
+        self.spans.append(params.pop("_progress", None))
         self.calls.append((tool, params))
         produced = self.tmp / "produced"
         produced.mkdir(exist_ok=True)
@@ -84,6 +88,9 @@ class RecordingSup:
         return produced
 
     def progress(self, fraction, message):
+        pass
+
+    def log(self, message, level="info", user=False):
         pass
 
 

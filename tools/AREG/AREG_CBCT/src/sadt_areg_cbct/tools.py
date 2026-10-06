@@ -78,8 +78,19 @@ def _returned(produced) -> str:
     return str(produced)
 
 
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing, which is what a caller with no bar of its own wants.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
-                 landmark_model: str = "", **extra) -> str:
+                 landmark_model: str = "", span=None, **extra) -> str:
     """Orient every case under `scan_dir` onto `reference_path`.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
@@ -113,7 +124,7 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
         if labels:
             parameters["cbct_landmarks"] = labels
     parameters.update(extra)
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
 def reference_landmarks(reference_path: str) -> list:
@@ -147,7 +158,7 @@ def reference_landmarks(reference_path: str) -> list:
     return []
 
 
-def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
+def segment_masks(sup, scan_dir: str, model_path: str, mask_structures, span=None) -> str:
     """Segment every scan under `scan_dir` into the requested mask structures.
 
     Returns the directory holding AMASSS's output, which `cbct.pipeline.find_masks`
@@ -176,4 +187,5 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
         merge=["SEPARATE"],
         prediction_ID="seg",
         generate_surface=False,
+        **_span(span),
     ))

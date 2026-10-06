@@ -824,6 +824,10 @@ def test_progress_counts_structures_because_that_is_what_the_run_loops_over(
     """
     events_file = tmp_path / "events.jsonl"
     monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    # The masks counted between completions are pinned by the test below; the
+    # watcher is kept out of this one so its exact sequence cannot depend on
+    # how fast the stub writes.
+    monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 3600.0)
     _write_scan(tmp_path / "input" / "patient01.nii.gz")
     _write_scan(tmp_path / "input" / "patient02.nii.gz")
     bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
@@ -838,7 +842,8 @@ def test_progress_counts_structures_because_that_is_what_the_run_loops_over(
     )
 
     events = [json.loads(line) for line in
-              Path(events_file).read_text().splitlines() if line]
+              Path(events_file).read_text().splitlines()
+              if line and json.loads(line).get("kind") != "log"]
     assert [event["message"] for event in events] == [
         "reading scan 1 of 2", "reading scan 2 of 2",
         "structure 1 of 2", "structure 2 of 2",
@@ -848,6 +853,104 @@ def test_progress_counts_structures_because_that_is_what_the_run_loops_over(
     assert fractions == sorted(fractions), "the bar must not restart per phase"
     assert max(fractions) < 1.0, "the run is not finished until the server says so"
     assert not any("patient" in event["message"] for event in events)
+
+
+def test_the_bar_moves_inside_a_structure_as_its_masks_are_written(
+    tmp_path, monkeypatch
+):
+    """One nnUNet call per structure covers the whole cohort and says nothing
+    on the way, but it writes each case's mask as soon as that case is done.
+    Counting those masks across every structure is a count of (structure,
+    scan) pairs finished -- never an estimate -- so the bar moves through each
+    structure instead of sitting still for its whole length, and never runs
+    ahead of, or back behind, the completions reported beside it.
+    """
+    import time
+
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 0.01)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested: "cpu")
+    total_masks = 4
+    written = []
+
+    def one_case_at_a_time(model_folder, input_dir, output_dir, device, **kwargs):
+        os.makedirs(output_dir, exist_ok=True)
+        for name in sorted(os.listdir(input_dir)):
+            if not name.endswith("_0000.nii.gz"):
+                continue
+            case_id = name[: -len("_0000.nii.gz")]
+            reference = sitk.ReadImage(os.path.join(input_dir, name))
+            array = np.zeros(sitk.GetArrayFromImage(reference).shape, dtype=np.uint8)
+            array[2:5, 2:5, 2:5] = 1
+            mask = sitk.GetImageFromArray(array)
+            mask.CopyInformation(reference)
+            sitk.WriteImage(mask, os.path.join(output_dir, f"{case_id}.nii.gz"))
+            written.append(case_id)
+            if len(written) == total_masks:
+                continue
+            # Wait for the watcher to have seen this mask, so the sequence
+            # below does not depend on how fast this machine is.
+            wanted = f"mask {len(written) + 1} of {total_masks}"
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and wanted not in events_file.read_text():
+                time.sleep(0.01)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", one_case_at_a_time)
+    _write_scan(tmp_path / "input" / "Smith_John.nii.gz")
+    _write_scan(tmp_path / "input" / "Jones_Mary.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    events = [record for record in records if record.get("kind") != "log"]
+    assert [event["message"] for event in events] == [
+        "reading scan 1 of 2", "reading scan 2 of 2",
+        "mask 2 of 4", "mask 3 of 4", "structure 1 of 2",
+        "mask 4 of 4", "structure 2 of 2",
+        "writing scan 1 of 2", "writing scan 2 of 2",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions), "the two counts must not fight"
+    assert all(0.1 <= event["fraction"] < 0.9 for event in events
+               if event["message"].startswith(("mask", "structure")))
+    assert [record for record in records if record.get("kind") == "log"] == []
+    text = events_file.read_text()
+    assert "Smith" not in text and "Jones" not in text
+
+
+def test_a_structure_with_no_model_is_logged_to_the_clinician(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """Asked for and not delivered: the report lists it, and the panel says so
+    at the time, by the structure's code -- which names anatomy, not a patient."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    report = pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+    )
+
+    assert report["structures_without_model"] == ["MAX"]
+    logs = [json.loads(line) for line in events_file.read_text().splitlines()
+            if line and json.loads(line).get("kind") == "log"]
+    assert [(log["level"], log["audience"], log["message"]) for log in logs] == [
+        ("warning", "user", "no model is installed for MAX; it was not segmented"),
+    ]
 
 
 # ---------------------------------------------------------------------------

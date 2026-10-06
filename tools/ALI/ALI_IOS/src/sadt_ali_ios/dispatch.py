@@ -190,7 +190,10 @@ def _stage(source: str, destination: str) -> None:
         shutil.copy2(source, destination)
 
 
-def _segment(sup, meshes: list, model_path: str, device: str, work_dir: str) -> tuple:
+def _segment(
+    sup, meshes: list, model_path: str, device: str, work_dir: str,
+    span: tuple = (0.0, 1.0),
+) -> tuple:
     """Ask `Crown_Seg` for tooth labels; return `(labelled, {key: reason})`.
 
     `meshes` and the first return value are both `(path, key)` pairs, and the
@@ -234,6 +237,9 @@ def _segment(sup, meshes: list, model_path: str, device: str, work_dir: str) -> 
         # server would otherwise have every supervised call ask for CUDA and
         # fall back with a warning.
         device=device,
+        # This call's slice of the run's bar; the server folds Crown_Seg's
+        # own 0..1 into it and removes the keyword before Crown_Seg sees it.
+        _progress=span,
     )
     # A tool returns a Path, or a dict of named ones.
     if isinstance(produced, dict):
@@ -416,6 +422,35 @@ def _filter_markups(path: str, wanted: set) -> list:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _bar_spans(labelled: int, unlabelled: int) -> tuple:
+    """Where the three phases of a run sit on its bar, as (start, end) pairs.
+
+    The labelled meshes' landmark pass, then Crown_Seg on the rest, then the
+    landmark pass over what it labelled -- in that order, which is the order
+    they run in, so the bar only moves forward. Weighted per mesh, one unit for
+    a landmark pass and one for a segmentation: neither engine publishes a
+    timing, and the counter in each message is what is exact; this is only how
+    the bar is shared between them. With nothing to segment the first pass is
+    the whole bar, exactly as it was before there was a second one.
+    """
+    units = float(labelled + 2 * unlabelled) or 1.0
+    first_end = labelled / units
+    segmentation_end = (labelled + unlabelled) / units
+    return (0.0, first_end), (first_end, segmentation_end), (segmentation_end, 1.0)
+
+
+def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
+    """`sup.log` when there is a supervisor that has one, the logger otherwise.
+
+    Never a file name: the line reaches the operator page, and with `user`
+    the clinician's panel.
+    """
+    if sup is not None and hasattr(sup, "log"):
+        sup.log(message, level=level, user=user)
+    else:
+        logger.log(logging.WARNING if level == "warning" else logging.INFO, message)
+
+
 def identify(
     input_path: str,
     model_path: str,
@@ -499,6 +534,9 @@ def identify(
                     len(unlabelled), len(detected.scans), CROWN_TOOL,
                 )
 
+        labelled_span, segmentation_span, segmented_span = _bar_spans(
+            len(labelled), len(unlabelled)
+        )
         pass_arguments = dict(
             model_path=model_path,
             networks=networks,
@@ -508,7 +546,7 @@ def identify(
         )
         reports, errors = [], []
 
-        def run_pass(meshes: list) -> None:
+        def run_pass(meshes: list, span: tuple) -> None:
             """One engine pass, allowed to fail without sinking the other.
 
             `predict_landmarks` raises when NO mesh of the batch it was given
@@ -524,7 +562,9 @@ def identify(
             cost a second failure and tell nobody anything.
             """
             try:
-                reports.append(ios_engine.predict_landmarks(meshes=meshes, **pass_arguments))
+                reports.append(ios_engine.predict_landmarks(
+                    meshes=meshes, span=span, **pass_arguments
+                ))
             except (ToolUnavailableError, ToolInputError):
                 raise
             except Exception as exc:  # noqa: BLE001 - recorded, re-raised below
@@ -535,7 +575,7 @@ def identify(
         # have, so their landmarks are on disk before a second of segmentation is
         # spent -- which is what a cancelled or timed-out run keeps.
         if labelled:
-            run_pass(labelled)
+            run_pass(labelled, labelled_span)
 
         segmented, segmentation_failures = [], {}
         if unlabelled:
@@ -547,17 +587,16 @@ def identify(
             # calls it again.
             ios_engine.check_dependencies()
             if hasattr(sup, "progress"):
-                # The share of the batch already behind us. The engine's own
-                # per-mesh events restart at zero for the second pass, which it
-                # cannot know it is (see `progress.report`'s start/end bounds,
-                # which only the caller of the loop could pass).
+                # Where the first pass ended, which is where the segmentation's
+                # own slice begins: each phase is handed its slice of the bar
+                # (see `_bar_spans`), so nothing restarts it at zero.
                 sup.progress(
-                    len(labelled) / float(len(detected.scans)),
+                    segmentation_span[0],
                     f"labelling {len(unlabelled)} mesh(es) with {CROWN_TOOL}",
                 )
             try:
                 segmented, segmentation_failures = _segment(
-                    sup, unlabelled, model_path, device, work_dir
+                    sup, unlabelled, model_path, device, work_dir, segmentation_span
                 )
             except Exception as exc:  # noqa: BLE001 - see below
                 # The whole call failed -- no checkpoint in the bundle, the
@@ -568,8 +607,17 @@ def identify(
                 logger.exception("'%s' could not label %d mesh(es)", CROWN_TOOL, len(unlabelled))
                 reason = f"{type(exc).__name__}: {exc}"
                 segmentation_failures = {key: reason for _path, key in unlabelled}
+            if segmentation_failures:
+                # The clinician's result is short of these meshes, and only the
+                # run report would otherwise say so. A count, never a name.
+                _log(
+                    sup,
+                    f"{len(segmentation_failures)} of {len(unlabelled)} mesh(es) without "
+                    f"tooth labels could not be labelled by {CROWN_TOOL} and have no landmarks",
+                    level="warning", user=True,
+                )
             if segmented:
-                run_pass(segmented)
+                run_pass(segmented, segmented_span)
 
         if not reports:
             if errors:

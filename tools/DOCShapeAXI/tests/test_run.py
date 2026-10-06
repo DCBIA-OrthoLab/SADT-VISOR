@@ -46,10 +46,11 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(pipeline, "resolve_device", lambda requested: "cpu")
     monkeypatch.setattr(pipeline, "load_network", lambda *a, **k: object())
 
-    def predict(model, analysis, surfaces, mount_point, device):
+    def predict(model, analysis, surfaces, mount_point, device, span=(0.0, 1.0)):
         return [float(index % max(analysis.classes, 1)) for index in range(len(surfaces))]
 
-    def explain(model, analysis, surfaces, mount_point, device, output_dir):
+    def explain(model, analysis, surfaces, mount_point, device, output_dir,
+                span=(0.0, 1.0)):
         written = []
         for path in surfaces:
             destination = os.path.join(output_dir, os.path.basename(path))
@@ -1003,3 +1004,98 @@ def test_the_gradcam_namespace_defaults_to_no_target_class():
     from sadt_docshapeaxi.engine import _Namespace
 
     assert _Namespace(device="cpu").target_class is None
+
+
+# ---------------------------------------------------------------------------
+# Progress -- the load announced, then each pass counted per surface
+# ---------------------------------------------------------------------------
+
+def _events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    return ([r for r in records if r.get("kind") != "log"],
+            [r for r in records if r.get("kind") == "log"])
+
+
+class _FakeNetwork:
+    """Just enough of a shapeaxi network for `engine.predict` to loop over."""
+
+    class hparams:
+        sample_levels = [16]
+
+    def create_mesh(self, vertices, faces, normals):
+        return vertices
+
+    def sample_points_from_meshes(self, mesh, level):
+        return mesh
+
+    def render(self, mesh):
+        return mesh, None
+
+    def __call__(self, points, views):
+        import torch
+
+        return torch.tensor([[0.1, 0.9]])
+
+
+def test_the_prediction_pass_counts_surfaces_and_never_names_one(tmp_path, monkeypatch):
+    """The real `engine.predict` loop, over a stand-in network and dataset:
+    the count it reports is the surfaces it has actually taken."""
+    torch = pytest.importorskip("torch")
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    monkeypatch.setattr(pipeline, "resolve_device", lambda requested: "cpu")
+    monkeypatch.setattr(pipeline, "load_network", lambda *a, **k: _FakeNetwork())
+    monkeypatch.setattr(
+        engine, "_dataset",
+        lambda model, surfaces, mount_point, device: [
+            (torch.zeros(3, 3), torch.zeros(1, 3, dtype=torch.long), torch.zeros(3, 3))
+            for _ in surfaces
+        ],
+    )
+    for name in ("Smith_John", "Jones_Mary"):
+        write_surface(tmp_path / "in" / (name + ".vtk"))
+    checkpoint = tmp_path / "airways_2_class.ckpt"
+    checkpoint.write_bytes(b"")
+
+    result = run(surfaces=str(tmp_path / "in"), model=str(checkpoint),
+                 output_dir=str(tmp_path / "out"), explain=False)
+
+    assert [entry["class"] for entry in result["predictions"]] == [1, 1]
+    events, logs = _events(events_file)
+    assert [event["message"] for event in events] == [
+        "loading the model", "classifying surface 1 of 2", "classifying surface 2 of 2",
+    ]
+    assert [event["fraction"] for event in events] == [0.0, 0.0, 0.5]
+    assert logs == []
+    text = events_file.read_text()
+    assert "Smith" not in text and "Jones" not in text and ".vtk" not in text
+
+
+def test_the_explanation_takes_the_bar_from_where_the_prediction_left_it(
+    tmp_path, monkeypatch, stubbed
+):
+    """Two passes, one bar: the explanation must not send it back to zero."""
+    spans = {}
+    real_predict, real_explain = engine.predict, engine.explain
+
+    def predict(*args, span=(0.0, 1.0), **kwargs):
+        spans["predict"] = span
+        return real_predict(*args, span=span, **kwargs)
+
+    def explain(*args, span=(0.0, 1.0), **kwargs):
+        spans["explain"] = span
+        return real_explain(*args, span=span, **kwargs)
+
+    monkeypatch.setattr(engine, "predict", predict)
+    monkeypatch.setattr(engine, "explain", explain)
+    write_surface(tmp_path / "in" / "a.vtk")
+    checkpoint = tmp_path / "condyles_4_class.ckpt"
+    checkpoint.write_bytes(b"")
+
+    run(surfaces=str(tmp_path / "in"), model=str(checkpoint),
+        output_dir=str(tmp_path / "out"))
+
+    assert spans["predict"][1] == spans["explain"][0]
+    assert 0.0 < spans["explain"][0] < 1.0
+    assert spans["explain"][1] == 1.0

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
+from . import progress
 from .dependencies import ToolUnavailableError
 from .extraction import (
     SYSTEM_PROMPTS,
@@ -140,6 +141,13 @@ def run(
             f"'{model_file.name}' names '{hint}'. Check they match."
         )
         logger.warning("%s", warnings[-1])
+        # The clinician's copy says the same without the model's file name: it
+        # is an argument value, and those stay out of the run's events.
+        progress.log(
+            f"the model chosen looks like the {hint} fine-tune, but the notes "
+            f"were declared {notes_type}; check the extractions",
+            "warning", user=True,
+        )
 
     window = context_for(notes_type, context_tokens)
     wants_gpu = device.startswith("cuda")
@@ -162,6 +170,15 @@ def run(
             "the CUDA build of llama-cpp-python, or ask for device='cpu'."
         )
         logger.warning("%s", warnings[-1])
+        # The operator's concern rather than the clinician's: the result is the
+        # same, only slower, and the fix is in the deployment.
+        progress.log(
+            "a GPU was requested but this llama.cpp build has none; running "
+            "on the CPU", "warning",
+        )
+    # The 4.4 GB load is one opaque call, so it is announced at the start of the
+    # bar rather than given a share of it nothing here could measure.
+    progress.emit(0.0, "loading the language model")
     engine = load_model(model_file, window, seed, -1 if wants_gpu else 0)
     logger.info(
         "CNE: %d note(s), type=%s, context=%d, max_tokens=%d, temperature=%.2f",
@@ -188,7 +205,10 @@ def run(
     written = []
     failures = []
 
-    for note in found:
+    for index, note in enumerate(found, start=1):
+        # One note is one call to the model, 2 to 176 s each as measured, so
+        # the position in the batch is the only progress there is to report.
+        progress.report(index, len(found), "note")
         relative = note.relative_to(root)
         entry = {"input": relative.as_posix()}
         try:
@@ -204,8 +224,18 @@ def run(
             # inner `except ... continue` counted failures into a tally that
             # was then printed over by an unconditional "All files processed
             # successfully!".
+            #
+            # Logged by position and by the KIND of failure only: the note's
+            # path is patient metadata, and a reader's own exception can name
+            # the file it could not open. The full reason goes to the report,
+            # which returns to whoever sent the notes.
             logger.warning(
-                "CNE could not extract from %s: %s", relative.as_posix(), exc
+                "CNE could not extract from note %d of %d: %s",
+                index, len(found), type(exc).__name__,
+            )
+            progress.log(
+                f"note {index} of {len(found)} could not be extracted; the "
+                f"report says why", "warning", user=True,
             )
             entry["status"] = "failed"
             entry["reason"] = f"{type(exc).__name__}: {exc}"

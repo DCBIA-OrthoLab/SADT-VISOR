@@ -140,9 +140,14 @@ class FakeSup:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.outputs = outputs or {}
         self.calls = []
+        self.spans = []
         self.messages = []
+        self.logs = []
 
     def run(self, tool, **params):
+        # The caller's span of its own bar. The server's supervisor removes it
+        # before the callee sees it, so it is recorded apart, never passed on.
+        self.spans.append((tool, params.pop("_progress", None)))
         self.calls.append((tool, params))
         maker = self.outputs.get(tool)
         if maker is None:
@@ -155,8 +160,9 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
+        self.logs.append((level, user, message))
 
     def asked(self, tool):
         """The parameters of the one call to `tool`."""

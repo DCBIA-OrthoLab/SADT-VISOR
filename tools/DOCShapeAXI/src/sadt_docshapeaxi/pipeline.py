@@ -16,6 +16,8 @@ in 2.0.3 and has not fixed here.
 import logging
 import os
 
+from . import progress
+
 logger = logging.getLogger("DOCShapeAXI")
 
 # What a surface file may be called. Upstream globbed `.vtk` only.
@@ -68,6 +70,9 @@ def resolve_device(requested: str) -> str:
     torch = import_torch()
     if requested == "cuda" and not torch.cuda.is_available():
         logger.warning("cuda requested but no CUDA device is visible; running on cpu")
+        progress.log(
+            "a GPU was requested but none is visible; running on the CPU", "warning"
+        )
         return "cpu"
     return requested
 

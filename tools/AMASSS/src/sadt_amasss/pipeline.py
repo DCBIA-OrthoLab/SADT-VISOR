@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import threading
 import time
 
 from . import nnunet_runner, progress, vtk_export
@@ -157,6 +158,12 @@ def resolve_models(model_path: str, structures):
         model_folder = nnunet_runner.find_model_folder(model_path, code)
         if model_folder is None:
             logger.warning("No usable model for structure '%s' in %s", code, model_path)
+            # The clinician asked for this structure and will not get it; the
+            # report lists it too, but a missing mask is easy to overlook.
+            progress.log(
+                f"no model is installed for {code}; it was not segmented",
+                "warning", user=True,
+            )
             missing.append(code)
         else:
             available[code] = model_folder
@@ -231,6 +238,81 @@ def _write_segmentation(array, reference, output_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
+# How often, in seconds, the structures' output folders are looked at while
+# nnUNet runs. One scan takes about a minute per structure on the card, so two
+# seconds moves the bar promptly and costs nothing.
+WATCH_INTERVAL = 2.0
+
+
+class _InferenceProgress:
+    """The bar through the structure phase, from two counts that are both real.
+
+    One nnUNet call per structure covers the whole cohort and says nothing on
+    the way, but it exports each case's mask under the case id as soon as that
+    case is done, to a folder of the structure's own. So the masks on disk,
+    across every structure, ARE the (structure, scan) pairs finished: a thread
+    counting them every few seconds moves the bar between the structures'
+    completions instead of leaving it still for the length of each one.
+
+    Both writers -- that thread and the loop collecting finished structures --
+    go through one lock and one high-water mark, so neither can send the bar
+    backwards past what the other already showed. A mask already on disk
+    before the phase is not counted, and the thread is a daemon, stopped in
+    `stop()`, that swallows every error of its own: progress must never fail a
+    run.
+    """
+
+    def __init__(self, expected, start, end, interval=None):
+        self.start, self.end = start, end
+        self.interval = WATCH_INTERVAL if interval is None else interval
+        self.total = len(expected)
+        try:
+            self.fresh = [path for path in expected if not os.path.exists(path)]
+        except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+            self.fresh = []
+        self.lock = threading.Lock()
+        self.high = start
+        self.reported = 0
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(
+            target=self._watch, name="amasss-progress", daemon=True
+        )
+
+    def _emit(self, share, message):
+        with self.lock:
+            fraction = max(self.high, self.start + (self.end - self.start) * share)
+            self.high = fraction
+            progress.emit(fraction, message)
+
+    def structure_done(self, done, total):
+        """A structure has finished: "structure k of n", where k is the next."""
+        # The same arithmetic `progress.report` uses, so the message keeps its
+        # meaning; only the floor is raised to what the masks already showed.
+        self._emit((done - 1) / float(total), f"structure {done} of {total}")
+
+    def _watch(self):
+        while not self.stopping.wait(self.interval):
+            try:
+                done = sum(1 for path in self.fresh if os.path.exists(path))
+                # The last mask is not reported: once it exists its structure
+                # is about to complete, and that completion says so itself.
+                if self.reported < done < self.total:
+                    self.reported = done
+                    self._emit(done / float(self.total),
+                               f"mask {done + 1} of {self.total}")
+            except Exception:  # noqa: BLE001 -- telemetry must never fail a run
+                pass
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.stopping.set()
+        self.thread.join(timeout=self.interval + 1.0)
+        return False
+
 
 def _channels_for(sup, wanted: int, declared: int = 0) -> int:
     """How many structures to predict at once: what the machine will pay for.
@@ -415,6 +497,10 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
             # progress call above follows, and it matters more here: a failed
             # run's stderr is copied into the server's own persistent log.
             logger.exception("Could not read scan %d of %d", index + 1, len(scans))
+            progress.log(
+                f"scan {index + 1} of {len(scans)} could not be read and was "
+                f"left out", "warning", user=True,
+            )
             record["status"] = "failed"
             record["error"] = f"Unreadable input: {exc}"
         scan_records.append(record)
@@ -460,7 +546,12 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
     # fewer of them.
     progress.set_width(width)
     done = 0
-    with futures.ThreadPoolExecutor(max_workers=width) as pool:
+    expected = [
+        os.path.join(work_dir, f"pred_{code}", f"{record['case_id']}.nii.gz")
+        for code in models for record in readable
+    ]
+    with _InferenceProgress(expected, start=0.1, end=0.9) as bar, \
+            futures.ThreadPoolExecutor(max_workers=width) as pool:
         running = {pool.submit(predict, item): item[0] for item in models.items()}
         for future in futures.as_completed(running):
             code = running[future]
@@ -468,13 +559,17 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
             # Reported on COMPLETION, not on submission: with a pool every
             # structure starts at once, so a bar driven off starts would jump
             # to full and then sit there for the length of the run.
-            progress.report(done, len(models), "structure", start=0.1, end=0.9)
+            bar.structure_done(done, len(models))
             try:
                 _code, structure_output = future.result()
                 predictions[code] = structure_output
             except Exception as exc:
                 # One structure failing must not lose the others.
                 logger.exception("Prediction failed for structure %s", code)
+                progress.log(
+                    f"{code} could not be segmented; the report says why",
+                    "warning", user=True,
+                )
                 failed_structures[code] = str(exc)
     # Back to declaring nothing: what follows is one scan at a time again, and
     # a width left standing over it would be the permission masquerading as a

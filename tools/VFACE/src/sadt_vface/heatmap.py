@@ -205,7 +205,7 @@ def _surfaces_by_patient(root: str) -> dict:
 
 
 def draw_cohort(sup, oriented: dict, registered: dict, regions, surface_model: str,
-                output_dir: str, work_dir: str, report: dict) -> str:
+                output_dir: str, work_dir: str, report: dict, span=None) -> str:
     """A heat map per patient per region, written under `Heat maps/<region>/`.
 
     Both sides are segmented rather than one: the baseline's surface comes from
@@ -215,14 +215,19 @@ def draw_cohort(sup, oriented: dict, registered: dict, regions, surface_model: s
     """
     destination = os.path.join(output_dir, "Heat maps")
     drawn = 0
+    # Two segmentations per region, each in its own slice of `span` and in the
+    # order they are made. The distance maps between them are seconds against
+    # the minutes of a segmentation, so they take no slice of their own.
+    slices = iter(tools.split_span(span, [1] * (2 * len(regions))))
 
     for region in regions:
         frame = catalogs.REGION_TABLE[region]["frame"]
         baseline = _surfaces_by_patient(tools.segment_surfaces(
-            sup, oriented[frame], surface_model, label=f"t1-{frame}"
+            sup, oriented[frame], surface_model, label=f"t1-{frame}", span=next(slices),
         ))
         compared = _surfaces_by_patient(tools.segment_surfaces(
-            sup, registered[region], surface_model, label=f"t2-{region}"
+            sup, registered[region], surface_model, label=f"t2-{region}",
+            span=next(slices),
         ))
 
         paired = sorted(set(baseline) & set(compared))

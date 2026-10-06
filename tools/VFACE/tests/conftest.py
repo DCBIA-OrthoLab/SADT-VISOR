@@ -85,13 +85,19 @@ class FakeSup:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.outputs = outputs or {}
         self.calls = []
+        self.spans = []
         self.messages = []
+        self.logs = []
 
     def run(self, tool, **params):
         # A slot per CALL, which is what the real supervisor gives
         # (`<job>/sup/<NN>_<tool>/output`) and why no caller passes `output_dir`
         # any more. Numbered, so the two orientations and the three
         # registrations land apart without anyone naming a directory.
+        # `_progress` is the caller's span of its own bar; the server's
+        # supervisor removes it before the callee sees it, so it is recorded
+        # apart and never handed to a planted tool.
+        self.spans.append((tool, params.pop("_progress", None)))
         self.calls.append((tool, params))
         slot = self.tmp / "sup" / f"{len(self.calls):02d}_{tool}" / "output"
         slot.mkdir(parents=True, exist_ok=True)
@@ -106,8 +112,9 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
+        self.logs.append((level, user, message))
 
     def asked(self, tool):
         """The parameters of the one call to `tool`."""
@@ -189,14 +196,22 @@ class PipelineSup:
         self.landmarks = landmarks or ARCH
         self.asymmetric = asymmetric
         self.calls = []
+        self.spans = []
         self.messages = []
+        self.logs = []
+        # Waypoints and calls in the order they happened: what the server
+        # folds into one bar, and so what has to move only forward.
+        self.timeline = []
 
     # -- the five members a tool can see ------------------------------------
 
     def run(self, tool, **params):
         # The slot the real supervisor allocates per call, rather than one the
         # caller named: no tool passes `output_dir` any more, and numbering by
-        # call is what keeps two runs of the same tool apart.
+        # call is what keeps two runs of the same tool apart. `_progress` is
+        # recorded apart, as the server's supervisor removes it.
+        self.spans.append((tool, params.pop("_progress", None)))
+        self.timeline.append((tool, self.spans[-1][1]))
         self.calls.append((tool, params))
         handler = getattr(self, f"_{tool.lower()}")
         destination = self.tmp / "sup" / f"{len(self.calls):02d}_{tool}" / "output"
@@ -206,9 +221,11 @@ class PipelineSup:
 
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
+        self.timeline.append(("waypoint", (fraction, fraction)))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
+        self.logs.append((level, user, message))
 
     def asked(self, tool):
         return [params for name, params in self.calls if name == tool]

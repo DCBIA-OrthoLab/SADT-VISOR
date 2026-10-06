@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Literal
 
+from . import progress
 from .pipeline import (
     SCAN_EXTENSIONS,
     UNREADABLE_EXTENSIONS,
@@ -114,8 +115,11 @@ def run(
     # upstream put it in the process working directory under a FIXED name --
     # two concurrent requests overwrote each other's.
     with tempfile.TemporaryDirectory(prefix="autocrop3d_") as scratch:
-        for scan_path in scan_paths:
-            name = os.path.basename(scan_path)
+        total = len(scan_paths)
+        for index, scan_path in enumerate(scan_paths, start=1):
+            # One scan is read, cropped and written before the next is opened,
+            # so the position in the batch is exactly what has been done.
+            progress.report(index, total, "scan")
             relative = _relative_to(scan_path, str(scans))
             try:
                 entry = _crop_one(
@@ -138,13 +142,29 @@ def run(
                 report["without_a_roi"].append(
                     {"scan": relative, "patient": str(absent)}
                 )
+                progress.log(
+                    f"scan {index} of {total} matched no ROI and was not cropped",
+                    "warning", user=True,
+                )
                 continue
             except Exception as error:  # noqa: BLE001 - reported per scan, never swallowed
                 # Per item, so one unreadable file costs one file. Upstream
                 # read the volume and the ROI OUTSIDE its try block, so either
                 # ended the batch, and wrapped only the write in a bare
                 # `except:` that logged and then counted the patient anyway.
-                logger.warning("AutoCrop3D failed on %s: %s", name, error)
+                #
+                # Logged by position and by the kind of error only. The scan's
+                # file name is patient metadata, and most of the reasons this
+                # can fail name the file themselves -- the per-scan report,
+                # which returns to whoever sent the scans, keeps the full text.
+                logger.warning(
+                    "AutoCrop3D failed on scan %d of %d: %s",
+                    index, total, type(error).__name__,
+                )
+                progress.log(
+                    f"scan {index} of {total} could not be cropped; the report "
+                    f"says why", "warning", user=True,
+                )
                 report["failed"][relative] = f"{type(error).__name__}: {error}"
                 continue
 

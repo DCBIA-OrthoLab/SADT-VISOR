@@ -362,6 +362,20 @@ def test_execute_runs_the_chosen_tool_through_the_supervisor(
     assert decision(output_dir)["executed"] is True
 
 
+def test_the_chosen_tool_fills_the_bar_from_the_waypoint_to_the_end(
+    tmp_path, catalog_file, stub_model
+):
+    """The callee's own 0..1 is folded into the span it is handed, which starts
+    at the waypoint this tool writes before the call and ends the bar."""
+    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    supervisor = FakeSup(tmp_path)
+    invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+
+    assert supervisor.spans == [("Bone_Seg", (0.1, 1.0))]
+    assert "_progress" not in supervisor.calls[0][1]
+    assert supervisor.messages[-1] == (0.1, "running Bone_Seg")
+
+
 def test_the_supervised_run_writes_inside_this_run_s_own_output(
     tmp_path, catalog_file, stub_model
 ):

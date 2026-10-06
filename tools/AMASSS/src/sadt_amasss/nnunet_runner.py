@@ -26,6 +26,7 @@ import inspect
 import logging
 import os
 
+from . import progress
 from .errors import ModelNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ def resolve_device(requested: str) -> str:
     if wanted.startswith("cuda") and not torch.cuda.is_available():
         logger.warning(
             "device=%s requested but CUDA is unavailable; falling back to CPU", requested
+        )
+        # The operator's concern: the result is the same, only many times
+        # slower, and the fix is in the deployment.
+        progress.log(
+            "a GPU was requested but none is visible; segmenting on the CPU",
+            "warning",
         )
         return "cpu"
     return wanted

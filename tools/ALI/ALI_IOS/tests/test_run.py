@@ -225,9 +225,11 @@ def test_progress_writes_one_line_per_event_and_nothing_when_unset(tmp_path, mon
 def test_the_engine_reports_the_position_it_already_logs():
     """The counter was there and went only to the server's log. The rule the
     log line states -- position in the batch, never the mesh's name -- is why
-    the progress call could take it unchanged."""
+    the progress call could take it unchanged. Bounded by the pass's span,
+    which only the caller knows when a run makes two passes."""
     source = open(engine.__file__, encoding="utf-8").read()
-    assert 'progress.report(mesh_index, len(meshes), "mesh")' in source
+    assert ('progress.report(mesh_index, len(meshes), "mesh", '
+            'start=span[0], end=span[1])') in source
 # The published schema and the catalog cannot drift apart
 #
 # `Literal` takes literals only, so it cannot be built from the catalog. That

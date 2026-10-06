@@ -1439,3 +1439,63 @@ def test_the_report_names_outputs_relative_to_the_output_folder(tmp_path):
         assert not os.path.isabs(entry["produced"][0]), entry["produced"][0]
         assert (output_dir / entry["produced"][0]).is_file()
         assert "_absolute" not in entry
+
+
+# ===========================================================================
+# Progress and the run's log -- a position in the batch, never a scan's name
+# ===========================================================================
+
+def _events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    return ([r for r in records if r.get("kind") != "log"],
+            [r for r in records if r.get("kind") == "log"])
+
+
+def test_progress_counts_scans_and_never_names_one(tmp_path, monkeypatch):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
+    for subject in ("Smith_John", "Jones_Mary", "Brown_Ann"):
+        _volume(scans / f"{subject}_Scan.nii.gz")
+    _roi(rois / "Any_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+
+    sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
+
+    events, logs = _events(events_file)
+    assert [event["message"] for event in events] == [
+        "scan 1 of 3", "scan 2 of 3", "scan 3 of 3",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    assert logs == []
+    text = events_file.read_text()
+    assert not any(name in text for name in ("Smith", "Jones", "Brown", ".nii"))
+
+
+def test_a_scan_that_fails_or_has_no_roi_is_logged_by_position(
+    tmp_path, monkeypatch, caplog
+):
+    """The defect this closes: the warning used to carry the scan's file name,
+    and a tool's stderr ends up in the server's own log on a failed run."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
+    _volume(scans / "Alpha_Scan.nii.gz")
+    (scans / "Beta_Scan.nii.gz").write_bytes(b"not a volume")
+    _volume(scans / "Gamma_Scan.nii.gz")
+    _roi(rois / "Alpha_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+    _roi(rois / "Beta_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+
+    with caplog.at_level("WARNING", logger="AutoCrop3D"):
+        sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
+
+    _, logs = _events(events_file)
+    assert [(log["level"], log["audience"], log["message"]) for log in logs] == [
+        ("warning", "user", "scan 2 of 3 could not be cropped; the report says why"),
+        ("warning", "user", "scan 3 of 3 matched no ROI and was not cropped"),
+    ]
+    assert not any("Beta" in record.getMessage() for record in caplog.records)
+    assert "Beta" not in events_file.read_text()
+    assert "Beta_Scan.nii.gz" in _report(out)["failed"], "the report still names it"

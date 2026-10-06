@@ -80,8 +80,19 @@ def _returned(produced) -> str:
     return str(produced)
 
 
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing, which is what a caller with no bar of its own wants.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
-                 landmark_model: str = "", **extra) -> str:
+                 landmark_model: str = "", span=None, **extra) -> str:
     """Orient every case under `scan_dir` onto `reference_path`.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
@@ -107,10 +118,10 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     if modality == "CBCT" and landmark_model:
         parameters["landmark_model"] = landmark_model
     parameters.update(extra)
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
-def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
+def label_crowns(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
     """Label the crowns of every mesh under `mesh_dir`.
 
     `skip_segmented` is left at its default: a mesh already carrying a
@@ -127,10 +138,10 @@ def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("Crown_Seg", **parameters))
+    return _returned(sup.run("Crown_Seg", **parameters, **_span(span)))
 
 
-def predict_mucogingival(sup, mesh_dir: str, model_path: str = "") -> str:
+def predict_mucogingival(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
     """Predict the 13 mucogingival landmarks on every lower arch under `mesh_dir`.
 
     Returns the directory holding ALI's markups files, which `ios.mgl` then
@@ -166,4 +177,4 @@ def predict_mucogingival(sup, mesh_dir: str, model_path: str = "") -> str:
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("ALI_IOS", **parameters))
+    return _returned(sup.run("ALI_IOS", **parameters, **_span(span)))

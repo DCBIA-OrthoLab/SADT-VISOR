@@ -199,16 +199,56 @@ def _own_reference(data_root):
     return candidate if os.path.isdir(candidate) else ""
 
 
+# How a run shares its bar, as fractions of the whole, per supervised call.
+# The calls come first because they run first -- in that order: ASO orients the
+# CBCT, Crown_Seg labels the crowns, ALI_IOS and then ALI_CBCT place the
+# landmarks -- and the registration takes what is left. ASO's CBCT mode runs
+# ALI_CBCT inside it, and an ALI_CBCT agent is a full two-scale walk of the
+# volume, so those two get the larger slices; the intraoral networks run on a
+# mesh and cost less. A weighting, not a measurement: what is exact is the
+# counter in each message.
+ORIENT_SHARE = 0.25
+CROWN_SHARE = 0.1
+IOS_LANDMARK_SHARE = 0.1
+CBCT_LANDMARK_SHARE = 0.2
+
+
+def _spans(automation: str, predict_ios: bool, predict_cbct: bool) -> dict:
+    """{step: (start, end)} for the steps this run makes, in the order it makes
+    them, ending with "register" on whatever is left.
+
+    The waypoints used to be fixed numbers in `tools.py` -- 0.5 for ASO, 0.1
+    for ALI_CBCT -- while the calls ran ASO first and ALI_CBCT last, so the bar
+    went backwards twice in a fully-automated run. Deriving them from the call
+    order is what makes that impossible; a step a mode skips takes no slice.
+    """
+    steps = []
+    if automation != catalogs.AUTOMATION_REGISTRATION:
+        if automation == catalogs.AUTOMATION_FULLY:
+            steps.append(("orient", ORIENT_SHARE))
+        steps.append(("crowns", CROWN_SHARE))
+        if predict_ios:
+            steps.append(("ios_landmarks", IOS_LANDMARK_SHARE))
+        if predict_cbct:
+            steps.append(("cbct_landmarks", CBCT_LANDMARK_SHARE))
+    spans, position = {}, 0.0
+    for name, share in steps:
+        spans[name] = (round(position, 6), round(position + share, 6))
+        position += share
+    spans["register"] = (round(position, 6), 1.0)
+    return spans
+
+
 def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_dir: str,
              output_dir: str, suffix: str, report: dict, max_dist: float,
-             progress_start: float = 0.0) -> None:
+             progress_span: tuple = (0.0, 1.0)) -> None:
     """The registration proper, once every landmark exists.
 
-    `progress_start` is where this phase begins on the run's progress bar. It
-    is 0 in the Registration mode, which predicts nothing, and follows the
-    waypoints in `tools.py` in the two modes that do -- otherwise a run that
-    called no other tool would report itself as more than half done before it
-    had registered anything.
+    `progress_span` is the slice of the run's progress bar this phase fills.
+    It is the whole bar in the Registration mode, which predicts nothing, and
+    what the supervised calls left (see `_spans`) in the two modes that make
+    them -- otherwise a run that called no other tool would report itself as
+    more than half done before it had registered anything.
     """
     paired, unpaired = pipeline.discover(ios_dir, cbct_dir)
     report["unpaired"] = unpaired
@@ -226,7 +266,8 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
         # Per patient, not per mesh: the inner loop is one or two arches, and
         # the counter is what a watcher can act on. The patient key is built
         # from the caller's file names and never travels in a message.
-        progress.report(index, len(paired), "patient", start=progress_start)
+        progress.report(index, len(paired), "patient",
+                        start=progress_span[0], end=progress_span[1])
         entry = {"cbct": os.path.basename(data["cbct"]), "meshes": {}}
         # Narrowed to this patient BEFORE the jaw is looked at: see _for_patient.
         own_ios = _for_patient(ios_landmarks, patient, sole_patient)
@@ -339,6 +380,8 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
         ios_lm = str(ios_landmarks) if ios_landmarks else None
         cbct_lm = str(cbct_landmarks) if cbct_landmarks else None
 
+        spans = _spans(automation, predict_ios=not ios_lm, predict_cbct=not cbct_lm)
+
         if automation != catalogs.AUTOMATION_REGISTRATION:
             # Everything the caller did not supply is fetched from the tool that
             # produces it. Checked up front so a request that cannot work comes
@@ -360,13 +403,19 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
                         "(scripts/setup-models.sh --tool AREG), or name another "
                         "in 'cbct_reference'."
                     )
-                cbct_root = tools.orient_cbct(sup, cbct_root, cbct_reference, landmark_model)
+                cbct_root = tools.orient_cbct(
+                    sup, cbct_root, cbct_reference, landmark_model, span=spans["orient"]
+                )
 
-            labelled = tools.label_crowns(sup, ios_root, crown_model or "")
+            labelled = tools.label_crowns(sup, ios_root, crown_model or "", span=spans["crowns"])
             if not ios_lm:
-                ios_lm = tools.predict_ios_landmarks(sup, labelled, ios_landmark_model or "")
+                ios_lm = tools.predict_ios_landmarks(
+                    sup, labelled, ios_landmark_model or "", span=spans["ios_landmarks"]
+                )
             if not cbct_lm:
-                cbct_lm = tools.predict_cbct_landmarks(sup, cbct_root, landmark_model or "")
+                cbct_lm = tools.predict_cbct_landmarks(
+                    sup, cbct_root, landmark_model or "", span=spans["cbct_landmarks"]
+                )
             ios_root = labelled
 
         if not ios_lm or not cbct_lm:
@@ -381,9 +430,9 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
             ios_landmark_dir=ios_lm, cbct_landmark_dir=cbct_lm,
             output_dir=output_dir, suffix=suffix, report=report,
             max_dist=float(max_dist) if max_dist else geometry.ICP_MAX_DIST_MM,
-            # The last waypoint `tools.py` writes is 0.5; the registration has
-            # the rest. Registration mode wrote none of them and starts at 0.
-            progress_start=0.0 if automation == catalogs.AUTOMATION_REGISTRATION else 0.6,
+            # Whatever the supervised calls left; the whole bar in the
+            # Registration mode, which makes none of them.
+            progress_span=spans["register"],
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

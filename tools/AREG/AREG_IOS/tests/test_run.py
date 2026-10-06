@@ -38,9 +38,14 @@ class FakeSup:
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.outputs = outputs or {}
         self.calls = []
+        self.spans = []
         self.messages = []
+        self.logs = []
 
     def run(self, tool, **params):
+        # The caller's span of its own bar. The server's supervisor removes it
+        # before the callee sees it, so it is recorded apart, never passed on.
+        self.spans.append((tool, params.pop("_progress", None)))
         self.calls.append((tool, params))
         maker = self.outputs.get(tool)
         if maker is None:
@@ -50,8 +55,9 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
+        self.logs.append((level, user, message))
 
 
 def _phantom(size=48, seed=0, spacing=0.8, origin=(-140.0, -90.0, 60.0)):
@@ -913,6 +919,84 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
 
     assert sup.messages == []
     assert [event["message"] for event in _events(events_file)] == ["subject 1 of 1"]
+
+
+# ---------------------------------------------------------------------------
+# Progress -- the supervised calls and the registration share one bar
+# ---------------------------------------------------------------------------
+
+def test_each_call_gets_its_own_slice_in_the_order_it_runs():
+    spans = dispatch._ios_spans(label_and_orient=True, predict_mgl=True)
+    order = ["crowns_t1", "crowns_t2", "orient_t1", "orient_t2", "mgl_t1", "mgl_t2",
+             "register"]
+    assert list(spans) == order
+    # Tiled: each slice starts where the one before it ended, and the last
+    # ends the bar.
+    assert spans["crowns_t1"][0] == 0.0
+    for before, after in zip(order, order[1:]):
+        assert spans[before][1] == spans[after][0]
+        assert spans[before][0] < spans[before][1]
+    assert spans["register"][1] == 1.0
+    assert dispatch._ios_spans(False, False) == {"register": (0.0, 1.0)}
+
+
+def test_predicting_the_mucogingival_landmarks_comes_before_the_loop(tmp_path, monkeypatch):
+    """ALI_IOS runs once per timepoint, each call in its own slice, and the
+    subject loop picks up where the second one ended."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    for timepoint in ("T1", "T2"):
+        surfaces.write_surface(
+            _grid_mesh(), str(tmp_path / timepoint / f"P1_{timepoint}_Lower.vtk")
+        )
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    monkeypatch.setattr(
+        ios_pipeline, "MGLPainter", lambda root, height: _StubPainter("Bottom_MGL")
+    )
+    sup = FakeSup(tmp_path, {"ALI_IOS": lambda params: planted})
+
+    dispatch.register(
+        t1_path=str(tmp_path / "T1"),
+        t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_SEMI,
+        ios_patch=catalogs.PATCH_MGL,
+        output_dir=str(tmp_path / "out"),
+        sup=sup,
+    )
+
+    assert sup.spans == [("ALI_IOS", (0.0, 0.1)), ("ALI_IOS", (0.1, 0.2))]
+    assert all("_progress" not in params for _tool, params in sup.calls)
+    fractions = [event["fraction"] for event in _events(events_file) if "fraction" in event]
+    assert fractions == sorted(fractions)
+    assert fractions[-1] == 0.2, "the subject loop starts where the calls ended"
+
+
+def test_a_subject_at_one_timepoint_only_is_told_to_the_clinician(tmp_path, monkeypatch):
+    """A count at warning level, for the clinician; never the subject's key."""
+    for timepoint in ("T1", "T2"):
+        surfaces.write_surface(
+            _grid_mesh(), str(tmp_path / timepoint / f"P1_{timepoint}_Lower.vtk")
+        )
+    surfaces.write_surface(_grid_mesh(), str(tmp_path / "T1" / "P2_T1_Lower.vtk"))
+    (tmp_path / "mgl").mkdir()
+    monkeypatch.setattr(
+        ios_pipeline, "MGLPainter", lambda root, height: _StubPainter("Bottom_MGL")
+    )
+    sup = FakeSup(tmp_path)
+
+    dispatch.register(
+        t1_path=str(tmp_path / "T1"),
+        t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_SEMI,
+        ios_patch=catalogs.PATCH_MGL,
+        mgl_landmarks_path=str(tmp_path / "mgl"),
+        output_dir=str(tmp_path / "out"),
+        sup=sup,
+    )
+
+    assert [(level, user) for level, user, _message in sup.logs] == [("warning", True)]
+    assert "P2" not in sup.logs[0][2]
 
 
 # ---------------------------------------------------------------------------
