@@ -117,6 +117,10 @@ def register_all(jobs: list, width: int, on_done=None) -> list:
     total = len(jobs)
     entries = [None] * total
     if width <= 1 or total <= 1:
+        # The same thread count a worker would get: elastix's preprocessing
+        # sums in an order set by it, so this is what keeps a registration
+        # identical to the bit whichever path ran it.
+        _worker_setup(_threads_per_worker(1))
         for index, job in enumerate(jobs):
             entries[index] = _register_safely(job)
             if on_done:
@@ -174,9 +178,19 @@ def _threads_per_worker(width: int) -> int:
 
 
 def _worker_setup(threads: int) -> None:
+    """Pin this process's thread count, in SimpleITK AND in elastix's itk.
+
+    They are two libraries with two defaults: setting SimpleITK's left elastix
+    on its own count, read once when `itk` was first imported, so a serial run
+    and a worker could still disagree by the order their sums ran in.
+    """
     os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(threads)
     os.environ["OMP_NUM_THREADS"] = str(threads)
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+    try:
+        elastix._import_elastix().MultiThreaderBase.SetGlobalDefaultNumberOfThreads(threads)
+    except Exception:  # noqa: BLE001 - a missing itk is reported where it is used
+        pass
 
 
 def _read(path: str, what: str, cause: str = "input") -> sitk.Image:
