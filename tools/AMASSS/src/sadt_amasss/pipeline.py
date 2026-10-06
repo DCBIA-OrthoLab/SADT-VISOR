@@ -606,6 +606,11 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
     # Before the pool, so a run that dies inside nnUNet is not diagnosed as
     # still "reading scan".
     progress.emit(0.1, f"predicting {len(models)} structure(s)")
+    # On THIS thread, before the pool starts: the structures' threads must
+    # only ever find nnUNet's modules fully imported. Imported concurrently for
+    # the first time, they handed some threads a half-initialised module and
+    # failed every structure of the run. See nnunet_runner.preload.
+    nnunet_runner.preload()
     done = 0
     prediction_failures = []
     expected = [

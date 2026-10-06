@@ -1600,3 +1600,164 @@ def test_the_separate_surfaces_are_named_after_their_own_structure(tmp_path):
 
     assert [os.path.basename(p) for p in written] == ["p_MAND.vtk", "p_MAX.vtk", "p_CB.vtk"]
     assert all(os.path.isfile(p) for p in written)
+
+
+# ---------------------------------------------------------------------------
+# nnUNet imported once, before the structures' threads
+# ---------------------------------------------------------------------------
+
+def test_the_pipeline_preloads_nnunet_before_any_structure_thread_starts(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """The structures' threads must only ever find nnUNet fully imported.
+
+    Each thread used to be the first to import nnunetv2 and the trainer class
+    nnUNet looks up by name, and on a five-channel run every structure failed
+    on a half-initialised module. The preload has to happen once, on the
+    run's own thread, before the pool hands out any work.
+    """
+    import threading
+
+    events = []
+    lock = threading.Lock()
+    main_thread = threading.current_thread()
+
+    def record_preload():
+        with lock:
+            events.append(("preload", threading.current_thread() is main_thread))
+
+    stubbed = nnunet_runner.predict_folder
+
+    def record_predict(model_folder, input_dir, output_dir, device, **kwargs):
+        with lock:
+            events.append(("predict", threading.current_thread() is main_thread))
+        stubbed(model_folder, input_dir, output_dir, device, **kwargs)
+
+    monkeypatch.setattr(nnunet_runner, "preload", record_preload)
+    monkeypatch.setattr(nnunet_runner, "predict_folder", record_predict)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX", "CB"])
+
+    report = pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX", "CB"),
+        merge=("SEPARATE",),
+        num_workers=3,
+    )
+
+    assert report["summary"]["processed"] == 1
+    assert events[0] == ("preload", True), "preloaded on the run's thread, first"
+    assert [kind for kind, _ in events].count("preload") == 1
+    assert sorted(events[1:]) == [("predict", False)] * 3, "then predicted in the pool"
+
+
+def test_concurrent_callers_of_preload_import_once_and_all_wait_for_it(monkeypatch):
+    """However many threads arrive at once, the imports run exactly once, and
+    none of them returns before they are complete -- a caller returning early
+    would reach nnUNet while another thread is still importing it."""
+    import threading
+    import time
+
+    walked = []
+    walk_lock = threading.Lock()
+
+    def slow_import_tree(package_name):
+        time.sleep(0.05)
+        with walk_lock:
+            walked.append(package_name)
+        return 1
+
+    monkeypatch.setattr(nnunet_runner, "_preloaded", False)
+    monkeypatch.setattr(nnunet_runner, "_import_tree", slow_import_tree)
+
+    callers = 8
+    barrier = threading.Barrier(callers)
+    complete_on_return = []
+
+    def call():
+        barrier.wait()
+        nnunet_runner.preload()
+        with walk_lock:
+            complete_on_return.append(len(walked))
+
+    threads = [threading.Thread(target=call) for _ in range(callers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    expected = list(nnunet_runner._RESOLVED_BY_NAME)
+    assert walked == expected, "each package walked once, not once per caller"
+    assert complete_on_return == [len(expected)] * callers
+
+
+def test_after_preload_loading_a_model_has_nothing_left_to_import():
+    """Everything nnUNet resolves BY NAME while loading and running a model is
+    already in sys.modules once `preload` has run.
+
+    A fresh interpreter, because this process may have imported nnUNet
+    already. The lookups are the ones `initialize_from_trained_model_folder`
+    and prediction perform -- the trainer named in the checkpoint, the network
+    and its building blocks named in the plans, the resamplers, normaliser,
+    preprocessor, reader/writer and label manager -- and none of them may
+    import a module for the first time, since that is exactly what used to
+    happen concurrently in the structures' threads.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import pydoc
+        import sys
+        from os.path import join
+
+        from sadt_amasss import nnunet_runner
+
+        nnunet_runner.preload()
+        before = set(sys.modules)
+
+        import nnunetv2
+        from nnunetv2.imageio.reader_writer_registry import (
+            recursive_find_reader_writer_by_name)
+        from nnunetv2.preprocessing.resampling.utils import (
+            recursive_find_resampling_fn_by_name)
+        from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
+        from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
+
+        root = nnunetv2.__path__[0]
+        found = [
+            recursive_find_trainer_class_by_name("nnUNetTrainer"),
+            recursive_find_trainer_class_by_name("nnUNetTrainerNoMirroring"),
+            recursive_find_resampling_fn_by_name("resample_data_or_seg_to_shape"),
+            recursive_find_resampling_fn_by_name("resample_torch_fornnunet"),
+            recursive_find_reader_writer_by_name("SimpleITKIO"),
+            recursive_find_reader_writer_by_name("NibabelIOWithReorient"),
+            recursive_find_python_class(join(root, "preprocessing"), "DefaultPreprocessor",
+                                        current_module="nnunetv2.preprocessing"),
+            recursive_find_python_class(join(root, "preprocessing", "normalization"),
+                                        "CTNormalization",
+                                        "nnunetv2.preprocessing.normalization"),
+            recursive_find_python_class(join(root, "preprocessing", "normalization"),
+                                        "ZScoreNormalization",
+                                        "nnunetv2.preprocessing.normalization"),
+            recursive_find_python_class(join(root, "utilities", "label_handling"),
+                                        "LabelManager",
+                                        current_module="nnunetv2.utilities.label_handling"),
+            pydoc.locate("dynamic_network_architectures.architectures.unet.PlainConvUNet"),
+            pydoc.locate("dynamic_network_architectures.architectures.unet.ResidualEncoderUNet"),
+            pydoc.locate("torch.nn.modules.conv.Conv3d"),
+            pydoc.locate("torch.nn.modules.instancenorm.InstanceNorm3d"),
+            pydoc.locate("torch.nn.LeakyReLU"),
+        ]
+        assert all(item is not None for item in found), found
+        print("\\n".join(sorted(set(sys.modules) - before)))
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
+        env={**os.environ, "PYTHONWARNINGS": "ignore"},
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip() == "", f"imported after preload:\n{result.stdout}"
