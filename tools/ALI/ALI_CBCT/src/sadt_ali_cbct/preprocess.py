@@ -153,7 +153,9 @@ def convert_dicom_series(directory: str, output_path: str) -> str:
     reader = sitk.ImageSeriesReader()
     file_names = reader.GetGDCMSeriesFileNames(directory)
     if not file_names:
-        raise ValueError(f"No DICOM series found in {directory}")
+        # Without the directory: it is named after the patient, and the
+        # caller already knows which series it sent at this position.
+        raise ValueError("GDCM found no slice of a DICOM series in this folder")
 
     reader.SetFileNames(file_names)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

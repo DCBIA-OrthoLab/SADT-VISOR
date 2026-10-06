@@ -174,3 +174,46 @@ def test_the_dependency_check_runs_before_any_scan_is_read():
     the per-patient loop makes a 40-patient batch fail 40 times identically,
     each only after that patient's mask has been built."""
     assert elastix.check_dependencies() is None
+
+
+# ---------------------------------------------------------------------------
+# A failure an operator can read
+# ---------------------------------------------------------------------------
+
+def test_an_elastix_failure_names_its_cause_not_the_log_it_hid():
+    """elastix's own exception says "Internal elastix error: See elastix log"
+    and nothing else -- the cause is the ITK `Description:` line in a log this
+    tool used to switch off. It is read back, and only that line is kept."""
+    fixed = phantom(size=16)
+    tiny = sitk.GetImageFromArray(np.zeros((2, 2, 2), np.float32))
+
+    with pytest.raises(RuntimeError) as raised:
+        elastix.register(fixed, tiny)
+    message = str(raised.value)
+    assert message.startswith("elastix rigid registration failed: ")
+    assert "less than 4" in message
+    assert "See elastix log" not in message
+    assert ".hxx" not in message and "0x" not in message
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_what_elastix_was_asked_is_logged_before_it_runs(caplog):
+    fixed = phantom(size=16)
+    tiny = sitk.GetImageFromArray(np.zeros((2, 2, 2), np.float32))
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    with pytest.raises(RuntimeError):
+        elastix.register(fixed, tiny)
+    attempted = [r.getMessage() for r in caplog.records if "elastix rigid" in r.getMessage()]
+    assert attempted and "16x16x16 voxels" in attempted[0] and "2x2x2 voxels" in attempted[0]
+
+
+def test_an_itk_message_is_reduced_to_its_sentence():
+    raised = RuntimeError(
+        "/build/itkSomething.hxx:389:\n"
+        "ITK ERROR: ElastixRegistrationMethod(0x63ec076aa9b0): Internal elastix error"
+    )
+    assert elastix.describe(raised) == "Internal elastix error"
+    assert elastix.describe(RuntimeError(
+        "File: x.hxx\nLine: 3\nDescription: ITK ERROR: Filter(0xab): too small\n"
+    )) == "too small"

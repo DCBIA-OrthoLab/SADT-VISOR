@@ -21,7 +21,7 @@ import logging
 import os
 import re
 
-from .errors import ToolInputError
+from .errors import ToolInputError, describe_failure
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,10 @@ def load_models(model_dir: str) -> dict:
     import joblib
 
     if not os.path.isdir(model_dir):
-        raise ToolInputError(f"The classifier bundle '{model_dir}' is not a folder.")
+        raise ToolInputError(
+            "'classifier_model' is not a folder: it should be the classifier "
+            "bundle, the folder holding the three models."
+        )
 
     missing = [name for name in MODEL_FILES.values()
                if not os.path.isfile(os.path.join(model_dir, name))]
@@ -80,10 +83,21 @@ def load_models(model_dir: str) -> dict:
             f"hold all three of {', '.join(sorted(MODEL_FILES.values()))}."
         )
 
-    return {
-        question: joblib.load(os.path.join(model_dir, filename))
-        for question, filename in MODEL_FILES.items()
-    }
+    models = {}
+    for question, filename in MODEL_FILES.items():
+        try:
+            models[question] = joblib.load(os.path.join(model_dir, filename))
+        except Exception as exc:  # noqa: BLE001 - re-raised, named, below
+            # A model pickled under another joblib, LightGBM or scikit-learn
+            # than the one installed fails here with a message about module
+            # internals. The bundle is the deployment's, not the caller's, so
+            # this is a RuntimeError rather than a 422 -- and it names WHICH
+            # model, which the unpickler's own message never does.
+            raise RuntimeError(
+                f"the classifier's '{question}' model could not be loaded "
+                f"({describe_failure(exc)})"
+            ) from exc
+    return models
 
 
 def _select(frame, model, question: str):
@@ -140,7 +154,8 @@ def classify(records, model_dir: str, report: dict = None) -> list:
                     pd.Series(answer, index=sub.index).map(INVOLVED_LABELS)
                 )
             except Exception as exc:  # noqa: BLE001 - the finer question may fail alone
-                logger.warning("VFACE: the %s sub-classification failed", question)
+                logger.warning("VFACE: the %s sub-classification failed (%s)",
+                               question, describe_failure(exc))
                 if report is not None:
                     report.setdefault("classification_partial", {})[question] = (
                         f"{type(exc).__name__}: {exc}"

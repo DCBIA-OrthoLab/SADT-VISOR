@@ -14,6 +14,7 @@ import pytest
 
 from sadt_docshapeaxi import _rename_with_suffix, run
 from sadt_docshapeaxi import catalog, engine, pipeline
+from sadt_docshapeaxi.errors import ToolInputError, ToolUnavailableError
 
 
 def write_surface(path):
@@ -589,8 +590,11 @@ def test_a_network_the_installed_shapeaxi_lacks_is_named_in_the_error(monkeypatc
     monkeypatch.setitem(sys.modules, "shapeaxi", shapeaxi)
     monkeypatch.setitem(sys.modules, "shapeaxi.saxi_nets_lightning", module)
 
-    with pytest.raises(ValueError, match="SaxiMHAFBRegression"):
+    # A RuntimeError: the installation disagreeing with itself is the
+    # server's fault, and must not be answered as a bad request.
+    with pytest.raises(RuntimeError, match="SaxiMHAFBRegression") as raised:
         pipeline.load_network("/models/x.ckpt", "SaxiMHAFBRegression", "cpu")
+    assert not isinstance(raised.value, ValueError)
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +913,8 @@ def test_the_backbone_is_refused_rather_than_downloaded(tmp_path, monkeypatch):
     import torch
 
     torch.hub.get_dir.cache_clear() if hasattr(torch.hub.get_dir, "cache_clear") else None
-    with pytest.raises(FileNotFoundError) as raised:
+    # ToolUnavailableError, so the server answers 503: no request can stage it.
+    with pytest.raises(ToolUnavailableError) as raised:
         pipeline.check_backbone_is_staged()
     message = str(raised.value)
     assert pipeline.BACKBONE_FILE in message
@@ -1099,3 +1104,140 @@ def test_the_explanation_takes_the_bar_from_where_the_prediction_left_it(
     assert spans["predict"][1] == spans["explain"][0]
     assert 0.0 < spans["explain"][0] < 1.0
     assert spans["explain"][1] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# What an operator reads when a run fails
+# ---------------------------------------------------------------------------
+
+def test_an_unknown_model_names_the_argument_and_the_analyses_in_words():
+    """File names are redacted on their way to a log; the anatomy and task
+    pairs are what an operator can still read."""
+    with pytest.raises(ToolInputError) as raised:
+        catalog.analysis_for("nose_9_class.ckpt")
+    message = str(raised.value)
+    assert message.startswith("'model'")
+    assert "Mandibular condyle (severity)" in message
+    assert "Nasopharynx airway obstruction (binary, severity, regression)" in message
+
+
+def test_a_missing_checkpoint_names_the_argument_and_the_analysis(tmp_path):
+    write_surface(tmp_path / "a.vtk")
+    with pytest.raises(FileNotFoundError) as raised:
+        run(surfaces=str(tmp_path), model=str(tmp_path / "condyles_4_class.ckpt"),
+            output_dir=str(tmp_path / "out"))
+    assert str(raised.value).startswith("'model': the Mandibular condyle severity")
+
+
+def test_an_empty_surface_is_refused_by_position_before_the_model_loads(tmp_path, monkeypatch):
+    write_surface(tmp_path / "in" / "a.vtk")
+    (tmp_path / "in" / "b.vtk").write_text("not a mesh")
+    checkpoint = tmp_path / "airways_2_class.ckpt"
+    checkpoint.write_bytes(b"")
+    monkeypatch.setattr(pipeline, "load_network",
+                        lambda *a, **k: pytest.fail("the model was loaded"))
+
+    with pytest.raises(ToolInputError) as raised:
+        run(surfaces=str(tmp_path / "in"), model=str(checkpoint),
+            output_dir=str(tmp_path / "out"))
+    message = str(raised.value)
+    assert "surface 2 of 2 is empty or unreadable" in message
+    assert "b.vtk" not in message
+
+
+def test_same_named_surfaces_are_refused_by_count_when_explaining(tmp_path, stubbed):
+    write_surface(tmp_path / "in" / "Smith" / "scan.vtk")
+    write_surface(tmp_path / "in" / "Jones" / "scan.vtk")
+    write_surface(tmp_path / "in" / "other.vtk")
+    checkpoint = tmp_path / "airways_2_class.ckpt"
+    checkpoint.write_bytes(b"")
+
+    with pytest.raises(ToolInputError) as raised:
+        run(surfaces=str(tmp_path / "in"), model=str(checkpoint),
+            output_dir=str(tmp_path / "out"))
+    message = str(raised.value)
+    assert message.startswith("'surfaces': 2 of 3 surfaces share a file name")
+    assert "scan" not in message and "Smith" not in message
+
+
+def test_the_network_load_is_announced_with_what_and_where(tmp_path, monkeypatch, caplog):
+    import sys
+    import types
+
+    class Exploding:
+        @classmethod
+        def load_from_checkpoint(cls, *args, **kwargs):
+            raise RuntimeError("a long pickle preamble\nthe actual cause")
+
+    module = types.ModuleType("shapeaxi.saxi_nets_lightning")
+    module.SaxiMHAFBClassification = Exploding
+    shapeaxi = types.ModuleType("shapeaxi")
+    shapeaxi.saxi_nets_lightning = module
+    monkeypatch.setitem(sys.modules, "shapeaxi", shapeaxi)
+    monkeypatch.setitem(sys.modules, "shapeaxi.saxi_nets_lightning", module)
+    monkeypatch.setattr(pipeline, "check_backbone_is_staged", lambda: None)
+    monkeypatch.setattr(pipeline, "allow_checkpoint_globals", lambda: None)
+
+    with caplog.at_level("INFO", logger="DOCShapeAXI"):
+        with pytest.raises(RuntimeError) as raised:
+            pipeline.load_network("/models/x.ckpt", "SaxiMHAFBClassification",
+                                  "cpu", anatomy="Mandibular condyle")
+    assert ("loading SaxiMHAFBClassification checkpoint for Mandibular condyle on cpu"
+            in caplog.messages)
+    assert str(raised.value).endswith("failed: RuntimeError: the actual cause")
+    assert not isinstance(raised.value, ValueError)
+
+
+def test_a_surface_that_fails_mid_pass_is_logged_by_position(tmp_path, monkeypatch, caplog):
+    torch = pytest.importorskip("torch")
+
+    class Failing(_FakeNetwork):
+        calls = 0
+
+        def __call__(self, points, views):
+            Failing.calls += 1
+            if Failing.calls == 2:
+                raise RuntimeError("CUDA out of memory")
+            return super().__call__(points, views)
+
+    monkeypatch.setattr(pipeline, "resolve_device", lambda requested: "cpu")
+    monkeypatch.setattr(pipeline, "load_network", lambda *a, **k: Failing())
+    monkeypatch.setattr(
+        engine, "_dataset",
+        lambda model, surfaces, mount_point, device: [
+            (torch.zeros(3, 3), torch.zeros(1, 3, dtype=torch.long), torch.zeros(3, 3))
+            for _ in surfaces
+        ],
+    )
+    for name in ("Smith_John", "Jones_Mary", "Doe_Jane"):
+        write_surface(tmp_path / "in" / (name + ".vtk"))
+    checkpoint = tmp_path / "airways_2_class.ckpt"
+    checkpoint.write_bytes(b"")
+
+    with caplog.at_level("INFO", logger="DOCShapeAXI"):
+        with pytest.raises(RuntimeError, match="CUDA out of memory"):
+            run(surfaces=str(tmp_path / "in"), model=str(checkpoint),
+                output_dir=str(tmp_path / "out"), explain=False)
+    assert ("surface 2 of 3: classification failed (RuntimeError: CUDA out of memory)"
+            in caplog.messages)
+    assert "Smith" not in caplog.text and ".vtk" not in caplog.text
+
+
+def test_a_finished_run_logs_how_much_was_done(tmp_path, stubbed, caplog):
+    write_surface(tmp_path / "in" / "a.vtk")
+    write_surface(tmp_path / "in" / "b.vtk")
+    checkpoint = tmp_path / "condyles_4_class.ckpt"
+    checkpoint.write_bytes(b"")
+
+    with caplog.at_level("INFO", logger="DOCShapeAXI"):
+        run(surfaces=str(tmp_path / "in"), model=str(checkpoint),
+            output_dir=str(tmp_path / "out"))
+    assert "2 of 2 surfaces classified, 2 explained" in caplog.messages
+
+
+def test_the_explanation_loader_runs_in_process():
+    """A worker process's failure reaches the server as a cut traceback string
+    and its log records never arrive."""
+    import inspect
+
+    assert "num_workers=0" in inspect.getsource(engine.explain)

@@ -173,7 +173,9 @@ def test_the_run_reports_where_it_has_got_to(tmp_path):
     sup = PipelineSup(tmp_path)
     run(sup=sup, **request(tmp_path))
 
-    fractions = [fraction for fraction, _message in sup.messages]
+    # Log lines travel through the same fake with no fraction; only the bar's
+    # own waypoints have to move forward.
+    fractions = [fraction for fraction, _message in sup.messages if fraction is not None]
     assert fractions == sorted(fractions)
     assert fractions[0] < fractions[-1] <= 1.0
     assert all("P1" not in message and "P2" not in message
@@ -517,6 +519,123 @@ def test_the_feature_table_carries_the_measurements_that_were_made(tmp_path):
     assert abs(table["CB_ROr_ROr_RL"].iloc[0]) == pytest.approx(56.0, abs=1e-6)
     # The mandibular condyle is nudged 1.5 mm superiorly by the fixture.
     assert abs(table["MAND_RCo_RCo_IS"].iloc[0]) == pytest.approx(1.5, abs=1e-6)
+
+
+def test_a_classification_not_run_is_said_not_only_recorded(tmp_path):
+    """A run that finishes without the verdict has to say so in a line the
+    operator and the clinician see, not only in a report somebody has to open."""
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(tmp_path))
+
+    warnings = [message for level, user, message in sup.logs
+                if level == "warning" and user]
+    assert any(message.startswith("classification not run: ") and
+               "feature_template" in message for message in warnings)
+
+
+def test_a_bundle_the_installed_libraries_cannot_load_does_not_cost_the_measurements(tmp_path):
+    """A model pickled under another library version fails in `joblib.load`,
+    with a message about module internals. That is the deployment's fault, and
+    it costs the verdict only -- said by name, with the model it was."""
+    from test_classify import FEATURES
+
+    bundle = tmp_path / "vface_models"
+    bundle.mkdir()
+    for name in ("sym_asymm.txt", "mand_asym.txt", "max_asym.txt"):
+        (bundle / name).write_bytes(b"not a pickle")
+
+    sup = PipelineSup(tmp_path)
+    run(sup=sup, **request(
+        tmp_path,
+        feature_template=write_feature_template(tmp_path / "template.xlsx", FEATURES),
+        classifier_model=str(bundle),
+    ))
+
+    written = tree_of(tmp_path / "out")
+    assert os.path.join("Measurements", dispatch.FEATURE_TABLE_NAME) in written
+    assert not any(name.startswith("Classification") for name in written)
+    report = read_report(tmp_path / "out")
+    assert "'symmetry' model could not be loaded" in report["classification"]
+    assert any("classification not run: RuntimeError" in message
+               for _level, _user, message in sup.logs)
+
+
+def test_an_empty_measurement_table_says_why_in_the_error_itself(tmp_path):
+    """The run report is deleted with the job when the run fails, so the
+    cause has to travel in the error: how many were tried, and the commonest
+    reason they were not made."""
+    from sadt_vface import aq3dc
+
+    distance = aq3dc.Measurement(kind=aq3dc.SPELLINGS["Distance between 2 points T1 T2"][0],
+                                 spelling="Distance between 2 points T1 T2",
+                                 names=("Xx", "Xx"), times=("T1", "T2"))
+    summary = {}
+    rows = aq3dc.compute_cohort({"P1": {"Ba": [0, 0, 0]}, "P2": {"Ba": [0, 0, 0]}},
+                                {"P1": {"Ba": [0, 0, 0]}, "P2": {"Ba": [0, 0, 0]}},
+                                [distance], summary=summary)
+    assert rows == []
+    message = dispatch._why_nothing_measured(summary, 1)
+    assert message == ("0 of 2 measurement(s) made over 2 patient(s); most common "
+                       "failure: landmark Xx absent (2 of 2)")
+
+    nobody = {}
+    aq3dc.compute_cohort({"P1": {}}, {"P2": {}}, [distance], summary=nobody)
+    assert dispatch._why_nothing_measured(nobody, 1) == (
+        "no patient has landmarks at both timepoints (2 at only one)"
+    )
+
+
+def test_a_measurement_skipped_for_several_patients_is_logged_once(caplog):
+    """One line per measurement, naming the absent landmark and how many
+    patients it cost -- never one identical line per patient."""
+    from sadt_vface import aq3dc
+
+    distance = aq3dc.Measurement(kind=aq3dc.SPELLINGS["Distance between 2 points T1 T2"][0],
+                                 spelling="Distance between 2 points T1 T2",
+                                 names=("Ba", "Xx"), times=("T1", "T2"))
+    present = {"Ba": [0, 0, 0], "Xx": [1, 0, 0]}
+    t1 = {"P1": {"Ba": [0, 0, 0]}, "P2": {"Ba": [0, 0, 0]}, "P3": present}
+    t2 = {"P1": {"Ba": [0, 0, 0]}, "P2": {"Ba": [0, 0, 0]}, "P3": present}
+    with caplog.at_level("WARNING", logger="sadt_vface"):
+        rows = aq3dc.compute_cohort(t1, t2, [distance])
+
+    assert len(rows) == 1
+    (message,) = [r.getMessage() for r in caplog.records]
+    assert message == "VFACE: Ba - Xx skipped for 2 of 3 patient(s) (landmark Xx absent)"
+
+
+def test_a_measurements_argument_that_is_not_a_folder_is_named(tmp_path):
+    with pytest.raises(ToolInputError, match="^'measurements' is not a folder"):
+        dispatch._measurement_lists(str(tmp_path / "absent"), catalogs.REGIONS)
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(ToolInputError, match="^'measurements' holds no Excel file"):
+        dispatch._measurement_lists(str(tmp_path / "empty"), catalogs.REGIONS)
+
+
+def test_heat_maps_that_all_fail_raise_with_the_commonest_cause(tmp_path, monkeypatch, caplog):
+    """Not a 422: every surface came out of this run's own segmentations."""
+    from sadt_vface import heatmap
+
+    def broken(*_args, **_kwargs):
+        raise ArithmeticError("the two surfaces share no point")
+
+    monkeypatch.setattr(heatmap, "distance_map", broken)
+    sup = PipelineSup(tmp_path)
+    total = len(PATIENTS) * len(catalogs.REGIONS)
+    with caplog.at_level("WARNING", logger="sadt_vface"):
+        with pytest.raises(RuntimeError, match=(
+            rf"0 of {total} heat map\(s\) drawn; most common failure: ArithmeticError: "
+            rf"the two surfaces share no point \({total} of {total}\)"
+        )):
+            run(sup=sup, **request(
+                tmp_path,
+                outputs=catalogs.OUTPUT_VISUALISATION,
+                surface_model=str(tmp_path / "models" / "bds"),
+            ))
+    failed = [r.getMessage() for r in caplog.records if "heat map failed" in r.getMessage()]
+    assert len(failed) == total
+    assert all("patient" in message and " of " in message for message in failed)
+    assert not any(patient in message for message in failed for patient in PATIENTS)
 
 
 # ---------------------------------------------------------------------------

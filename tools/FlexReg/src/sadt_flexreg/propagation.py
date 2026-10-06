@@ -2,20 +2,30 @@ import torch
 import vtk
 import numpy as np
 
-import sys
+import functools
 import logging
 
-# ===== Logging Configuration =====
-logger = logging.getLogger("FlexReg_CLI_propagation")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-if logger.handlers:
-    logger.handlers.clear()
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(name)s - %(levelname)s - (%(filename)s:%(lineno)d) - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+from .errors import ToolUnavailableError
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def require_cuda():
+    """Refuse, by name, to propagate a patch without a CUDA device.
+
+    Upstream calls `.cuda()` unconditionally below, and on a CPU-only server
+    that surfaced as torch's "Torch not compiled with CUDA enabled" or "No CUDA
+    GPUs are available" from deep inside the dilation, read as a bug in the
+    tool. Checked once per process: the answer does not change between
+    surfaces, and every surface of a batch would otherwise fail the same way.
+    """
+    if not torch.cuda.is_available():
+        raise ToolUnavailableError(
+            "the palate patch needs a CUDA GPU and torch sees none on this "
+            "server (torch {}, built for CUDA {})".format(
+                torch.__version__, torch.version.cuda or "none")
+        )
 
 
 def Difference(t1,t2):
@@ -63,6 +73,7 @@ def GetNeighbors(vtkdata, pids_tensor):
 
 
 def Dilation(arg_point,F,texture,surf):
+    require_cuda()
     arg_point = torch.tensor([arg_point]).cuda().to(torch.int64)
     F = F.cuda()
     texture = texture.cuda()

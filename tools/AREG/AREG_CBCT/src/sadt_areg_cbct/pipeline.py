@@ -51,11 +51,11 @@ def register_patient(
     Raises `elastix.RegistrationError` when this patient cannot be registered;
     the caller records that and moves on to the next.
     """
-    fixed = sitk.ReadImage(t1_path)
-    mask = sitk.ReadImage(mask_path)
+    fixed = _read(t1_path, "T1 scan")
+    mask = _read(mask_path, "mask", cause="mask")
     masked, note = elastix.apply_mask(fixed, mask, label=segmentation_label)
 
-    moving = sitk.ReadImage(t2_path)
+    moving = _read(t2_path, "T2 scan")
     transform = elastix.register(masked, moving)
 
     # The T2's own size, spacing and direction, in the T1's frame -- placed where
@@ -142,9 +142,15 @@ def _register_safely(job: dict) -> dict:
     try:
         return register_patient(**job)
     except elastix.RegistrationError as exc:
-        return {"status": "failed", "reason": str(exc)}
+        # `error` and `cause` travel back to the parent, which logs the failure
+        # and decides whose fault it was; it takes them out of the report.
+        return {"status": "failed", "reason": str(exc), "error": type(exc).__name__,
+                "cause": getattr(exc, "cause", None)}
     except RuntimeError as exc:
-        return {"status": "failed", "reason": f"registration failed: {exc}"}
+        # Straight from ITK: its source path and an object address come before
+        # the sentence, so only the sentence is kept.
+        return {"status": "failed", "reason": elastix.describe(exc),
+                "error": type(exc).__name__, "cause": "engine"}
 
 
 def _threads_per_worker(width: int) -> int:
@@ -171,6 +177,22 @@ def _worker_setup(threads: int) -> None:
     os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(threads)
     os.environ["OMP_NUM_THREADS"] = str(threads)
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+
+
+def _read(path: str, what: str, cause: str = "input") -> sitk.Image:
+    """Read one volume, or say which of the three could not be read.
+
+    A file the caller sent that ITK cannot open is the caller's to fix, so it
+    is reported as their input (`cause="input"`) rather than as an engine
+    failure -- and by its role, never by its name. A mask is "mask": whose
+    fault it is depends on who made it, which only the caller knows.
+    """
+    try:
+        return sitk.ReadImage(path)
+    except RuntimeError as exc:
+        raise elastix.RegistrationError(
+            f"the {what} could not be read: {elastix.describe(exc)}", cause=cause
+        ) from exc
 
 
 def _origin_in_fixed_frame(moving: sitk.Image, transform: sitk.Transform) -> tuple:

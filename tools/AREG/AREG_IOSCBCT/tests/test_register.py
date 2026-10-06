@@ -6,6 +6,7 @@ back out and the report that describes it. What the other two modes add is
 where the landmarks came from, which `test_tools.py` covers.
 """
 
+import logging
 import os
 
 import numpy as np
@@ -289,13 +290,37 @@ def test_one_mesh_failing_does_not_cost_the_batch(tmp_path):
     assert os.path.join("1", "P001_T2_U_Reg.vtk") in tree_of(tmp_path / "out")
 
 
-def test_a_batch_where_nothing_registered_raises_and_says_where_to_look(tmp_path):
+def test_a_batch_where_nothing_registered_raises_with_the_cause_in_it(tmp_path):
+    """The report is deleted with a failed job, so the message must stand alone:
+    the count and the commonest failure. Every arch failing on the caller's own
+    landmarks keeps the caller's error class."""
     cohort(tmp_path)
     write_markups(
         tmp_path / "cbct_lm" / "P_0001_T2_lm_Pred.mrk.json", {"UR1O": [0.0, 0.0, 0.0]}
     )
-    with pytest.raises(RuntimeError, match="registered no mesh"):
+    with pytest.raises(ToolInputError) as raised:
         run_registration(tmp_path)
+    message = str(raised.value)
+    assert message.startswith("0 of 1 mesh(es) registered")
+    assert "ToolInputError: The two modalities share only 1 landmark(s)" in message
+    assert "(1 of 1)" in message
+    assert "report" not in message
+
+
+def test_a_failed_arch_is_logged_with_its_position_and_cause_not_its_name(tmp_path, caplog):
+    cohort(tmp_path, patients=("P001", "P002"))
+    write_markups(
+        tmp_path / "cbct_lm" / "P_0002_T2_lm_Pred.mrk.json", {"UR1O": [0.0, 0.0, 0.0]}
+    )
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        run_registration(tmp_path)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    failed = [m for m in warnings if "registration failed" in m]
+    assert len(failed) == 1
+    assert failed[0].startswith("patient 2/2, arch U: registration failed (ToolInputError: ")
+    assert "P002" not in failed[0]
+    # The run finished, partially: the summary says how many and is a warning.
+    assert any("1 of 2 mesh(es) registered, 1 failed" in m for m in warnings)
 
 
 def test_a_mesh_with_no_landmarks_of_its_own_names_the_patient_and_the_side(tmp_path):
@@ -305,8 +330,11 @@ def test_a_mesh_with_no_landmarks_of_its_own_names_the_patient_and_the_side(tmp_
     run_registration(tmp_path)
     failed = read_report(tmp_path / "out")["patients"]["2"]["meshes"]["P002_T2_U.vtk"]
     assert failed["status"] == "failed"
-    assert "patient '2'" in failed["error"]
+    assert "this patient" in failed["error"]
     assert "the intraoral" in failed["error"]
+    assert "'ios_landmarks'" in failed["error"]
+    # The key is built from the caller's file names, so it is not repeated.
+    assert "'2'" not in failed["error"]
 
 
 def test_an_empty_landmark_folder_is_refused_before_any_mesh_is_read(tmp_path):
@@ -315,7 +343,34 @@ def test_an_empty_landmark_folder_is_refused_before_any_mesh_is_read(tmp_path):
 
     with pytest.raises(ToolInputError) as raised:
         run_registration(tmp_path)
-    assert "1 intraoral and 0 CBCT" in str(raised.value)
+    assert "No CBCT landmark could be read from 'cbct_landmarks'" in str(raised.value)
+    assert "0 landmark file(s)" in str(raised.value)
+
+
+def test_an_unreadable_landmark_file_is_skipped_with_its_position(tmp_path, caplog):
+    """One truncated JSON used to abort the batch with a bare JSONDecodeError."""
+    cohort(tmp_path, patients=("P001", "P002"))
+    (tmp_path / "ios_lm" / "P002_T2_U_lm_Pred.mrk.json").write_text("{not json")
+
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        run_registration(tmp_path)
+    report = read_report(tmp_path / "out")
+    assert report["patients"]["1"]["status"] == "ok"
+    assert report["patients"]["2"]["status"] == "failed"
+    unreadable = [r.getMessage() for r in caplog.records if "landmark file 2 of 2" in r.getMessage()]
+    assert len(unreadable) == 1
+    assert unreadable[0].startswith(
+        "intraoral landmark file 2 of 2 unreadable (JSONDecodeError: ")
+    assert "P002" not in unreadable[0]
+
+
+def test_every_landmark_file_unreadable_is_refused_and_counted(tmp_path):
+    cohort(tmp_path)
+    (tmp_path / "cbct_lm" / "P_0001_T2_lm_Pred.mrk.json").write_text("[]")
+
+    with pytest.raises(ToolInputError) as raised:
+        run_registration(tmp_path)
+    assert "1 landmark file(s)" in str(raised.value)
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +461,26 @@ def test_an_arch_the_cbct_cannot_confirm_is_refused_rather_than_written(tmp_path
     # translation of a few millimetres, so it cannot bring this back.
     write_plane(tmp_path / "ios" / "P001_T2_U.vtk", centre=(500.0, 500.0, 500.0))
 
-    with pytest.raises(RuntimeError, match="registered no mesh"):
+    with pytest.raises(RuntimeError, match="0 of 1 mesh") as raised:
         run_registration(tmp_path)
+    assert "matched the CBCT surface" in str(raised.value)
+    # Not the caller's fault, so not a 422.
+    assert not isinstance(raised.value, ValueError)
     # Nothing written is the whole point: the failure mode being guarded against
     # is a file that looks like a registered arch and is not one.
     assert list(tree_of(tmp_path / "out")) == []
+
+
+def test_the_registrations_own_lines_carry_the_patient_and_arch(tmp_path, caplog):
+    """`geometry` knows nothing of the batch; without the prefix its lines said
+    what happened and never to which arch."""
+    cohort(tmp_path, patients=("P001", "P002"))
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        run_registration(tmp_path)
+    fitted = [r.getMessage() for r in caplog.records
+              if r.name == "sadt_areg_ioscbct.geometry" and "Pre-alignment" in r.getMessage()]
+    assert [line.split(":")[0] for line in fitted] == [
+        "patient 1/2, arch U", "patient 2/2, arch U"]
+    # Outside the loop nothing is prefixed.
+    summary = [r.getMessage() for r in caplog.records if "mesh(es) registered" in r.getMessage()]
+    assert summary == [summary[0]] and summary[0].startswith("AREG_IOSCBCT: 2 of 2")

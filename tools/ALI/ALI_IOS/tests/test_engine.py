@@ -735,3 +735,105 @@ def test_a_mask_that_claimed_no_face_has_no_position():
         [], torch.zeros(1, 1, 3, dtype=torch.int64), torch.zeros(1, 3, 3),
         _RecordingLocator(), _OnePointSurface()
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# What an operator can read when a run fails
+# ---------------------------------------------------------------------------
+#
+# The server keeps the exception's class and message and this package's log
+# lines -- no traceback, and no report once a run has failed.
+
+def _messages(caplog, level):
+    return [record.getMessage() for record in caplog.records
+            if record.name.startswith("sadt_ali_ios") and record.levelname == level]
+
+
+def test_a_checkpoint_that_cannot_be_loaded_fails_the_run_once(tmp_path, stubs, monkeypatch, caplog):
+    """It used to fail every mesh of the batch identically, each after its own
+    rendering setup, and the run then blamed the first mesh."""
+    mesh_with(tmp_path / "in" / "Smith_John.vtk", [8, 9])
+    mesh_with(tmp_path / "in" / "Jones_Mary.vtk", [8, 9])
+    bundle = write_bundle(tmp_path / "b", BOTH_JAWS)
+    attempts = []
+
+    def broken(checkpoint, device, network_code="O"):
+        attempts.append(checkpoint)
+        raise RuntimeError("Error(s) in loading state_dict for UNet:\n\tMissing key(s)")
+
+    monkeypatch.setattr(engine, "_build_network", broken)
+    with caplog.at_level("INFO"), pytest.raises(engine.NetworkUnusable) as raised:
+        identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
+
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value) == (
+        "the Occlusal/Upper network could not be loaded "
+        "(RuntimeError: Error(s) in loading state_dict for UNet:)"
+    )
+    assert len(attempts) == 1
+    assert _messages(caplog, "ERROR") == [f"mesh 1 of 2: {raised.value}"]
+    assert not any("Smith" in line or "Jones" in line
+                   for level in ("INFO", "WARNING", "ERROR") for line in _messages(caplog, level))
+
+
+def test_a_failed_mesh_is_logged_with_its_position_and_class(tmp_path, stubs, caplog):
+    mesh_with(tmp_path / "in" / "a.vtk", [8, 9])
+    mesh_with(tmp_path / "in" / "z_Smith_John.vtk", [77, 88])
+    bundle = write_bundle(tmp_path / "b", BOTH_JAWS)
+
+    with caplog.at_level("INFO"):
+        identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
+
+    warnings = _messages(caplog, "WARNING")
+    assert any(line.startswith("mesh 2 of 2: landmark prediction failed (RuntimeError: "
+                               "no known tooth number") for line in warnings)
+    assert any(line.startswith("1 of 2 meshes processed, 1 failed") for line in warnings)
+    assert not any("Smith" in line for line in warnings)
+
+
+def test_a_failed_tooth_is_logged_with_its_mesh_position(tmp_path, stubs, monkeypatch, caplog):
+    mesh_with(tmp_path / "in" / "a.vtk", [8, 9])
+    bundle = write_bundle(tmp_path / "b", BOTH_JAWS)
+    real = engine._predict_one_tooth
+
+    def flaky(**kwargs):
+        if kwargs["tooth_number"] == 8:
+            raise RuntimeError("rasterizer said no")
+        return real(**kwargs)
+
+    monkeypatch.setattr(engine, "_predict_one_tooth", flaky)
+    with caplog.at_level("INFO"):
+        identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
+    assert "mesh 1 of 1: Occlusal/Upper tooth 8 failed (RuntimeError: rasterizer said no)" in (
+        _messages(caplog, "WARNING")
+    )
+
+
+def test_a_batch_where_nothing_worked_leads_with_the_count(tmp_path, stubs, monkeypatch):
+    mesh_with(tmp_path / "in" / "a.vtk", [8, 9])
+    mesh_with(tmp_path / "in" / "b.vtk", [8, 9])
+    bundle = write_bundle(tmp_path / "b", BOTH_JAWS)
+
+    def oom(**kwargs):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 1.00 GiB")
+
+    monkeypatch.setattr(engine, "_predict_one_tooth", oom)
+    with pytest.raises(RuntimeError) as raised:
+        identify(tmp_path, tmp_path / "in", bundle, ios_networks=["Occlusal"])
+    assert str(raised.value) == (
+        "0 of 2 meshes processed; most common failure: no landmark was predicted on "
+        "this mesh; most common failure: RuntimeError: CUDA out of memory. Tried to "
+        "allocate 1.00 GiB (2 of 2 teeth) (2 of 2)"
+    )
+
+
+def test_an_unreadable_mesh_does_not_refuse_the_batch_in_the_label_check(tmp_path, caplog):
+    good = write_surface(tmp_path / "a.vtk")
+    empty = tmp_path / "b.vtk"
+    empty.write_text("# vtk DataFile Version 3.0\nnothing\nASCII\nDATASET POLYDATA\nPOINTS 0 float\n")
+
+    with caplog.at_level("WARNING"):
+        engine.require_labels([(good, "a.vtk"), (str(empty), "b.vtk")])
+    assert _messages(caplog, "WARNING") == [
+        "mesh 2 of 2: reading failed (ValueError: Surface has no points)"
+    ]

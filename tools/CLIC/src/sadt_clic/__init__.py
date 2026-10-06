@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
@@ -16,7 +17,14 @@ from .pipeline import (
     segment_volume,
 )
 
-logger = logging.getLogger("CLIC")
+# Named after the package, not the tool: the server shows the records of the
+# loggers under this package and nothing else.
+logger = logging.getLogger(__name__)
+
+# How much of one failure's message the all-failed error quotes. The server
+# keeps about 300 characters of an exception, and the count after the quote is
+# what says whether the failure was one bad scan or the whole batch.
+_QUOTED_FAILURE = 160
 
 __all__ = ["run"]
 
@@ -124,6 +132,11 @@ def run(
 
     checkpoint = _resolve_checkpoint(model, data_root)
     device = resolve_device(device)
+    # Said BEFORE the load, not after it: a checkpoint that cannot be read
+    # fails here, and the last thing logged is what tells an operator which
+    # stage a run died in.
+    logger.info("loading checkpoint %s on %s", os.path.basename(checkpoint), device)
+    progress.emit(None, "loading checkpoint")
     network, classes = build_model(checkpoint, device)
     logger.info(
         "CLIC: %d scan(s), %d class(es), device=%s, score_threshold=%.2f",
@@ -153,6 +166,7 @@ def run(
             f"named wrongly."
         )
     written = []
+    failures = []
 
     # Scans are keyed by their path RELATIVE to the input root, and the output
     # mirrors that tree. Keying on the base name alone made two scans called
@@ -170,54 +184,126 @@ def run(
         progress.report(index, len(found), "scan")
         relative = Path(os.path.relpath(path, root))
         entry = {"input": relative.as_posix()}
+        step = ["reading"]
         try:
             written.append(
                 _segment_one(network, path, output_dir, relative, device,
-                             score_threshold, output_suffix, classes, entry)
+                             score_threshold, output_suffix, classes, entry,
+                             step)
             )
         except Exception as exc:
             # One unreadable scan must not cost the other 199. Upstream ran one
             # process per scan, so it never had to say this. Position here too,
-            # and for a sharper reason than the progress call above: a failed
-            # run's stderr is copied into the server's own persistent log.
-            logger.exception("CLIC failed on scan %d of %d", index, len(found))
+            # and for a sharper reason than the progress call above: the server
+            # keeps this line, and a file name in it is a patient identifier.
+            # The step and the exception go in the line itself because the
+            # server shows no traceback.
+            logger.warning(
+                "scan %d of %d: %s failed (%s: %s)",
+                index, len(found), step[0], type(exc).__name__, exc,
+            )
             entry["status"] = "failed"
             entry["reason"] = f"{type(exc).__name__}: {exc}"
+            failures.append(exc)
+        else:
+            if not entry["detections"]:
+                # A wrong checkpoint looks exactly like this on every scan, so
+                # it is said where an operator reads, not only in the report.
+                logger.warning(
+                    "scan %d of %d: no detection cleared the score threshold "
+                    "%.2f, so its segmentation is empty",
+                    index, len(found), score_threshold,
+                )
         report["cases"][entry["input"]] = entry
 
     report["summary"] = f"{len(written)}/{len(found)} scan(s) segmented"
     report["duration_seconds"] = round(time.monotonic() - started, 2)
+    logger.log(
+        logging.WARNING if failures else logging.INFO,
+        "%d of %d scans segmented, %d failed",
+        len(written), len(found), len(failures),
+    )
 
     if not written:
         # The guard counts what was WRITTEN, not what was walked past.
-        raise ValueError(
-            "CLIC segmented none of the scans it was given. "
-            + "; ".join(
-                f"{s['input']}: {s.get('reason', 'unknown')}"
-                for s in report["cases"].values() if s.get("status") == "failed"
-            )
-        )
+        raise _nothing_segmented(failures, len(found))
 
     (output_dir / "CLIC_report.json").write_text(json.dumps(report, indent=2))
     return output_dir
 
 
+def _nothing_segmented(failures, total):
+    """The exception for a batch in which no scan was segmented.
+
+    Counted and classified rather than listed: the list used to be every
+    scan's file name with its reason, which put patient identifiers in the one
+    message the server keeps, and was cut long before the reasons that mattered.
+    The most common failure, with how many scans it accounts for, is what tells
+    a broken batch from a broken deployment.
+
+    A ValueError -- the caller's fault, answered as such -- only when every
+    failure was one: scans that are not readable volumes. Anything else that
+    failed every scan (an out-of-memory card, a network that cannot run) is the
+    server's, and a RuntimeError.
+    """
+    reasons = Counter(f"{type(exc).__name__}: {exc}" for exc in failures)
+    reason, count = reasons.most_common(1)[0]
+    if len(reason) > _QUOTED_FAILURE:
+        reason = reason[: _QUOTED_FAILURE - 3] + "..."
+    message = (
+        f"0 of {total} scans segmented; most common failure: {reason} "
+        f"({count} of {total})"
+    )
+    kind = ValueError if all(isinstance(e, ValueError) for e in failures) else RuntimeError
+    error = kind(message)
+    error.__cause__ = failures[0]
+    return error
+
+
+def _read_volume(path):
+    """The scan's voxels as float32, or a ValueError naming why it cannot be.
+
+    What nibabel raises for a file that is not a NIfTI volume -- not gzip, cut
+    short, a wrong header -- is the caller's input, so it becomes a ValueError.
+    Its message carries the full path, and the path carries the patient's file
+    name, so the path is replaced before the message goes anywhere.
+    """
+    import gzip
+    import zlib
+
+    import nibabel as nib
+    import numpy as np
+    from nibabel.filebasedimages import ImageFileError
+
+    try:
+        image = nib.load(path)
+        volume = image.get_fdata(dtype=np.float32)
+    except (ImageFileError, gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        detail = str(exc).replace(str(path), "<scan>")
+        raise ValueError(
+            f"not a readable NIfTI volume ({type(exc).__name__}: {detail})"
+        ) from exc
+    if volume.ndim != 3:
+        raise ValueError(f"expected a 3D volume, got {volume.ndim}D")
+    return image, volume
+
+
 def _segment_one(network, path, output_dir, relative, device, score_threshold,
-                 suffix, classes, entry):
+                 suffix, classes, entry, step):
     """One scan, in and out. Returns the path written.
 
     `relative` is the scan's path relative to the input root; the output is
     written at the same place under `output_dir`, so a batch of homonyms in
-    different folders keeps them apart.
+    different folders keeps them apart. `step` is a one-element list this
+    updates as it goes, so a failure can say which step it happened in.
     """
     import nibabel as nib
     import numpy as np
 
-    image = nib.load(path)
-    volume = image.get_fdata(dtype=np.float32)
-    if volume.ndim != 3:
-        raise ValueError(f"expected a 3D volume, got {volume.ndim}D")
+    step[0] = "reading"
+    image, volume = _read_volume(path)
 
+    step[0] = "segmentation"
     labels, detections = segment_volume(network, volume, device, score_threshold)
 
     stem = relative.name
@@ -226,6 +312,7 @@ def _segment_one(network, path, output_dir, relative, device, score_threshold,
             stem = stem[: -len(extension)]
             break
 
+    step[0] = "writing"
     destination = output_dir / relative.parent / f"{stem}_{suffix}.nii.gz"
     destination.parent.mkdir(parents=True, exist_ok=True)
     nib.save(nib.Nifti1Image(labels, image.affine, image.header), str(destination))

@@ -221,3 +221,39 @@ def test_the_answers_are_not_read_back_as_features(tmp_path):
     )
     assert features.read_template_columns(str(tmp_path / "template.xlsx")) == \
         ["CB_ROr_LOr_RL"]
+
+
+def test_a_bundle_that_is_not_a_folder_is_refused_naming_the_argument(tmp_path):
+    with pytest.raises(ToolInputError, match="^'classifier_model' is not a folder"):
+        classify.load_models(str(tmp_path / "absent"))
+
+
+def test_a_model_that_cannot_be_unpickled_is_a_server_fault_naming_the_model(bundle):
+    """A pickle from another library version is the deployment's problem, not
+    the caller's, so it is not a 422 -- and it says WHICH of the three it was."""
+    with open(os.path.join(bundle, "mand_asym.txt"), "wb") as handle:
+        handle.write(b"not a pickle")
+    with pytest.raises(RuntimeError, match="'mandible' model could not be loaded"):
+        classify.load_models(bundle)
+
+
+def test_a_failed_sub_classification_logs_its_cause(bundle, monkeypatch, caplog):
+    """The finer question may fail alone, but not silently: the line says which
+    sub-model and why."""
+
+    class Fake:
+        def __init__(self, columns):
+            self.feature_name_ = columns
+
+        def predict(self, frame):
+            return np.zeros(len(frame), dtype=int)
+
+    loaded = {"symmetry": Fake(FEATURES), "mandible": Fake(FEATURES),
+              "maxilla": Fake(["NOT_A_FEATURE"])}
+    monkeypatch.setattr(classify, "load_models", lambda _dir: loaded)
+    with caplog.at_level("WARNING", logger="sadt_vface"):
+        classify.classify(records(), bundle)
+
+    (message,) = [r.getMessage() for r in caplog.records if "sub-classification" in r.getMessage()]
+    assert "maxilla" in message
+    assert "ToolInputError" in message and "NOT_A_FEATURE" in message

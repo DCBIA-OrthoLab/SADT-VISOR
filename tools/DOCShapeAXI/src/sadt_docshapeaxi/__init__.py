@@ -58,7 +58,12 @@ def run(
     analysis = catalog.analysis_for(os.path.basename(model))
 
     if not os.path.exists(model):
-        raise FileNotFoundError(f"The checkpoint '{os.path.basename(model)}' was not found.")
+        # Named by argument and analysis first: the file name that follows is
+        # redacted on its way to an operator's log.
+        raise FileNotFoundError(
+            f"'model': the {analysis.anatomy} {analysis.task} checkpoint was "
+            f"not found ('{os.path.basename(model)}')."
+        )
 
     found = pipeline.discover_surfaces(surfaces)
     if not found:
@@ -66,6 +71,11 @@ def run(
             f"No .vtk surface was found under '{os.path.basename(surfaces)}'. "
             f"DOCShapeAXI reads surfaces, not volumes."
         )
+    # Both before the checkpoint is loaded, which is the slow part: a batch
+    # that cannot finish is refused while refusing it is cheap.
+    pipeline.check_surfaces(found)
+    if explain:
+        pipeline.check_unique_names(found)
 
     device = pipeline.resolve_device(device)
     os.makedirs(output_dir, exist_ok=True)
@@ -89,7 +99,9 @@ def run(
     # The checkpoint load is one opaque call: announced at the start of the
     # bar rather than given a share of it nothing here measures.
     progress.emit(0.0, "loading the model")
-    network = pipeline.load_network(model, analysis.network, device)
+    network = pipeline.load_network(
+        model, analysis.network, device, anatomy=analysis.anatomy
+    )
     values = engine.predict(
         network, analysis, found, mount_point, device, span=(0.0, split)
     )
@@ -131,6 +143,14 @@ def run(
     outputs = {"report": report_path}
     for path in written:
         outputs[os.path.splitext(os.path.basename(path))[0]] = path
+
+    # Every surface is accounted for or the run has already raised, so this
+    # is the operator's confirmation of how much was done, not a tally of
+    # partial success.
+    logger.info(
+        "%d of %d surfaces classified, %d explained", len(predictions),
+        len(found), len(written),
+    )
     return {"outputs": outputs, "predictions": predictions, "report": report_path}
 
 

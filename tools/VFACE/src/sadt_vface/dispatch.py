@@ -129,6 +129,28 @@ def _stage(sup, plan: dict, key: str, message: str) -> tuple:
     return span
 
 
+def _per_item(sup, span):
+    """A `(done, total, message)` callback that moves the bar across `span`.
+
+    For the steps VFACE runs itself, one item at a time: each message lands as
+    the run's stage, so a failure in the middle of one is reported with the
+    item it was on rather than with the line that opened the step. None for
+    no span, which is a caller with no bar.
+    """
+    if span is None:
+        return None
+    start, end = span
+
+    def report(done: int, total: int, message: str) -> None:
+        fraction = start + (end - start) * done / max(total, 1)
+        if sup is not None and hasattr(sup, "progress"):
+            sup.progress(fraction, message)
+        else:
+            progress.emit(fraction, message)
+
+    return report
+
+
 def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
     """`sup.log` when there is a supervisor, the progress file's log otherwise.
 
@@ -240,11 +262,13 @@ def _second_timepoint(sup, study: str, oriented: dict, mirror_reference: str,
         )
     # The follow-up goes through the same two stages the baseline did, in the
     # same proportions: a resample, then an orientation per frame.
-    _resample_span, orient_span = tools.split_span(
+    resample_span, orient_span = tools.split_span(
         span, [STAGE_WEIGHTS["resample"], STAGE_WEIGHTS["orient"]]
     )
-    resampled = resample.resample_cohort(t2, _folder(work_dir, "t2_resampled"),
-                                         report=report)
+    resampled = resample.resample_cohort(
+        t2, _folder(work_dir, "t2_resampled"), report=report,
+        on_progress=_per_item(sup, resample_span),
+    )
     return _orient(sup, resampled, work_dir, reference_of, landmark_model,
                    span=orient_span)
 
@@ -366,21 +390,41 @@ def _measure(regions, baseline: dict, compared: dict, measurements: dict,
     stats = {}
     for region in regions:
         frame = catalogs.REGION_TABLE[region]["frame"]
+        summary = {}
         rows = aq3dc.compute_cohort(
             landmark_files.read_cohort(baseline[frame]),
             landmark_files.read_cohort(compared[region]),
-            measurements[region], report=report,
+            measurements[region], report=report, summary=summary,
         )
         if not rows:
             raise ToolInputError(
-                f"No measurement could be made on the {region}. The per-patient "
-                "reasons are in the run report."
+                f"No measurement could be made on the {region}: "
+                f"{_why_nothing_measured(summary, len(measurements[region]))}"
             )
         aq3dc.write_table(rows, os.path.join(
             destination, f"Measurements_{_short(region)}.xlsx"
         ))
         stats[_short(region)] = features.to_stats(rows)
     return stats
+
+
+def _why_nothing_measured(summary: dict, listed: int) -> str:
+    """The cause of an empty measurement table, said in the error itself.
+
+    Never "see the run report": the job directory, and the report in it, is
+    deleted when the run fails, so the error is the only thing that survives.
+    """
+    patients = summary.get("patients", 0)
+    if not patients:
+        return (f"no patient has landmarks at both timepoints "
+                f"({summary.get('only_one', 0)} at only one)")
+    skipped = summary.get("skipped") or {}
+    if not skipped:
+        return f"the measurement list names no measurement ({patients} patient(s))"
+    reason, count = max(skipped.items(), key=lambda item: item[1])
+    total = patients * listed
+    return (f"0 of {total} measurement(s) made over {patients} patient(s); most "
+            f"common failure: {reason} ({count} of {total})")
 
 
 def _short(region: str) -> str:
@@ -558,9 +602,10 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
 
     # --- the scans, in the two frames ---------------------------------------
     if mode == catalogs.MODE_FULL:
-        _stage(sup, plan, "resample", "putting the cohort on one voxel grid")
+        span = _stage(sup, plan, "resample", "putting the cohort on one voxel grid")
         resampled = resample.resample_cohort(t1, _folder(work_dir, "resampled"),
-                                             report=report)
+                                             report=report,
+                                             on_progress=_per_item(sup, span))
         span = _stage(sup, plan, "orient",
                       "orienting into the cranial base and maxillary frames")
         oriented = _orient(sup, resampled, work_dir, reference_of, landmark_model,
@@ -642,7 +687,7 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
         stats = _measure(regions, baseline, compared, lists, output_dir, report)
 
         _stage(sup, plan, "classify", "reading the measurements as a classification")
-        _classify(stats, feature_template, classifier_model, output_dir, report)
+        _classify(sup, stats, feature_template, classifier_model, output_dir, report)
 
     if wants_heat_maps:
         from . import heatmap
@@ -669,7 +714,10 @@ def _measurement_lists(folder: str, regions) -> dict:
     by whoever wrote them.
     """
     if not os.path.isdir(folder):
-        raise ToolInputError(f"'{folder}' is not a folder of measurement lists.")
+        raise ToolInputError(
+            "'measurements' is not a folder: it should be the folder holding one "
+            "measurement list per region."
+        )
 
     spellings = {
         catalogs.REGION_CRANIAL_BASE: ("CB", "CRANIAL", "CRANIOFACIAL"),
@@ -681,7 +729,9 @@ def _measurement_lists(folder: str, regions) -> dict:
         if name.lower().endswith((".xlsx", ".xls")) and not name.startswith("~$")
     )
     if not workbooks:
-        raise ToolInputError(f"'{os.path.basename(folder)}' holds no Excel file.")
+        raise ToolInputError(
+            "'measurements' holds no Excel file: each measurement list is a workbook."
+        )
 
     found = {}
     for region in regions:
@@ -703,7 +753,18 @@ def _measurement_lists(folder: str, regions) -> dict:
     return found
 
 
-def _classify(stats, feature_template: str, classifier_model: str,
+def _skip_classification(sup, report: dict, reason: str, detail: str = "") -> None:
+    """Record, and SAY, that the verdict was not read.
+
+    Not raised, for the reasons `_classify` gives -- but never silent either: a
+    run that finishes without the verdict it was asked for has to tell the
+    operator and the clinician why, in a line rather than only in the report.
+    """
+    report["classification"] = f"not run: {reason}{f' {detail}' if detail else ''}"
+    _log(sup, f"classification not run: {reason}", level="warning", user=True)
+
+
+def _classify(sup, stats, feature_template: str, classifier_model: str,
               output_dir: str, report: dict) -> None:
     """The feature table, and the classification read off it.
 
@@ -714,9 +775,10 @@ def _classify(stats, feature_template: str, classifier_model: str,
     run, so the columns the models name exist.
     """
     if not feature_template:
-        report["classification"] = (
-            "not run: it needs 'feature_template', the workbook naming the features "
-            "the classifier was trained on"
+        _skip_classification(
+            sup, report,
+            "it needs 'feature_template', the workbook naming the features "
+            "the classifier was trained on",
         )
         return
 
@@ -729,7 +791,7 @@ def _classify(stats, feature_template: str, classifier_model: str,
         # down with the verdict on top of them -- and the server destroys the
         # job directory on failure, so the clinician would be left with the GPU
         # minutes and nothing else.
-        report["classification"] = f"not run: {exc}"
+        _skip_classification(sup, report, str(exc))
         return
 
     features.write_table(
@@ -739,21 +801,28 @@ def _classify(stats, feature_template: str, classifier_model: str,
     report["features"] = len(records)
 
     if not classifier_model:
-        report["classification"] = (
-            "not run: the feature table was written, and reading it as a verdict "
-            "needs 'classifier_model' from the same training run"
+        _skip_classification(
+            sup, report,
+            "the feature table was written, and reading it as a verdict "
+            "needs 'classifier_model' from the same training run",
         )
         return
 
     try:
         classified = classify.classify(records, classifier_model, report=report)
-    except ToolInputError as exc:
+    except (ToolInputError, RuntimeError) as exc:
         # Same reasoning, one step further along: the feature table is written
         # too by now, and it is what somebody would look at to find out WHY the
-        # models could not read it.
-        report["classification"] = (
-            f"not run: {exc} The measurements and the feature table were written "
-            "and are in this archive."
+        # models could not read it. A RuntimeError is a bundle the installed
+        # libraries cannot unpickle (see `classify.load_models`): the
+        # deployment's fault rather than the caller's, and no more a reason to
+        # throw the measurements away.
+        reason = str(exc) if isinstance(exc, ToolInputError) else (
+            f"{type(exc).__name__}: {exc}"
+        )
+        _skip_classification(
+            sup, report, reason,
+            "The measurements and the feature table were written and are in this archive.",
         )
         return
 

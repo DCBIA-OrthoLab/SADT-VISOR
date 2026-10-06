@@ -21,7 +21,7 @@ full-head surfaces is millions each.
 import logging
 import os
 
-from .errors import ToolInputError
+from .errors import describe_failure, most_common_failure
 from . import catalogs, landmarks as landmark_files, tools
 
 logger = logging.getLogger(__name__)
@@ -215,6 +215,9 @@ def draw_cohort(sup, oriented: dict, registered: dict, regions, surface_model: s
     """
     destination = os.path.join(output_dir, "Heat maps")
     drawn = 0
+    failures = []
+    attempted = 0
+    unpaired_total = 0
     # Two segmentations per region, each in its own slice of `span` and in the
     # order they are made. The distance maps between them are seconds against
     # the minutes of a segmentation, so they take no slice of their own.
@@ -231,7 +234,8 @@ def draw_cohort(sup, oriented: dict, registered: dict, regions, surface_model: s
         ))
 
         paired = sorted(set(baseline) & set(compared))
-        for patient in paired:
+        for index, patient in enumerate(paired, start=1):
+            attempted += 1
             try:
                 distance_map(
                     baseline[patient], compared[patient],
@@ -239,20 +243,33 @@ def draw_cohort(sup, oriented: dict, registered: dict, regions, surface_model: s
                 )
                 drawn += 1
             except Exception as exc:  # noqa: BLE001 - one pair must not cost the rest
-                logger.exception("VFACE could not draw one heat map")
+                logger.warning("VFACE: %s, patient %d of %d: heat map failed (%s)",
+                               region, index, len(paired), describe_failure(exc))
+                failures.append(exc)
                 report.setdefault("heat_maps_failed", {})[f"{patient}/{region}"] = (
                     f"{type(exc).__name__}: {exc}"
                 )
 
         unpaired = sorted(set(baseline) ^ set(compared))
         if unpaired:
+            unpaired_total += len(unpaired)
             report.setdefault("heat_maps_unpaired", {})[region] = len(unpaired)
 
     if not drawn:
         # Counted on what was DRAWN. A guard counting the patients walked past
         # would pass on a cohort where not one map could be made.
-        raise ToolInputError(
-            "No heat map could be drawn. The per-pair reasons are in the run report."
+        # Said in the error itself: the run report that holds the per-pair
+        # detail is deleted with the job when the run fails. Not the caller's
+        # 422 either -- every surface here came out of this run's own
+        # segmentations.
+        if not attempted:
+            raise RuntimeError(
+                f"0 heat map(s) drawn: no patient has a surface on both sides of "
+                f"any region ({unpaired_total} surface(s) without a counterpart)"
+            )
+        raise RuntimeError(
+            f"0 of {attempted} heat map(s) drawn; most common failure: "
+            f"{most_common_failure(failures)}"
         )
     report["heat_maps"] = drawn
     return destination

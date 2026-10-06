@@ -25,6 +25,7 @@ Three defects fixed, all of which cost results silently:
 import logging
 import os
 import time
+from collections import Counter
 
 import numpy as np
 
@@ -37,6 +38,25 @@ from . import progress
 from . import render, surface
 
 logger = logging.getLogger(__name__)
+
+
+class NetworkUnusable(RuntimeError):
+    """A bundled checkpoint that cannot be loaded: the run's fault, not a mesh's.
+
+    A RuntimeError, never a ValueError: the server would answer 422 and tell
+    the caller to fix a request that is fine.
+    """
+
+
+def _first_line(text, limit: int = 160) -> str:
+    """The first line of an error, cut to fit in front of a count.
+
+    A torch `load_state_dict` mismatch lists every missing key on its own line,
+    and the server keeps only the first few hundred characters of a reason.
+    """
+    lines = str(text).strip().splitlines()
+    first = lines[0] if lines else ""
+    return first if len(first) <= limit else first[: limit - 3] + "..."
 
 _MONAI_HINT = "ALI's IOS engine needs monai. Run `uv sync` in tools/ALI."
 
@@ -140,8 +160,21 @@ def require_labels(meshes: list) -> None:
     point-data array names is cheap, and discovering this on mesh 40 of 40 after
     an hour of inference is the failure worth spending that scan on.
     """
-    unlabelled = [key for path, key in meshes if surface.label_array_name(
-        surface.read_surface(path)) is None]
+    unlabelled = []
+    for index, (path, key) in enumerate(meshes, start=1):
+        try:
+            readable = surface.read_surface(path)
+        except Exception as exc:  # noqa: BLE001 - one mesh, not the batch
+            # Not refused here: this check is about LABELS, and one corrupt
+            # file must not cost the other thirty-nine. The mesh fails on its
+            # own in the engine's loop, which records why in the report.
+            logger.warning(
+                "mesh %d of %d: reading failed (%s: %s)",
+                index, len(meshes), type(exc).__name__, exc,
+            )
+            continue
+        if surface.label_array_name(readable) is None:
+            unlabelled.append(key)
     if not unlabelled:
         return
     raise ToolInputError(
@@ -350,7 +383,17 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
                 mesh_index, mesh_total, pass_name, len(teeth),
             )
 
-            unet = _build_network(checkpoint, device, network)
+            try:
+                unet = _build_network(checkpoint, device, network)
+            except Exception as exc:
+                # The bundle's fault, not this mesh's: the same checkpoint
+                # would fail every mesh of the batch identically, each after
+                # its whole rendering setup. Raised as its own type so the
+                # cohort loop stops at once instead of repeating it N times.
+                raise NetworkUnusable(
+                    f"the {pass_name} network could not be loaded "
+                    f"({type(exc).__name__}: {_first_line(exc)})"
+                ) from exc
             estimates = (
                 render.estimate_missing_teeth(labels, vertices, teeth, device)
                 if network == "MG"
@@ -389,7 +432,11 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
                         )
                     except Exception as exc:
                         # One tooth failing must not cost the other 27.
-                        logger.exception("IOS prediction raised for tooth %d", tooth_number)
+                        logger.warning(
+                            "mesh %d of %d: %s tooth %d failed (%s: %s)",
+                            mesh_index, mesh_total, pass_name, tooth_number,
+                            type(exc).__name__, exc,
+                        )
                         record["landmarks_failed"][f"{jaw}-{tooth_number}"] = (
                             f"{type(exc).__name__}: {exc}"
                         )
@@ -409,6 +456,16 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
                 )
 
     if not positions:
+        if record["landmarks_failed"]:
+            # Led by the error that dominated: "no landmark was predicted"
+            # alone sends the operator to the mesh when every tooth may have
+            # died of the same out-of-memory.
+            error, count = Counter(record["landmarks_failed"].values()).most_common(1)[0]
+            total = len(record["landmarks_failed"])
+            raise RuntimeError(
+                f"no landmark was predicted on this mesh; most common failure: "
+                f"{_first_line(error)} ({count} of {total} teeth)"
+            )
         raise RuntimeError("no landmark was predicted on this mesh")
 
     record["landmarks_found"].sort()
@@ -659,8 +716,18 @@ def predict_landmarks(
                 mesh_total=len(meshes),
             )
             record["status"] = "ok"
+        except NetworkUnusable as exc:
+            # A broken checkpoint is the run's, and every later mesh would
+            # meet it again: failing once, here, says so in one line.
+            logger.error("mesh %d of %d: %s", mesh_index, len(meshes), exc)
+            raise
         except Exception as exc:
-            logger.exception("ALI IOS failed on one mesh")
+            # Position, class and message -- never the mesh's name, and no
+            # traceback the server would not show anyway.
+            logger.warning(
+                "mesh %d of %d: landmark prediction failed (%s: %s)",
+                mesh_index, len(meshes), type(exc).__name__, exc,
+            )
             record["status"] = "failed"
             record["error"] = str(exc)
         record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
@@ -671,19 +738,25 @@ def predict_landmarks(
         )
 
     written = sum(len(record["landmarks_found"]) for record in scan_reports.values())
-    logger.info(
-        "ALI IOS done: %d/%d mesh(es), %d landmark(s) written, %.0fs",
-        sum(1 for r in scan_reports.values() if r["status"] == "ok"),
-        len(scan_reports), written, time.monotonic() - started_at,
+    processed = [record for record in scan_reports.values() if record["status"] == "ok"]
+    failed = len(scan_reports) - len(processed)
+    # WARNING when partial: a run that lost meshes still returns 200, and this
+    # line is the only place the operator sees that it did.
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "%d of %d meshes processed, %d failed; %d landmark(s) written in %.0fs",
+        len(processed), len(scan_reports), failed, written, time.monotonic() - started_at,
     )
 
-    processed = [record for record in scan_reports.values() if record["status"] == "ok"]
     if not processed:
-        first_error = next(
-            (record.get("error") for record in scan_reports.values() if record.get("error")),
-            "unknown",
+        # The count and the dominant error, first: a failed run's report is
+        # deleted with its job directory, so this message is all that is left.
+        errors = [record.get("error") or "unknown" for record in scan_reports.values()]
+        error, count = Counter(errors).most_common(1)[0] if errors else ("no mesh", 0)
+        raise RuntimeError(
+            f"0 of {len(scan_reports)} meshes processed; most common failure: "
+            f"{_first_line(error)} ({count} of {len(scan_reports)})"
         )
-        raise RuntimeError(f"ALI produced no landmarks for any mesh. First error: {first_error}")
 
     return {
         "mode": "IOS",

@@ -685,7 +685,7 @@ class _StubPainter:
     def __init__(self, array_name):
         self.array_name = array_name
 
-    def __call__(self, surface, key):
+    def __call__(self, surface, key, where=None):
         from vtk.util.numpy_support import numpy_to_vtk
 
         points = surfaces.points_of(surface)
@@ -870,7 +870,7 @@ def test_the_cohort_loop_reports_one_event_per_subject(tmp_path, monkeypatch):
     # The band is painted deterministically instead of walked from landmarks;
     # the loop around it, which is what reports, runs for real.
     monkeypatch.setattr(
-        ios_pipeline, "MGLPainter", lambda root, height: _StubPainter("Bottom_MGL")
+        ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
     )
 
     dispatch.register(
@@ -903,7 +903,7 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
         )
     (tmp_path / "mgl").mkdir()
     monkeypatch.setattr(
-        ios_pipeline, "MGLPainter", lambda root, height: _StubPainter("Bottom_MGL")
+        ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
     )
     sup = FakeSup(tmp_path)
 
@@ -952,7 +952,7 @@ def test_predicting_the_mucogingival_landmarks_comes_before_the_loop(tmp_path, m
     planted = tmp_path / "planted"
     planted.mkdir()
     monkeypatch.setattr(
-        ios_pipeline, "MGLPainter", lambda root, height: _StubPainter("Bottom_MGL")
+        ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
     )
     sup = FakeSup(tmp_path, {"ALI_IOS": lambda params: planted})
 
@@ -981,7 +981,7 @@ def test_a_subject_at_one_timepoint_only_is_told_to_the_clinician(tmp_path, monk
     surfaces.write_surface(_grid_mesh(), str(tmp_path / "T1" / "P2_T1_Lower.vtk"))
     (tmp_path / "mgl").mkdir()
     monkeypatch.setattr(
-        ios_pipeline, "MGLPainter", lambda root, height: _StubPainter("Bottom_MGL")
+        ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
     )
     sup = FakeSup(tmp_path)
 
@@ -1078,3 +1078,227 @@ class TestTheModelFieldsAreNotOffered:
         from sadt_areg_ios.layout import LAYOUT
 
         assert LAYOUT[name].get("hidden") is True, name
+
+
+# ---------------------------------------------------------------------------
+# Failures an operator can read: position, step, class, and who is at fault
+# ---------------------------------------------------------------------------
+
+class _FailingPainter:
+    """A painter raising `error` on the subjects whose number is in `failing`
+    (1-based, in sorted key order), and painting the others like the stub."""
+
+    array_name = "Bottom_MGL"
+
+    def __init__(self, error, failing=None):
+        self.error = error
+        self.failing = failing
+        self._stub = _StubPainter(self.array_name)
+
+    def __call__(self, surface, key, where=None):
+        subject = int(where.split()[1]) if where else 0
+        if self.failing is None or subject in self.failing:
+            raise self.error
+        return self._stub(surface, key)
+
+
+def _mgl_cohort(tmp_path, subjects=("P1", "P2")):
+    for subject in subjects:
+        for timepoint in ("T1", "T2"):
+            surfaces.write_surface(
+                _grid_mesh(), str(tmp_path / timepoint / f"{subject}_{timepoint}_Lower.vtk")
+            )
+    (tmp_path / "mgl").mkdir(exist_ok=True)
+
+
+def _register_mgl(tmp_path, **overrides):
+    arguments = dict(
+        t1_path=str(tmp_path / "T1"),
+        t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_SEMI,
+        ios_patch=catalogs.PATCH_MGL,
+        mgl_landmarks_path=str(tmp_path / "mgl"),
+        output_dir=str(tmp_path / "out"),
+    )
+    arguments.update(overrides)
+    return dispatch.register(**arguments)
+
+
+class TestRunOutcome:
+    def test_a_run_where_every_subject_failed_raises(self, tmp_path, monkeypatch, caplog):
+        """Zero registered is a failed run, not a success carrying a report."""
+        _mgl_cohort(tmp_path)
+        error = surfaces.SurfaceError("the patch prediction selected no point on this mesh")
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter", lambda root, height, **_: _FailingPainter(error)
+        )
+        with caplog.at_level("WARNING", logger="sadt_areg_ios"):
+            with pytest.raises(RuntimeError, match=r"0 of 2 subjects registered") as raised:
+                _register_mgl(tmp_path)
+        assert not isinstance(raised.value, ValueError)
+        assert "SurfaceError" in str(raised.value) and "(2 of 2)" in str(raised.value)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        per_subject = [line for line in warnings if line.startswith("subject ")]
+        assert per_subject[0].startswith("subject 1 of 2: reading the mesh")
+        assert "SurfaceError: the patch prediction selected no point" in per_subject[0]
+        assert per_subject[1].startswith("subject 2 of 2")
+        assert not any("P1" in line or "P2" in line or ".vtk" in line for line in warnings)
+
+    def test_every_failure_on_the_callers_landmarks_keeps_the_input_class(
+            self, tmp_path, monkeypatch):
+        _mgl_cohort(tmp_path)
+        error = landmark_files.LandmarkError("no landmark file for this scan")
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter", lambda root, height, **_: _FailingPainter(error)
+        )
+        with pytest.raises(ToolInputError, match="0 of 2 subjects registered"):
+            _register_mgl(tmp_path)
+
+    def test_the_same_failure_on_predicted_landmarks_is_the_servers(
+            self, tmp_path, monkeypatch):
+        _mgl_cohort(tmp_path)
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        error = landmark_files.LandmarkError("no landmark file for this scan")
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter", lambda root, height, **_: _FailingPainter(error)
+        )
+        sup = FakeSup(tmp_path, {"ALI_IOS": lambda params: planted})
+        with pytest.raises(RuntimeError, match="0 of 2 subjects registered") as raised:
+            _register_mgl(tmp_path, mgl_landmarks_path=None, sup=sup)
+        assert not isinstance(raised.value, ToolInputError)
+
+    def test_a_partial_run_ends_on_a_warning_summary(self, tmp_path, monkeypatch, caplog):
+        _mgl_cohort(tmp_path)
+        error = icp.RegistrationError("the alignment did not converge to a usable transform")
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter",
+            lambda root, height, **_: _FailingPainter(error, failing={2}),
+        )
+        with caplog.at_level("INFO", logger="sadt_areg_ios"):
+            run_result = _register_mgl(tmp_path)
+        assert run_result.report["summary"] == {"patients": 2, "registered": 1, "failed": 1}
+        summary = [r for r in caplog.records if "subjects registered" in r.getMessage()]
+        assert summary[-1].levelname == "WARNING"
+        assert "1 of 2 subjects registered, 1 failed" in summary[-1].getMessage()
+        assert any(
+            r.getMessage() == "subject 2 of 2: the ICP alignment failed (RegistrationError: "
+                              "the alignment did not converge to a usable transform)"
+            for r in caplog.records
+        )
+
+    def test_a_clean_run_ends_on_an_info_summary(self, tmp_path, monkeypatch, caplog):
+        _mgl_cohort(tmp_path)
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
+        )
+        with caplog.at_level("INFO", logger="sadt_areg_ios"):
+            _register_mgl(tmp_path)
+        summary = [r for r in caplog.records if "subjects registered" in r.getMessage()]
+        assert summary[-1].levelname == "INFO"
+        assert "2 of 2 subjects registered, 0 failed" in summary[-1].getMessage()
+
+    def test_meshes_naming_no_jaw_are_counted_for_the_clinician(self, tmp_path, monkeypatch):
+        _mgl_cohort(tmp_path, subjects=("P1",))
+        surfaces.write_surface(_grid_mesh(), str(tmp_path / "T1" / "P3_T1.vtk"))
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
+        )
+        sup = FakeSup(tmp_path)
+        _register_mgl(tmp_path, sup=sup)
+        jawless = [m for level, user, m in sup.logs if "do not name their jaw" in m]
+        assert jawless and jawless[0].startswith("1 mesh(es)")
+        assert ("warning", True) in [(level, user) for level, user, _m in sup.logs]
+        assert not any("P3" in m for _level, _user, m in sup.logs)
+
+    def test_the_landmark_tool_writing_nothing_is_logged_with_counts(
+            self, tmp_path, monkeypatch, caplog):
+        _mgl_cohort(tmp_path)
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        monkeypatch.setattr(
+            ios_pipeline, "MGLPainter", lambda root, height, **_: _StubPainter("Bottom_MGL")
+        )
+        sup = FakeSup(tmp_path, {"ALI_IOS": lambda params: planted})
+        with caplog.at_level("WARNING", logger="sadt_areg_ios"):
+            _register_mgl(tmp_path, mgl_landmarks_path=None, sup=sup)
+        lines = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert "ALI_IOS produced 0 landmark file(s) for 2 lower T1 mesh(es)" in lines
+        assert "ALI_IOS produced 0 landmark file(s) for 2 lower T2 mesh(es)" in lines
+
+    def test_reading_the_meshes_to_derive_the_mode_is_announced(self, tmp_path, monkeypatch):
+        events_file = tmp_path / "events.jsonl"
+        monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+        _mgl_cohort(tmp_path, subjects=("P1",))
+        dispatch.derive_automation(catalogs.AUTOMATION_AUTO, str(tmp_path / "T1"))
+        messages = [event.get("message", "") for event in _events(events_file)]
+        assert messages and messages[0].startswith("reading the T1 meshes")
+
+
+class TestWhoseLandmarkFolderIsEmpty:
+    def test_the_callers_empty_folder_is_an_input_error_naming_the_argument(self, tmp_path):
+        with pytest.raises(ToolInputError, match="'mgl_landmarks' holds no Slicer markups"):
+            ios_pipeline.MGLPainter(str(tmp_path))
+
+    def test_the_landmark_tools_empty_output_is_the_servers(self, tmp_path):
+        with pytest.raises(RuntimeError, match="ALI_IOS produced no mucogingival") as raised:
+            ios_pipeline.MGLPainter(str(tmp_path), predicted=True)
+        assert not isinstance(raised.value, ValueError)
+
+
+class TestTheCheckpointIsTheServers:
+    def test_a_deployment_bundle_with_no_checkpoint_is_not_a_422(self, tmp_path):
+        bundle = tmp_path / "AREG_model"
+        bundle.mkdir()
+        with pytest.raises(RuntimeError, match="holds no") as raised:
+            butterfly.find_checkpoint(str(bundle), named_by_caller=False)
+        assert not isinstance(raised.value, ValueError)
+
+    def test_an_unreadable_checkpoint_is_a_runtime_error(self, tmp_path, monkeypatch):
+        from sadt_areg_ios import net
+
+        broken = tmp_path / "broken.ckpt"
+        broken.write_bytes(b"not a checkpoint")
+        monkeypatch.setattr(net, "build", lambda device: None)
+        with pytest.raises(RuntimeError, match="^loading the palate patch checkpoint failed") as raised:
+            net.load(str(broken), "cpu")
+        assert not isinstance(raised.value, ValueError)
+
+    def test_a_checkpoint_without_the_network_weights_is_a_runtime_error(
+            self, tmp_path, monkeypatch):
+        import torch
+        from sadt_areg_ios import net
+
+        foreign = tmp_path / "foreign.ckpt"
+        torch.save({"state_dict": {"other.weight": torch.zeros(1)}}, str(foreign))
+
+        class _Model:
+            def load_state_dict(self, state, strict):
+                return [], list(state)
+
+        monkeypatch.setattr(net, "build", lambda device: _Model())
+        with pytest.raises(RuntimeError, match="holds no 'model.\\*' weights") as raised:
+            net.load(str(foreign), "cpu")
+        assert type(raised.value) is RuntimeError
+
+
+class TestWarningsSayWhichMesh:
+    def test_missing_landmarks_name_the_subject_position(self, caplog):
+        landmarks = TestMGLPatch._landmarks_along_row(12, 24)
+        del landmarks["LL6MG"]
+        with caplog.at_level("WARNING", logger="sadt_areg_ios"):
+            mgl.build_patch(TestMGLPatch._labelled_grid(), landmarks, height=2.0,
+                            where="subject 3 of 8, T2")
+        assert any(
+            r.getMessage().startswith("AREG MGL, subject 3 of 8, T2: 1 of 13 MG landmark")
+            for r in caplog.records
+        )
+
+    def test_an_unlabelled_mesh_names_the_subject_position(self, caplog):
+        mesh = _grid_mesh(rows=24, columns=24)
+        landmarks = TestMGLPatch._landmarks_along_row(12, 24)
+        with caplog.at_level("WARNING", logger="sadt_areg_ios"):
+            mgl.build_patch(mesh, landmarks, height=2.0, where="subject 1 of 2, T1")
+        assert any("subject 1 of 2, T1: the mesh carries no tooth labels" in r.getMessage()
+                   for r in caplog.records)

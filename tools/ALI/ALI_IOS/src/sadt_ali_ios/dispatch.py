@@ -32,6 +32,7 @@ import logging
 import os
 import shutil
 import time
+from collections import Counter
 
 from sadt_ali_common import markups
 from sadt_ali_common.discovery import (
@@ -158,18 +159,20 @@ def split_by_labels(meshes: list) -> tuple:
     from . import surface
 
     labelled, unlabelled = [], []
-    for path, key in meshes:
+    for index, (path, key) in enumerate(meshes, start=1):
         try:
             found = surface.label_array_name(surface.read_surface(path)) is not None
-        except Exception:  # noqa: BLE001 - unreadable is not labelled; see below
+        except Exception as exc:  # noqa: BLE001 - unreadable is not labelled; see below
             # A mesh this cannot even read is put with the ones needing labels
             # rather than raised here. One corrupt file in a cohort of forty
             # then costs that file -- `Crown_Seg` fails it alone and says why,
             # and the run returns landmarks for the other thirty-nine. Raising
             # would lose them all, on mesh 3 of 40, before a landmark was
             # placed.
-            logger.warning("ALI_IOS: a surface could not be read; sending it to '%s'",
-                           CROWN_TOOL)
+            logger.warning(
+                "mesh %d of %d: reading failed (%s: %s); sending it to '%s'",
+                index, len(meshes), type(exc).__name__, exc, CROWN_TOOL,
+            )
             found = False
         (labelled if found else unlabelled).append((path, key))
     return labelled, unlabelled
@@ -268,6 +271,14 @@ def _segment(
     labelled, without_labels = split_by_labels(labelled)
     for _path, key in without_labels:
         failed[key] = f"'{CROWN_TOOL}' returned a mesh carrying no tooth-label array"
+    # Compared with what was SENT: the nested call succeeds as a whole even
+    # when it labelled none of the meshes, and its own log lines say so only
+    # in its terms.
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "'%s' returned labelled meshes for %d of %d mesh(es), %d failed",
+        CROWN_TOOL, len(labelled), len(meshes), len(failed),
+    )
     return labelled, failed
 
 
@@ -565,7 +576,9 @@ def identify(
                 reports.append(ios_engine.predict_landmarks(
                     meshes=meshes, span=span, **pass_arguments
                 ))
-            except (ToolUnavailableError, ToolInputError):
+            except (ToolUnavailableError, ToolInputError, ios_engine.NetworkUnusable):
+                # A checkpoint that cannot be loaded is the bundle's, and the
+                # other pass would load the very same file.
                 raise
             except Exception as exc:  # noqa: BLE001 - recorded, re-raised below
                 logger.exception("ALI_IOS: no landmark on any of %d mesh(es)", len(meshes))
@@ -624,11 +637,13 @@ def identify(
                 raise errors[0]
             # Nothing carried labels and nothing could be given any, so the
             # segmentation is the whole story and its reason is what travels.
+            reason, count = Counter(segmentation_failures.values()).most_common(1)[0] \
+                if segmentation_failures else ("unknown", 0)
             raise RuntimeError(
-                "ALI_IOS produced no landmarks: none of the {} mesh(es) carried tooth "
-                "labels and '{}' could not label them. First reason: {}".format(
-                    len(detected.scans), CROWN_TOOL,
-                    next(iter(segmentation_failures.values()), "unknown"),
+                "0 of {} mesh(es) could be labelled by '{}', and none arrived "
+                "labelled; most common failure: {} ({} of {})".format(
+                    len(detected.scans), CROWN_TOOL, ios_engine._first_line(reason),
+                    count, len(detected.scans),
                 )
             )
 

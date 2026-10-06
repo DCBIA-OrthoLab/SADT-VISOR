@@ -377,6 +377,47 @@ def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: s
         dental_model_seg.main(args)
 
 
+# The longest cause quoted back out of a shapeaxi failure. The server cuts a
+# failure's reason at about 300 characters, so the cause has to fit well inside
+# that together with the count that precedes it.
+MAX_CAUSE = 200
+
+
+def _last_meaningful_line(message) -> str:
+    """The line of an exception message that actually says what went wrong.
+
+    shapeaxi runs its meshes through a PyTorch DataLoader, and an error raised
+    in a loader worker comes back re-wrapped: "Caught ValueError in DataLoader
+    worker process 0.", then "Original Traceback (most recent call last):",
+    then the whole worker traceback, and only on the LAST line the real
+    "ValueError: <message>". The server keeps the first few hundred characters
+    of a reason, which would be the wrapper and the frame list and never the
+    cause. The last non-blank line is the cause for that shape and is the whole
+    message for an ordinary one-line error, so it is right for both.
+    """
+    lines = [line.strip() for line in str(message).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    return last if len(last) <= MAX_CAUSE else last[:MAX_CAUSE - 3] + "..."
+
+
+def _describe_failure(exc) -> str:
+    """`Type: cause`, with the cause reduced to its meaningful last line.
+
+    When the last line already names an exception type -- the DataLoader case,
+    where `exc` itself is only the RuntimeError wrapper -- that inner type is
+    the informative one and is not prefixed a second time.
+    """
+    cause = _last_meaningful_line(exc)
+    head = cause.split(":", 1)[0]
+    if cause and head.isidentifier() and head[:1].isupper() and (
+        head.endswith("Error") or head.endswith("Exception")
+    ):
+        return cause
+    return f"{type(exc).__name__}: {cause}" if cause else type(exc).__name__
+
+
 @contextlib.contextmanager
 def _counting_outputs(expected, what, interval=None):
     """Report "mesh k of n" while shapeaxi runs, from the outputs that exist.
@@ -580,27 +621,58 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
             for mesh in to_segment:
                 handle.write(f"{mesh}\n")
 
-        logger.info("CrownSeg: segmenting %d mesh(es) on %s", len(to_segment), device)
+        total = len(to_segment)
         csv_stem = os.path.splitext(os.path.basename(csv_path))[0]
         expected = [
             _predicted_path(output_dir, csv_stem, suffix, mesh, input_root)
             for mesh in to_segment
         ]
+        # Said BEFORE the call, because a failure inside shapeaxi arrives as one
+        # opaque exception for the whole batch: this line is what tells the
+        # operator which checkpoint, how many meshes and which device were
+        # being attempted when it came. The checkpoint's name is the model's,
+        # never a patient's.
+        logger.info(
+            "loading checkpoint %s and segmenting %d mesh(es) on %s",
+            os.path.basename(model_path), total, device,
+        )
         # The model load inside shapeaxi is not visible from here, so the first
         # mesh is announced at the start of the bar and the load is part of it.
-        progress.report(1, len(to_segment), "mesh")
-        with _counting_outputs(expected, "mesh"):
-            _run_shapeaxi(
-                csv_path=csv_path,
-                output_dir=output_dir,
-                model_path=model_path,
-                input_root=input_root,
-                array_name=array_name,
-                suffix=suffix,
-                device=device,
-                fdi=fdi,
-                num_workers=num_workers,
+        progress.report(1, total, "mesh")
+        try:
+            with _counting_outputs(expected, "mesh"):
+                _run_shapeaxi(
+                    csv_path=csv_path,
+                    output_dir=output_dir,
+                    model_path=model_path,
+                    input_root=input_root,
+                    array_name=array_name,
+                    suffix=suffix,
+                    device=device,
+                    fdi=fdi,
+                    num_workers=num_workers,
+                )
+        except (ToolUnavailableError, ToolInputError):
+            # Already phrased for whoever has to act on them, and classed so the
+            # server answers 503 or 422; rewrapping would turn both into a 500.
+            raise
+        except Exception as exc:
+            # shapeaxi takes the batch in one call, so its failure carries no
+            # position. The outputs on disk do: they say how far it got.
+            written = sum(1 for path in expected if os.path.isfile(path))
+            cause = _describe_failure(exc)
+            logger.error(
+                "shapeaxi failed after %d of %d meshes were written (%s)",
+                written, total, cause,
             )
+            # RuntimeError whatever shapeaxi raised: a ValueError out of its
+            # loader is a fault of the bundled engine or of this server, not
+            # an argument the caller sent, and must not be answered as a 422.
+            # The cause comes first so the server's cut keeps it.
+            raise RuntimeError(
+                f"crown segmentation failed: {cause} "
+                f"({written} of {total} meshes were written before it)"
+            ) from exc
 
         for index, mesh in enumerate(to_segment, start=1):
             relative = os.path.relpath(mesh, input_root)
@@ -611,8 +683,12 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                 produced.append(predicted)
             else:
                 # One mesh shapeaxi could not write must not cost the batch.
+                logger.warning(
+                    "mesh %d of %d: segmentation failed (shapeaxi returned "
+                    "without error but wrote no output for it)", index, total,
+                )
                 progress.log(
-                    f"mesh {index} of {len(to_segment)} produced no segmentation",
+                    f"mesh {index} of {total} produced no segmentation",
                     "warning", user=True,
                 )
                 records[relative] = {
@@ -622,8 +698,25 @@ def _segment(meshes, input_root, model_path, output_dir, work_dir, array_name, s
                     "error": "the segmentation produced no output for this mesh",
                 }
 
+    failed = sum(1 for r in records.values() if r["status"] == "failed")
     if not produced:
-        raise RuntimeError("CrownSeg produced no segmented mesh for any input.")
+        # Only reachable when every mesh went to shapeaxi and it returned
+        # cleanly having written none of them -- an exception would have been
+        # raised above. Saying so explicitly is the point: "no output" with no
+        # error is a different fault (a wrong output layout, a silent skip)
+        # from a crash, and the operator has nothing else to tell them apart.
+        raise RuntimeError(
+            f"0 of {len(meshes)} meshes segmented; shapeaxi returned without "
+            f"error but wrote none of the {len(to_segment)} expected outputs"
+        )
+
+    labelled = len(produced)
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "%d of %d meshes labelled, %d failed (%d segmented here, %d already labelled)",
+        labelled, len(meshes), failed, labelled - len(already_segmented),
+        len(already_segmented),
+    )
 
     report = {
         "tool": TOOL_NAME,

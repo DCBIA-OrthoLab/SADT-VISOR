@@ -1,11 +1,14 @@
-"""The failures a caller can do something about.
+"""The failures this tool raises on purpose, and who each one is addressed to.
 
-Anything else raised by this tool is a bug and should surface as one. These
-replace the server's `base.ToolArgumentError`, which a tool package cannot
-import: nothing here knows the server exists. The server maps by exception
-class NAME -- `ToolInputError`/`ValueError`/`FileNotFoundError` to 422 with the
-message passed through, `ToolUnavailableError` to 503 -- so every message below
-is written to be read by whoever sent the request.
+These replace the server's `base.ToolArgumentError`, which a tool package cannot
+import: nothing here knows the server exists. The server maps by the EXACT
+exception class name, not by inheritance -- `ToolInputError`/`ValueError`/
+`FileNotFoundError` to 422 with the message passed through,
+`ToolUnavailableError` to 503, every other name to 500. A subclass therefore
+does not inherit its parent's status: whatever must reach the caller as a 422
+is raised as `ToolInputError` itself, and whatever is a deployment fault as
+`ToolUnavailableError` itself. The subclasses below are for the faults that
+are neither, where the class name is what tells the operator what broke.
 """
 
 
@@ -31,11 +34,27 @@ class SupervisorRequired(ToolInputError):
     """
 
 
-class CatalogError(ToolInputError):
-    """The catalogue is missing, unreadable, or not shaped like `GET /tools`."""
+class CatalogError(RuntimeError):
+    """The server's live registry answered, but not with a usable catalogue.
+
+    A server fault, not the caller's: the caller sent no catalogue and the
+    server's own `GET /tools` is what was malformed. A catalogue the CALLER
+    passed as `catalog_file` is refused as a plain `ToolInputError` instead,
+    and an unreachable registry is a `ToolUnavailableError`.
+    """
 
 
-class RankingError(ToolInputError):
+class ModelAnswerError(RuntimeError):
+    """The model answered, but not with the JSON object the call asked for.
+
+    Not the caller's fault -- no argument they change makes the model produce
+    JSON -- and not an unreachable service either: the endpoint is up and the
+    model is loaded. It says the model in use is not following the prompt,
+    which is for whoever chose `model_tag`'s default and deployed it.
+    """
+
+
+class RankingError(RuntimeError):
     """The candidate ranker could not produce a candidate set.
 
     Deliberately fatal. Upstream's ranker caught every exception and fell back
@@ -45,4 +64,8 @@ class RankingError(ToolInputError):
     segmentation and nothing else, and the only sign was a line on stdout that
     also broke the JSON the caller parsed. A ranker that cannot rank must not
     narrow.
+
+    A `RuntimeError` rather than an input error: the only way to reach it is an
+    empty tool list, which `catalog.normalise` already refuses, so arriving here
+    is an internal fault no argument the caller changes would fix.
     """

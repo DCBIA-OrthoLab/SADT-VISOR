@@ -13,8 +13,11 @@ linearly invents labels that were never in it.
 import json
 import logging
 import os
+import re
 
-logger = logging.getLogger("AutoMatrix")
+# Named after the module, not the tool: the server shows the records of the
+# loggers under the tool's own package, and "AutoMatrix" is not one of them.
+logger = logging.getLogger(__name__)
 
 # Tokens that name what a file IS rather than whose it is, and so must not end
 # up in the patient key. The shared `patient_stem` already drops the scan
@@ -68,6 +71,28 @@ def is_transform_file(name: str) -> bool:
     return name.lower().endswith(TRANSFORM_EXTENSIONS)
 
 
+# What SimpleITK puts before the cause in every exception it raises: which C++
+# function threw, at which line of which source file, and the ITK object's
+# address. None of it helps whoever reads the message, the address makes two
+# identical failures differ, and the server cuts a long reason before the
+# cause at its end is reached.
+_ITK_PREAMBLE = re.compile(
+    r"Exception thrown in SimpleITK \w+: \S+:\d+:\s*"
+    r"|(?:ITK |sitk::)ERROR: (?:\w+(?:\(0x[0-9a-fA-F]+\))?: )?"
+)
+
+
+def itk_cause(message: str) -> str:
+    """A SimpleITK exception's message, reduced to the cause on one line.
+
+    `Exception thrown in SimpleITK ImageFileReader_Execute: .../x.cxx:99:
+    sitk::ERROR: Unable to determine ImageIO reader for "..."` becomes
+    `Unable to determine ImageIO reader for "..."`. Any other text comes back
+    with only its whitespace collapsed.
+    """
+    return " ".join(_ITK_PREAMBLE.sub("", str(message)).split())
+
+
 def apply_to_landmarks(source: str, transform, destination: str) -> int:
     """Move a Slicer markups file's points. Returns how many moved.
 
@@ -76,11 +101,21 @@ def apply_to_landmarks(source: str, transform, destination: str) -> int:
     transform that cannot be inverted is an error rather than a warning and a
     file copied unchanged -- upstream logged and returned, so the output looked
     like a result.
+
+    That refusal is a ValueError: a matrix with no inverse is what the caller
+    sent, and the server answers a ValueError as the caller's to fix. A markups
+    file that is not JSON already raises one (`json.JSONDecodeError`).
     """
     with open(source) as handle:
         markups = json.load(handle)
 
-    inverse = transform.GetInverse()
+    try:
+        inverse = transform.GetInverse()
+    except RuntimeError as itk_error:
+        raise ValueError(
+            "the transform has no inverse, which moving landmark points "
+            f"needs. ITK said: {itk_cause(itk_error)}"
+        ) from itk_error
 
     moved = 0
     for group in markups.get("markups", []):
@@ -197,7 +232,7 @@ def read_transform(path: str):
         if matrix is None:
             raise RuntimeError(
                 f"{os.path.basename(path)} is neither an ITK transform nor a "
-                f"4x4 matrix in text. ITK said: {itk_error}"
+                f"4x4 matrix in text. ITK said: {itk_cause(itk_error)}"
             ) from itk_error
         affine = sitk.AffineTransform(3)
         affine.SetMatrix([value for row in matrix[:3] for value in row[:3]])

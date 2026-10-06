@@ -281,22 +281,39 @@ def compute_one(patient: str, positions: dict, entry: Measurement) -> dict:
 
 
 def compute_cohort(t1_landmarks: dict, t2_landmarks: dict, measurements,
-                   report: dict = None) -> list:
+                   report: dict = None, summary: dict = None) -> list:
     """Every measurement for every patient present at both timepoints.
 
     `t1_landmarks` and `t2_landmarks` are `{patient: {label: position}}`. A
     patient in one and not the other is reported and skipped: a measurement
     between a landmark and its mirror needs both sides of the pair, and half of
     one is not a smaller answer, it is no answer.
+
+    What was skipped is logged once per MEASUREMENT, with how many patients it
+    was skipped for and why, rather than once per patient and measurement: a
+    landmark the search never finds would otherwise write one identical line
+    per patient for every measurement that uses it, and bury the one line that
+    says which landmark it was.
+
+    `summary`, when given, is filled with the counts a caller needs to explain
+    an empty result: `patients` (at both timepoints), `only_one` (at one), and
+    `skipped`, `{reason: count}` over every patient and measurement.
     """
+    from collections import Counter
+
     rows = []
     both = sorted(set(t1_landmarks) & set(t2_landmarks))
     only_one = sorted(set(t1_landmarks) ^ set(t2_landmarks))
-    if only_one and report is not None:
-        report.setdefault("not_measured", {}).update({
-            patient: "present at only one timepoint" for patient in only_one
-        })
+    if only_one:
+        logger.warning("VFACE: %d patient(s) have landmarks at only one timepoint "
+                       "and are not measured", len(only_one))
+        if report is not None:
+            report.setdefault("not_measured", {}).update({
+                patient: "present at only one timepoint" for patient in only_one
+            })
 
+    # {measurement label: Counter of reasons}, so each measurement is logged once.
+    skipped: dict = {}
     for patient in both:
         positions = {
             T1: with_midpoints(t1_landmarks[patient], measurements),
@@ -306,19 +323,30 @@ def compute_cohort(t1_landmarks: dict, t2_landmarks: dict, measurements,
             try:
                 rows.append(compute_one(patient, positions, entry))
             except KeyError as missing:
-                logger.warning("VFACE: a landmark a measurement needs is absent for "
-                               "one patient; that measurement is skipped")
+                reason = f"landmark {missing.args[0]} absent"
+                skipped.setdefault(entry.label, Counter())[reason] += 1
                 if report is not None:
                     report.setdefault("landmarks_absent", {}).setdefault(
                         patient, []
                     ).append(f"{entry.label} ({missing.args[0]})")
             except measure.MeasurementError as exc:
-                logger.warning("VFACE: one measurement is degenerate for one "
-                               "patient and is skipped")
+                reason = f"degenerate: {exc}"
+                skipped.setdefault(entry.label, Counter())[reason] += 1
                 if report is not None:
                     report.setdefault("measurements_degenerate", {}).setdefault(
                         patient, []
                     ).append(f"{entry.label}: {exc}")
+
+    for label, reasons in skipped.items():
+        reason, _count = reasons.most_common(1)[0]
+        logger.warning("VFACE: %s skipped for %d of %d patient(s) (%s)",
+                       label, sum(reasons.values()), len(both), reason)
+
+    if summary is not None:
+        totals = Counter()
+        for reasons in skipped.values():
+            totals.update(reasons)
+        summary.update(patients=len(both), only_one=len(only_one), skipped=dict(totals))
     return rows
 
 

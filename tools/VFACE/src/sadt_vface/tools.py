@@ -338,11 +338,22 @@ def _why_nothing_registered(produced: str) -> str:
         return ""
 
     parts = []
+    # AREG_CBCT writes "unmatched", `{"t1_without_t2": [...], "t2_without_t1":
+    # [...]}`, always present and usually empty; "unpaired" is the older key,
+    # read for a report written before the rename. Counted, never listed: the
+    # entries are patient names.
+    unmatched = content.get("unmatched") or {}
+    if isinstance(unmatched, dict):
+        t1_only = len(unmatched.get("t1_without_t2") or [])
+        t2_only = len(unmatched.get("t2_without_t1") or [])
+        if t1_only or t2_only:
+            parts.append(f"unmatched: {t1_only} T1-only, {t2_only} T2-only")
     unpaired = content.get("unpaired")
     if unpaired:
-        parts.append(f"unpaired: {unpaired}")
+        count = len(unpaired) if isinstance(unpaired, (list, dict)) else unpaired
+        parts.append(f"unpaired: {count}")
     patients = content.get("patients") or {}
-    for key, entry in list(patients.items())[:3]:
+    for index, entry in enumerate(list(patients.values())[:3], start=1):
         state = entry.get("status", "?")
         reason = entry.get("error") or entry.get("reason") or ""
         # AREG records the reason PER REGION, one level below the patient, so
@@ -351,8 +362,9 @@ def _why_nothing_registered(produced: str) -> str:
             if region.get("reason"):
                 reason = f"{code}: {region['reason']}"
                 break
-        parts.append(f"{key}: {state}{f' ({reason})' if reason else ''}")
-    if not patients and not unpaired:
+        parts.append(f"patient {index} of {len(patients)}: {state}"
+                     f"{f' ({reason})' if reason else ''}")
+    if not parts:
         parts.append("its report names no patient at all")
     return " AREG says -- " + "; ".join(parts) + "."
 

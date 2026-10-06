@@ -463,7 +463,7 @@ def test_a_pass_that_produces_nothing_does_not_cost_the_other(tmp_path, monkeypa
              output_dir=None, device=None, span=(0.0, 1.0)):
         passes.append(list(meshes))
         if len(passes) == 1:
-            raise RuntimeError("ALI produced no landmarks for any mesh. First error: x")
+            raise RuntimeError("0 of 1 meshes processed; most common failure: x (1 of 1)")
         return {
             "mode": "IOS", "device": device, "prediction_ID": prediction_ID,
             "networks": ["Occlusal"], "landmarks_without_model": [],

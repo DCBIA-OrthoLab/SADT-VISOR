@@ -32,6 +32,7 @@ arguments rather than server settings.
 """
 
 import contextlib
+from collections import Counter
 import json
 import logging
 import os
@@ -74,6 +75,44 @@ WATCH_INTERVAL = 2.0
 # Where on the bar the segmentation sits: the reading of the scans before it
 # and the writing of the results after it are each given a tenth.
 _SEGMENTATION_SPAN = (0.1, 0.9)
+
+
+def _formats_in_words() -> str:
+    """The accepted scan formats, without a leading dot.
+
+    ".nii.gz" in a message reaches the operator as `<file>`: the redaction
+    takes any dotted imaging suffix for a file name.
+    """
+    names = []
+    for extension in SCAN_EXTENSIONS:
+        name = extension.lstrip(".")
+        if name.endswith(".gz"):
+            name = name[: -len(".gz")]
+        if name not in names:
+            names.append(name)
+    return ", ".join(names) + " (each optionally gzipped)"
+
+
+def _failure(exc: BaseException, scan_path: str = "") -> str:
+    """"Type: message" on one line, with the scan's own path taken out.
+
+    The LAST line, because a SimpleITK or nnUNet message is several and ends on
+    its cause, and the server keeps about 300 characters of it. The path,
+    because SimpleITK names the file it could not open: that is patient
+    metadata in a log, and it also made every scan's failure a different
+    string, so the commonest one could never be counted.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    message = lines[-1] if lines else ""
+    if scan_path:
+        message = message.replace(scan_path, "the scan")
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def _most_common_failure(failures: list) -> str:
+    """"<Type: msg> (k of N)" for the commonest of `failures`, from `_failure`."""
+    text, count = Counter(failures).most_common(1)[0]
+    return f"{text} ({count} of {len(failures)})"
 
 
 @contextlib.contextmanager
@@ -147,7 +186,7 @@ def discover_scans(input_path: str, suffix: str) -> list:
     a nested cohort is processed whole.
     """
     if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Input path not found: {input_path}")
+        raise FileNotFoundError("'scans' path does not exist")
 
     if os.path.isfile(input_path):
         return [input_path]
@@ -181,10 +220,12 @@ def resolve_model(model_path: str) -> tuple:
 
     folder = nnunet_runner.find_model_folder(str(model_path))
     if folder is None:
+        # In words: the layout spelled as a path reached the operator as
+        # `<path>`, which says nothing about what to copy.
         raise ToolInputError(
-            f"The '{name}' bundle holds no usable nnUNet model (expected "
-            f"dataset.json, plans.json and fold_0/{nnunet_runner.CHECKPOINT_NAME}). "
-            f"Re-fetch it with `scripts/setup-models.sh --tool BatchDentalSeg`."
+            f"The '{name}' bundle holds no usable nnUNet model: no folder in it "
+            f"holds the dataset and plans JSON files beside a fold-0 final "
+            f"checkpoint. Re-fetch it with `scripts/setup-models.sh --tool BatchDentalSeg`."
         )
     return model, folder
 
@@ -299,8 +340,8 @@ def segment(
     scans = discover_scans(input_path, prediction_ID)
     if not scans:
         raise ToolInputError(
-            "No scan found in the input. Expected one of "
-            f"{', '.join(SCAN_EXTENSIONS)}, or a folder of them."
+            f"No scan found in 'scans'; supported formats: {_formats_in_words()}, "
+            "as one file or a folder of them."
         )
 
     input_root = input_path if os.path.isdir(input_path) else os.path.dirname(scans[0])
@@ -321,7 +362,11 @@ def segment(
         return os.path.relpath(path, input_root) if os.path.isdir(input_root) else os.path.basename(path)
 
     cases = {}
+    # Each case's position in the whole batch, which is what every log line
+    # about it names -- the same number the reading phase already used.
+    positions = {}
     failed_conversions = []
+    failures = []
     # The two ends of this run are counted as they go. The segmentation between
     # them is ONE nnUNet call over the whole folder, so its progress is counted
     # off the masks nnUNet writes as each case finishes -- see
@@ -335,7 +380,10 @@ def segment(
             # Guarded per scan, and deliberately: this loop runs BEFORE
             # inference, so without it one corrupt file in a cohort of forty
             # would abort the whole run before a single scan was segmented.
-            logger.exception("BatchDentalSeg: could not read a scan")
+            failure = _failure(exc, scan)
+            logger.warning("scan %d of %d: reading failed (%s)",
+                           index + 1, len(scans), failure)
+            failures.append(failure)
             progress.log(
                 f"scan {index + 1} of {len(scans)} could not be read and was "
                 f"left out", "warning", user=True,
@@ -345,19 +393,24 @@ def segment(
                     "case_id": case_id,
                     "input": _describe(scan),
                     "status": "failed",
-                    "error": f"could not be read ({type(exc).__name__}: {exc})",
+                    "error": f"could not be read ({failure})",
                 }
             )
             continue
         cases[case_id] = scan
+        positions[case_id] = index + 1
 
     if not cases:
+        # The caller's input, every time: kept a ToolInputError.
         raise ToolInputError(
-            "None of the input scans could be read. Check the files are valid "
-            "medical volumes."
+            f"0 of {len(scans)} scans could be read as a medical volume; most common "
+            f"failure: {_most_common_failure(failures)}"
         )
 
-    logger.info("BatchDentalSeg: %d scan(s), model=%s, device=%s", len(cases), model.name, device)
+    logger.info(
+        "BatchDentalSeg: %d scan(s), model=%s, device=%s, tile_step_size=%s, gpu_resampling=%s",
+        len(cases), model.name, device, tile_step_size, gpu_resampling,
+    )
     progress.emit(_SEGMENTATION_SPAN[0], f"segmenting {len(cases)} scan(s) in one pass")
     expected = [os.path.join(nnunet_output, f"{case_id}.nii.gz") for case_id in cases]
     try:
@@ -367,6 +420,15 @@ def segment(
                 tile_step_size=tile_step_size, gpu_resampling=gpu_resampling,
             )
     except Exception:
+        # One call for the whole batch, and nnUNet works through it in order,
+        # so the failing scan is the first one without a mask -- counted off
+        # the same files the progress bar is.
+        finished = sum(1 for path in expected if os.path.isfile(path))
+        failing = list(cases)[min(finished, len(cases) - 1)]
+        logger.exception(
+            "nnUNet failed at scan %d of %d (model=%s, device=%s, gpu_resampling=%s)",
+            positions[failing], len(scans), model.name, device, gpu_resampling,
+        )
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
@@ -379,6 +441,8 @@ def segment(
             # Reported per scan rather than raised: one unreadable patient in a
             # cohort of forty must not lose the other thirty-nine.
             entry.update(status="failed", error="nnUNet produced no output for this scan")
+            logger.warning("scan %d of %d: nnUNet wrote no mask", positions[case_id], len(scans))
+            failures.append("RuntimeError: nnUNet wrote no mask")
             progress.log(
                 f"scan {index} of {len(cases)} produced no segmentation",
                 "warning", user=True,
@@ -417,20 +481,38 @@ def segment(
             produced.extend(mesh_export.write(
                 labels, model, base, scan_output_dir, prediction_ID,
                 export_formats, decimation=surface_decimation,
+                where=f"scan {positions[case_id]} of {len(scans)}: ",
             ))
             entry.update(status="ok", produced=produced)
         except Exception as exc:  # noqa: BLE001 - one bad scan must not end the batch
-            logger.exception("BatchDentalSeg: scan failed")
+            failure = _failure(exc, scan)
+            logger.warning("scan %d of %d: writing outputs failed (%s)",
+                           positions[case_id], len(scans), failure)
+            failures.append(failure)
             progress.log(
                 f"scan {index} of {len(cases)} could not be written; the report "
                 f"says why", "warning", user=True,
             )
-            entry.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+            entry.update(status="failed", error=failure)
 
         report_cases[case_id] = entry
 
     succeeded = [entry for entry in report_cases.values()
                  if entry.get("status") == "ok"]
+    if not succeeded:
+        # Some scan was readable and nothing came out of it: the server's
+        # fault, not the caller's, hence a RuntimeError. The job directory is
+        # deleted on a failed run, so the work dir goes with it here too.
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"0 of {len(report_cases)} scans segmented; most common failure: "
+            f"{_most_common_failure(failures)}"
+        )
+    failed = len(report_cases) - len(succeeded)
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "%d of %d scans segmented, %d failed", len(succeeded), len(report_cases), failed,
+    )
     report = {
         "tool": TOOL_NAME,
         "model": model.name,

@@ -48,7 +48,16 @@ Two things, and it acquires neither of them:
 
 An absent endpoint or an unpulled model is a `ToolUnavailableError`, which the
 server answers **503** -- a deployment problem, not the caller's. The message
-names the endpoint or the exact model tag.
+names the endpoint or the exact model tag. A server that is up but too slow is
+the same class with a different message, "router call exceeded
+timeout_seconds=N", so a slow model is not mistaken for a stopped one. So is a
+live registry that is unset, unreachable or too slow.
+
+The server maps the exact class name, not its parents, so who is at fault
+decides what is raised: a `catalog_file` the caller sent that cannot be used is
+a plain `ToolInputError` (422); a live registry that answers with something
+that is not a catalogue is a `CatalogError`, and a model answer that is not
+JSON a `ModelAnswerError` -- both server faults, 500.
 
 ## Arguments
 

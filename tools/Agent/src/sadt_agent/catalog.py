@@ -21,6 +21,13 @@ Two sources, in this order:
    server's own registry is not an outbound call.
 
 If neither is available the run fails naming both. It never guesses.
+
+Who is at fault decides the error class, because the server maps the exact
+class name to a status. A `catalog_file` the caller sent that cannot be used is
+the caller's (`ToolInputError`, 422). A live registry that is not configured,
+not reachable or too slow is the deployment's (`ToolUnavailableError`, 503). A
+registry that answers with something that is not a catalogue is the server's
+own bug (`CatalogError`, 500).
 """
 
 import json
@@ -29,7 +36,8 @@ import re
 import urllib.error
 import urllib.request
 
-from .errors import CatalogError
+from .errors import CatalogError, ToolInputError, ToolUnavailableError
+from .llm import is_timeout
 
 # What the server sets so a tool can reach it. Read only when `catalog` is not
 # supplied, and only to build `<value>/tools`.
@@ -61,26 +69,37 @@ def load_catalog(catalog_path, timeout_seconds: int = 30):
             with open(path, encoding="utf-8") as handle:
                 payload = json.load(handle)
         except OSError as exc:
-            raise CatalogError(
-                "The catalogue at '{}' could not be read: {}.".format(
-                    os.path.basename(path), exc
+            raise ToolInputError(
+                "'catalog_file' could not be read ({}: {}).".format(
+                    type(exc).__name__, exc.strerror or exc
                 )
-            )
+            ) from exc
         except ValueError as exc:
-            raise CatalogError(
-                "The catalogue at '{}' is not valid JSON: {}. It must hold what "
-                "GET /tools returns.".format(os.path.basename(path), exc)
-            )
+            raise ToolInputError(
+                "'catalog_file' is not valid JSON: {}. It must hold what "
+                "GET /tools returns.".format(exc)
+            ) from exc
         return normalise(payload), "file:{}".format(os.path.basename(path))
 
     api = os.environ.get(API_ENV, "").strip()
     if not api:
-        raise CatalogError(
-            "No catalogue. Pass `catalog` -- a JSON file holding what the "
-            "server's GET /tools returns -- or run this tool from a server that "
-            "sets {}, which is where the live registry is read from.".format(API_ENV)
+        # A deployment fault rather than the caller's: `catalog_file` is
+        # optional, and a server always sets this variable for its tools. Only
+        # outside a server is passing `catalog_file` the fix, so both are named.
+        raise ToolUnavailableError(
+            "No catalogue: {} is not set, so the live registry cannot be read. "
+            "A server sets it for every tool; outside one, pass `catalog_file` "
+            "-- a JSON file holding what GET /tools returns.".format(API_ENV)
         )
-    return normalise(fetch_catalog(api, timeout_seconds)), "registry:{}".format(api)
+    payload = fetch_catalog(api, timeout_seconds)
+    try:
+        return normalise(payload), "registry:{}".format(api)
+    except ToolInputError as exc:
+        # The same checks as a caller's file, but here nobody but the server
+        # wrote the payload, so its fault is the server's.
+        raise CatalogError(
+            "The live registry's GET /tools is not a usable catalogue: {}".format(exc)
+        ) from exc
 
 
 def fetch_catalog(api: str, timeout_seconds: int = 30):
@@ -90,14 +109,22 @@ def fetch_catalog(api: str, timeout_seconds: int = 30):
         with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
             body = response.read()
     except (urllib.error.URLError, OSError) as exc:
-        raise CatalogError(
-            "The live registry at '{}' could not be read: {}. Pass `catalog` "
-            "instead -- a JSON file holding what GET /tools returns.".format(url, exc)
-        )
+        if is_timeout(exc):
+            raise ToolUnavailableError(
+                "reading the live registry exceeded timeout_seconds={} at "
+                "'{}'.".format(timeout_seconds, url)
+            ) from exc
+        raise ToolUnavailableError(
+            "The live registry at '{}' could not be read: {}. Pass "
+            "`catalog_file` instead -- a JSON file holding what GET /tools "
+            "returns.".format(url, exc)
+        ) from exc
     try:
         return json.loads(body.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
-        raise CatalogError("'{}' did not answer with JSON: {}.".format(url, exc))
+        raise CatalogError(
+            "'{}' did not answer with JSON: {}.".format(url, exc)
+        ) from exc
 
 
 def normalise(payload):
@@ -113,14 +140,14 @@ def normalise(payload):
                 payload = payload[key]
                 break
     if not isinstance(payload, list):
-        raise CatalogError(
+        raise ToolInputError(
             "A catalogue must be a JSON array of tools, or an object with a "
             "'tools' array, as GET /tools returns. Got {}.".format(
                 type(payload).__name__
             )
         )
     if not payload:
-        raise CatalogError(
+        raise ToolInputError(
             "The catalogue holds no tools, so there is nothing to route to."
         )
 
@@ -133,7 +160,7 @@ def normalise(payload):
             # The same rule the server's registry applies at startup:
             # `Batch_Dental_Seg` and `BatchDentalSeg` are one tool written two
             # ways, and routing to the wrong spelling picks the wrong schema.
-            raise CatalogError(
+            raise ToolInputError(
                 "The catalogue lists '{}' and '{}', which are the same tool "
                 "name written two ways.".format(seen[key], tool["name"])
             )
@@ -145,16 +172,16 @@ def normalise(payload):
 def _normalise_tool(entry, index: int):
     where = "catalogue entry {}".format(index + 1)
     if not isinstance(entry, dict):
-        raise CatalogError("{} is not an object.".format(where))
+        raise ToolInputError("{} is not an object.".format(where))
 
     name = entry.get("name")
     if not isinstance(name, str) or not name.strip():
-        raise CatalogError("{} has no 'name'.".format(where))
+        raise ToolInputError("{} has no 'name'.".format(where))
     name = name.strip()
 
     description = entry.get("description") or ""
     if not isinstance(description, str):
-        raise CatalogError("'{}' has a non-string 'description'.".format(name))
+        raise ToolInputError("'{}' has a non-string 'description'.".format(name))
 
     arguments = entry.get("arguments", {})
     if not isinstance(arguments, dict):
@@ -163,7 +190,7 @@ def _normalise_tool(entry, index: int):
         # collapse every nameless one into a single `""` key -- injected
         # afterwards as a phantom parameter no tool declares. A mapping keyed
         # by name cannot express that shape at all.
-        raise CatalogError(
+        raise ToolInputError(
             "'{}' declares 'arguments' as {}. It must be an object keyed by "
             "argument name, as GET /tools publishes it.".format(
                 name, type(arguments).__name__
@@ -173,7 +200,7 @@ def _normalise_tool(entry, index: int):
     normalised = {}
     for argument, spec in arguments.items():
         if not isinstance(argument, str) or not argument.strip():
-            raise CatalogError(
+            raise ToolInputError(
                 "'{}' declares an argument with an empty name. An argument that "
                 "cannot be named cannot be sent.".format(name)
             )
@@ -191,20 +218,20 @@ def _normalise_tool(entry, index: int):
 def _normalise_argument(tool: str, argument: str, spec):
     where = "'{}' argument '{}'".format(tool, argument)
     if not isinstance(spec, dict):
-        raise CatalogError("{} is not an object.".format(where))
+        raise ToolInputError("{} is not an object.".format(where))
 
     declared = spec.get("type")
     if not isinstance(declared, str) or not declared:
-        raise CatalogError("{} declares no 'type'.".format(where))
+        raise ToolInputError("{} declares no 'type'.".format(where))
     if declared not in KNOWN_TYPES:
-        raise CatalogError(
+        raise ToolInputError(
             "{} is of type {!r}, which this agent cannot fill. Known types: "
             "{}.".format(where, declared, ", ".join(KNOWN_TYPES))
         )
 
     choices = spec.get("choices")
     if choices is not None and not isinstance(choices, list):
-        raise CatalogError("{} has a non-list 'choices'.".format(where))
+        raise ToolInputError("{} has a non-list 'choices'.".format(where))
 
     normalised = {
         "type": declared,

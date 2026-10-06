@@ -120,6 +120,11 @@ def derive_automation(automation: str, t1_root: str) -> tuple:
     if automation and automation != catalogs.AUTOMATION_AUTO:
         return automation, "requested"
 
+    # Before the read, which opens every T1 mesh: on a large cohort it takes
+    # long enough that a failure in it would otherwise be reported against
+    # whatever stage the previous message named.
+    progress.emit(0.0, "reading the T1 meshes to tell whether they are already labelled")
+
     # Imported here, not at module level: this pulls in vtk, and AREG_IOS is
     # loaded on servers that answer for CBCT alone.
     from . import surfaces
@@ -219,8 +224,13 @@ def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
 def _run_ios(
     t1_root, t2_root, automation, registration_model, crown_model, mgl_model, orientation_reference,
     ios_patch, mgl_landmarks_path, mgl_patch_height,
-    output_dir, work_dir, suffix, report, sup=None,
-) -> None:
+    output_dir, work_dir, suffix, report, sup=None, registration_model_named=True,
+) -> list:
+    """Run the IOS chain and register every matched subject.
+
+    Returns `[(exception, caller_input), ...]`, one per subject that failed, for
+    `_summarize` to decide whether the run as a whole succeeded.
+    """
     # Imported here rather than at module level: the IOS engine pulls in torch,
     # monai and pytorch3d, and AREG must load (and register CBCT scans) on a
     # server without them.
@@ -252,19 +262,15 @@ def _run_ios(
         # the necessary one: ASO's fully-automated IOS mode aligns a mesh by its
         # tooth centroids, so the labels have to exist first.
         progress.emit(spans["crowns_t1"][0], "labelling the crowns with Crown_Seg")
-        t1_root = tools.label_crowns(sup, t1_root, crown_model or "", span=spans["crowns_t1"])
-        t2_root = tools.label_crowns(sup, t2_root, crown_model or "", span=spans["crowns_t2"])
+        t1_root = _counted("Crown_Seg", "labelled meshes", "T1", t1_root, lambda: tools.label_crowns(
+            sup, t1_root, crown_model or "", span=spans["crowns_t1"]))
+        t2_root = _counted("Crown_Seg", "labelled meshes", "T2", t2_root, lambda: tools.label_crowns(
+            sup, t2_root, crown_model or "", span=spans["crowns_t2"]))
         progress.emit(spans["orient_t1"][0], "orienting the meshes with ASO")
-        t1_root = tools.orient_scans(
-            sup,
-            t1_root, orientation_reference, catalogs.MODALITY_IOS,
-            span=spans["orient_t1"],
-        )
-        t2_root = tools.orient_scans(
-            sup,
-            t2_root, orientation_reference, catalogs.MODALITY_IOS,
-            span=spans["orient_t2"],
-        )
+        t1_root = _counted("ASO", "oriented meshes", "T1", t1_root, lambda: tools.orient_scans(
+            sup, t1_root, orientation_reference, catalogs.MODALITY_IOS, span=spans["orient_t1"]))
+        t2_root = _counted("ASO", "oriented meshes", "T2", t2_root, lambda: tools.orient_scans(
+            sup, t2_root, orientation_reference, catalogs.MODALITY_IOS, span=spans["orient_t2"]))
         report["labelled_and_oriented"] = True
         prior_transforms = _collect_transforms(t2_root, suffix="Or")
 
@@ -281,6 +287,11 @@ def _run_ios(
             f"{len(matched.no_jaw)} mesh(es) named no jaw, "
             f"{len(matched.unpaired)} subject(s) appear at one timepoint only."
         )
+    if matched.no_jaw:
+        # Left out of the run because nothing says which arch they are; until
+        # now only the report said so, and the report goes with a failed job.
+        _log(sup, f"{len(matched.no_jaw)} mesh(es) do not name their jaw (Upper/Lower "
+                  "token) and are not registered", level="warning", user=True)
     if matched.unpaired:
         # The run goes on without them, and the clinician who sent them would
         # otherwise learn it only from the report. A count, never a key: the
@@ -289,7 +300,13 @@ def _run_ios(
                   "and are not registered", level="warning", user=True)
 
     if on_palate:
-        predictor = butterfly.PatchPredictor(registration_model)
+        # The first time this run touches the checkpoint, and the slowest step
+        # before the loop: without a message here a broken bundle is reported
+        # against "orienting the meshes" or whatever came last.
+        progress.emit(spans["register"][0], "loading the palate patch checkpoint")
+        predictor = butterfly.PatchPredictor(
+            registration_model, named_by_caller=registration_model_named
+        )
         painter = ios_pipeline.PalatePainter(predictor)
         report["device"] = predictor.device
         # Which weights placed this patch has to have an answer next to the
@@ -309,25 +326,29 @@ def _run_ios(
             landmark_root = os.path.join(work_dir, "mgl_predicted")
             os.makedirs(landmark_root, exist_ok=True)
             progress.emit(spans["mgl_t1"][0], "predicting the mucogingival landmarks with ALI_IOS")
-            for root, span in ((t1_root, spans["mgl_t1"]), (t2_root, spans["mgl_t2"])):
+            for timepoint, root, span in (("T1", t1_root, spans["mgl_t1"]),
+                                          ("T2", t2_root, spans["mgl_t2"])):
                 # No model named: ALI picks the hosted bundle matching the input
                 # from the models hosted for IT, which is the right default and
                 # the only one a caller can express -- AREG's own model list
                 # holds the palatal checkpoint and the orientation references,
                 # none of which is a landmark bundle.
-                _merge_into(
-                    tools.predict_mucogingival(sup, root, mgl_model or "", span=span),
-                    landmark_root,
-                )
+                produced = tools.predict_mucogingival(sup, root, mgl_model or "", span=span)
+                _report_landmarks(root, produced, timepoint)
+                _merge_into(produced, landmark_root)
             report["mgl_landmarks"] = "predicted by 'ALI_IOS'"
 
-        painter = ios_pipeline.MGLPainter(landmark_root, height=mgl_patch_height)
+        painter = ios_pipeline.MGLPainter(
+            landmark_root, height=mgl_patch_height, predicted=not mgl_landmarks_path
+        )
         report["mgl_patch_height_mm"] = mgl_patch_height
 
+    failures = []
+    total = len(matched.matched)
     for index, (key, jaws) in enumerate(sorted(matched.matched.items()), start=1):
         # The counter, never the patient key: the key is built from the file
         # names the caller sent, and a progress message is stored and shown.
-        progress.report(index, len(matched.matched), "subject",
+        progress.report(index, total, "subject",
                         start=spans["register"][0], end=spans["register"][1])
         try:
             report["patients"][key] = ios_pipeline.register_patient(
@@ -338,6 +359,7 @@ def _run_ios(
                 relative_key=key,
                 suffix=suffix,
                 prior_transforms=prior_transforms,
+                position=f"subject {index} of {total}",
             )
         except (
             icp.RegistrationError,
@@ -346,6 +368,78 @@ def _run_ios(
             landmark_files.LandmarkError,
         ) as exc:
             report["patients"][key] = {"status": "failed", "reason": str(exc)}
+            step = _STEP_OF.get(type(exc).__name__, "registration")
+            # Position, step, class and message; never the key, which is the
+            # caller's file name. The report holds the same reason, but the
+            # report is deleted with the job when the run fails.
+            logger.warning("subject %d of %d: %s failed (%s: %s)",
+                           index, total, step, type(exc).__name__, exc)
+            # Landmarks the CALLER sent being unusable is theirs to fix; the
+            # same error on landmarks ALI_IOS predicted, a mesh the patch
+            # network found nothing on, or an ICP that did not converge is not.
+            caller_input = bool(mgl_landmarks_path) and isinstance(
+                exc, (landmark_files.LandmarkError, mgl.PatchError))
+            failures.append((exc, caller_input))
+    return failures
+
+
+# Which step of `register_patient` each per-subject error comes from, for the
+# warning line. By class name so the table needs no import of the IOS stack.
+_STEP_OF = {
+    "LandmarkError": "matching the mucogingival landmarks",
+    "PatchError": "building the mucogingival patch",
+    "SurfaceError": "reading the mesh or painting its patch",
+    "RegistrationError": "the ICP alignment",
+}
+
+
+def _count_meshes(root: str, jaw: str = None) -> int:
+    """How many surface files are under `root`, of one jaw when `jaw` is set."""
+    from . import surfaces
+
+    return sum(
+        1
+        for _directory, _subdirs, names in os.walk(str(root))
+        for name in names
+        if not name.startswith(".") and surfaces.is_surface_file(name)
+        and (jaw is None or surfaces.jaw_of(name) == jaw)
+    )
+
+
+def _counted(tool: str, produced_what: str, timepoint: str, before_root: str, call) -> str:
+    """Run one nested tool call and log how many meshes went in and came out.
+
+    A tool that returns cleanly with fewer meshes than it was given is the
+    failure that otherwise surfaces only later, as subjects "at one timepoint
+    only" -- which points at the caller's files rather than at the tool.
+    """
+    before = _count_meshes(before_root)
+    produced = call()
+    after = _count_meshes(produced)
+    level = logging.WARNING if after < before else logging.INFO
+    logger.log(level, "%s produced %d %s for %d %s mesh(es)",
+               tool, after, produced_what, before, timepoint)
+    return produced
+
+
+def _report_landmarks(mesh_root: str, produced: str, timepoint: str) -> None:
+    """Log how many landmark files ALI_IOS wrote for the lower meshes it was given.
+
+    ALI restricts the mucogingival network to mandibles itself, so the lower
+    meshes are what to compare against, not every mesh in the folder.
+    """
+    from . import landmarks as landmark_files
+
+    lower = _count_meshes(mesh_root, jaw=catalogs.JAW_LOWER)
+    written = sum(
+        1
+        for _directory, _subdirs, names in os.walk(str(produced))
+        for name in names
+        if not name.startswith(".") and landmark_files.is_markups_file(name)
+    )
+    level = logging.WARNING if written < lower else logging.INFO
+    logger.log(level, "ALI_IOS produced %d landmark file(s) for %d lower %s mesh(es)",
+               written, lower, timepoint)
 
 
 def _collect_transforms(oriented_root: str, suffix: str) -> dict:
@@ -423,19 +517,38 @@ def _as_directory(path: str, destination: str) -> str:
     return destination
 
 
-def _summarize(report: dict) -> None:
+def _summarize(report: dict, failures: list = ()) -> None:
+    """Count the outcome into the report, log it, and refuse an empty run.
+
+    A run where no subject registered is a failure, not a success with a report
+    of failures: the server would otherwise return an archive holding nothing
+    but that report, and the operator would see a green run. The exception is
+    built from the most common failure, because that is the one to fix first.
+    """
     statuses = [entry.get("status") for entry in report["patients"].values()]
-    report["summary"] = {
-        "patients": len(statuses),
-        "registered": statuses.count("ok"),
-        "failed": statuses.count("failed"),
-    }
-    logger.info(
-        "AREG %s %s: %d/%d registered",
-        report["modality"],
-        report["automation"],
-        report["summary"]["registered"],
-        report["summary"]["patients"],
+    total, registered, failed = len(statuses), statuses.count("ok"), statuses.count("failed")
+    report["summary"] = {"patients": total, "registered": registered, "failed": failed}
+
+    if failed and not registered:
+        by_class: dict = {}
+        for exc, _caller_input in failures:
+            by_class.setdefault(type(exc).__name__, []).append(exc)
+        name, examples = max(by_class.items(), key=lambda item: len(item[1]))
+        first = examples[0]
+        message = (
+            f"0 of {total} subjects registered; most common failure: "
+            f"{name}: {str(first)[:160]} ({len(examples)} of {total})"
+        )
+        # The caller's fault only when EVERY failure was: one subject failing
+        # on the server's side makes the run a server problem.
+        if failures and all(caller_input for _exc, caller_input in failures):
+            raise ToolInputError(message) from first
+        raise RuntimeError(message) from first
+
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "AREG %s %s: %d of %d subjects registered, %d failed",
+        report["modality"], report["automation"], registered, total, failed,
     )
 
 
@@ -453,11 +566,19 @@ def register(
     output_suffix: str = "Reg",
     output_dir: str = None,
     sup=None,
+    registration_model_named: bool = True,
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
     Each path is a directory or a `.zip`.
     declared in `catalogs.REGION_CHOICES` (CBCT only).
+
+    `registration_model_named` is False when the deployment filled
+    `registration_model` itself, which makes a broken bundle a server fault
+    rather than a bad request.
+
+    Raises RuntimeError (ToolInputError when every failure was the caller's)
+    when no subject at all could be registered.
     """
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -483,7 +604,7 @@ def register(
 
     from . import mgl
 
-    _run_ios(
+    failures = _run_ios(
         t1_root=t1_root,
         t2_root=t2_root,
         automation=automation,
@@ -501,6 +622,7 @@ def register(
         suffix=output_suffix,
         report=report,
         sup=sup,
+        registration_model_named=registration_model_named,
     )
 
     # Extracted inputs, converted DICOM, the oriented copies and whatever the
@@ -508,7 +630,7 @@ def register(
     # left under output_dir is results and nothing else.
     shutil.rmtree(work_dir, ignore_errors=True)
 
-    _summarize(report)
+    _summarize(report, failures)
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
     return RegistrationRun(output_dir, report)
@@ -555,6 +677,7 @@ def main(
     # checks below then see a real bundle and their message stays about what is
     # missing from the DEPLOYMENT rather than about a field the panel no longer
     # shows.
+    registration_model_named = bool(registration_model)
     registration_model = registration_model or _own_bundle(
         data_root, _REGISTRATION_BUNDLE)
     reference = ios_reference or _own_bundle(data_root, _ORIENTATION_REFERENCE)
@@ -588,6 +711,7 @@ def main(
         output_suffix=suffix,
         output_dir=output_dir,
         sup=sup,
+        registration_model_named=registration_model_named,
     )
 
     return run.output_dir

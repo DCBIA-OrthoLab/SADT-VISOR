@@ -12,11 +12,12 @@ not this tool's vocabulary, and when a tool renames one this file is what
 breaks. `test_schema_seam.py` checks those names against the real schemas.
 """
 
+import logging
 import os
 
 import pytest
 
-from conftest import FakeSup, cohort, read_report, write_markups, UPPER_LABELS, moved
+from conftest import FakeSup, cohort, read_report, write_markups, write_mesh, UPPER_LABELS, moved
 from sadt_areg_ioscbct import dispatch, tools
 from sadt_areg_common import catalogs
 from sadt_areg_common.errors import SupervisorRequired, ToolInputError
@@ -321,17 +322,22 @@ def test_a_sibling_tool_failing_takes_the_run_with_it(tmp_path):
         dispatch.main(**arguments)
 
 
-def test_a_sibling_producing_nothing_usable_is_a_422_not_a_crash(tmp_path):
-    """Crown_Seg returning an empty folder is a real outcome -- and the message
-    has to say which side came back empty."""
+def test_a_sibling_producing_nothing_usable_is_a_server_fault_naming_it(tmp_path, caplog):
+    """ALI_IOS returning an empty folder is a real outcome -- but not the
+    caller's fault, so not a 422, and the message has to say which tool's
+    output came back empty. The shortfall is logged as soon as it returns."""
     empty = tmp_path / "empty"
     empty.mkdir()
     sup, arguments = semi_automated(
         tmp_path, outputs={"ALI_IOS": lambda params: empty}
     )
-    with pytest.raises(ToolInputError) as raised:
-        dispatch.main(**arguments)
-    assert "0 intraoral and 1 CBCT" in str(raised.value)
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        with pytest.raises(RuntimeError) as raised:
+            dispatch.main(**arguments)
+    assert not isinstance(raised.value, ValueError)
+    assert "No intraoral landmark could be read from ALI_IOS's output" in str(raised.value)
+    assert any("ALI_IOS returned 0 landmark file(s) for 1 sent" in r.getMessage()
+               and r.levelno == logging.WARNING for r in caplog.records)
 
 
 def test_a_supervised_run_leaves_no_working_directory_behind(tmp_path):
@@ -354,3 +360,20 @@ def test_the_predicted_landmarks_really_reach_the_registration(tmp_path):
 
     matrix = np.load(str(tmp_path / "out" / "1" / "P001_T2_U_Reg_matrix.npy"))
     assert matrix[0, 3] == pytest.approx(7.0, abs=1e-5)
+
+
+def test_a_sibling_returning_fewer_files_than_it_was_sent_is_warned_about(tmp_path, caplog):
+    """The tool ran to the end, so nothing raised: the shortfall would only show
+    later, as a patient with nothing to register."""
+    sup, arguments = semi_automated(tmp_path)
+    # Two meshes sent, Crown_Seg hands back a folder holding one.
+    write_mesh(tmp_path / "ios" / "P001_T2_L.vtk")
+    labelled = tmp_path / "labelled"
+    write_mesh(labelled / "P001_T2_U.vtk")
+    sup.outputs["Crown_Seg"] = lambda params: labelled
+
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        dispatch.main(**arguments)
+    shortfall = [r for r in caplog.records
+                 if r.getMessage() == "Crown_Seg returned 1 labelled mesh(es) for 2 sent"]
+    assert shortfall and shortfall[0].levelno == logging.WARNING

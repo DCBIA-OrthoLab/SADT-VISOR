@@ -229,13 +229,17 @@ def discover(input_root: str, output_suffix: str = "Or") -> dict:
     return found
 
 
-def load_landmarks(paths: list) -> dict:
+def load_landmarks(paths: list, patient=None) -> dict:
     """Merge every markups file a patient has into one landmark dict.
 
     Later files win on a repeated label, which only happens when a caller sends
     overlapping groups. An unreadable file is skipped with a warning giving its
     position and the failure's type -- never its name, and never the data.
+
+    `patient`, when given, is `(index, total)` and leads the warning, so a
+    skipped file can be traced to the patient it cost.
     """
+    where = f"patient {patient[0]} of {patient[1]}: " if patient else ""
     merged: dict = {}
     for index, path in enumerate(paths, start=1):
         try:
@@ -247,8 +251,8 @@ def load_landmarks(paths: list) -> dict:
             # diagnosis anyway -- JSONDecodeError, ValueError and
             # FileNotFoundError are three different mistakes.
             logger.warning(
-                "Skipping markups file %d of %d: %s",
-                index, len(paths), type(exc).__name__,
+                "%sSkipping markups file %d of %d: %s",
+                where, index, len(paths), type(exc).__name__,
             )
     return merged
 
@@ -261,15 +265,23 @@ def load_reference(reference_dir: str) -> dict:
     requiring one to be present -- so a reference bundle holding just the
     landmarks it actually registers against was rejected with an IndexError.
     """
+    # A RuntimeError, not a ValueError: the reference is a bundle this server
+    # hosts, so an unreadable one is the deployment's to fix -- answering 422
+    # would tell the caller to change a request that is fine.
     for directory, _, file_names in sorted(os.walk(reference_dir)):
         for file_name in sorted(file_names):
             if markups.is_markups_file(file_name) and not file_name.startswith("."):
-                landmarks = markups.load_landmarks(os.path.join(directory, file_name))
+                try:
+                    landmarks = markups.load_landmarks(os.path.join(directory, file_name))
+                except (ValueError, OSError) as exc:
+                    raise RuntimeError(
+                        f"reference bundle unreadable: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if landmarks:
                     return landmarks
-    raise ValueError(
-        "The reference bundle holds no readable landmark file (.mrk.json). A CBCT "
-        "reference is one already-oriented case's landmarks."
+    raise RuntimeError(
+        "reference bundle unreadable: it holds no readable landmark file "
+        "(.mrk.json). A CBCT reference is one already-oriented case's landmarks."
     )
 
 

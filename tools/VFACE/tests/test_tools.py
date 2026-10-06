@@ -356,6 +356,24 @@ class TestWhereTheRegistrationPutItsMatrices:
         with pytest.raises(ToolInputError, match="AREG_report.json"):
             tools._region_folder(str(root))
 
+    def test_the_refusal_carries_areg_unmatched_counts_never_the_names(self, tmp_path):
+        """AREG_CBCT writes "unmatched", not "unpaired". Read under the old key
+        only, the one explanation that survives the job's deletion was empty."""
+        import json
+
+        from sadt_vface import tools
+        from sadt_vface.errors import ToolInputError
+
+        root = tmp_path / "output"
+        (root / "CB").mkdir(parents=True)
+        (root / "AREG_report.json").write_text(json.dumps({
+            "unmatched": {"t1_without_t2": ["P1", "P2"], "t2_without_t1": ["P3"]},
+            "patients": {},
+        }))
+        with pytest.raises(ToolInputError, match="unmatched: 2 T1-only, 1 T2-only") as raised:
+            tools._region_folder(str(root))
+        assert "P1" not in str(raised.value) and "P3" not in str(raised.value)
+
     def test_two_region_folders_are_refused_rather_than_guessed(self, tmp_path):
         """Only a single-region call can be descended into unambiguously."""
         from sadt_vface import tools

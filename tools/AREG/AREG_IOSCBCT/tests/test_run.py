@@ -149,7 +149,7 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
     # landmarks, silently and with an "ok" in the report.
     monkeypatch.setattr(
         dispatch, "_landmarks_by_jaw",
-        lambda root: {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
+        lambda root, side="": {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
                       for name in ("P1", "P2")},
     )
     # A stand-in that answers the one call the loop makes on a mesh. Returning
@@ -185,8 +185,11 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
             max_dist=1.0, progress_span=span,
         )
         events = _events(events_file)
-        assert [event["message"] for event in events] == ["patient 1 of 2", "patient 2 of 2"]
-        assert [event["fraction"] for event in events] == expected
+        # "reading landmarks" first, at the start of the span: walking and
+        # parsing every landmark file is not instant on a large batch.
+        assert [event["message"] for event in events] == [
+            "reading landmarks", "patient 1 of 2", "patient 2 of 2"]
+        assert [event["fraction"] for event in events] == [expected[0]] + expected
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +375,9 @@ def test_the_rules_run_before_anything_is_read():
 
 def test_an_unreadable_input_is_reported_rather_than_crashing_the_batch(tmp_path):
     """`discover` walks a folder that is not there without complaining, so the
-    refusal is the pairing one -- which names what it was looking for."""
+    refusal is the empty-side one -- which names the argument it looked in."""
     cohort(tmp_path)
-    with pytest.raises(ToolInputError, match="No patient has both"):
+    with pytest.raises(ToolInputError, match="No CBCT scan found in 'cbct'"):
         run_registration(tmp_path, cbct="/nonexistent/cbct")
 
 

@@ -29,6 +29,8 @@ import logging
 import os
 
 from sadt_areg_common import catalogs, pairing
+from sadt_areg_common.errors import ToolInputError
+
 from . import landmarks as landmark_files
 from . import butterfly, icp, mgl, surfaces
 
@@ -143,18 +145,30 @@ class MGLPainter:
 
     array_name = mgl.MGL_ARRAY_NAME
 
-    def __init__(self, landmark_root: str, height: float = mgl.DEFAULT_HEIGHT):
+    def __init__(self, landmark_root: str, height: float = mgl.DEFAULT_HEIGHT,
+                 predicted: bool = False):
         self.height = height
         self.index = landmark_files.index(landmark_root, also_drop=_MATCHING_TOKENS)
         if not self.index:
-            raise landmark_files.LandmarkError(
-                "the mucogingival landmarks folder holds no Slicer markups file "
-                "(.json/.mrk.json)"
+            # Whose folder it is decides whose fault it is. The caller's
+            # 'mgl_landmarks' holding nothing usable is theirs to fix (a 422);
+            # ALI_IOS writing nothing is a server-side failure of the tool this
+            # run drove, and must not come back to the caller as a bad request.
+            if predicted:
+                raise RuntimeError(
+                    "ALI_IOS produced no mucogingival landmark file (.json or "
+                    ".mrk.json) for any mesh of either timepoint"
+                )
+            raise ToolInputError(
+                "'mgl_landmarks' holds no Slicer markups file (.json or .mrk.json); "
+                "send one per lower scan, or leave the field empty to have them predicted"
             )
 
-    def __call__(self, surface, scan_path: str) -> tuple:
+    def __call__(self, surface, scan_path: str, where: str = None) -> tuple:
         path = landmark_files.for_scan(self.index, scan_path, also_drop=_MATCHING_TOKENS)
-        return mgl.build_patch(surface, landmark_files.load(path), height=self.height)
+        return mgl.build_patch(
+            surface, landmark_files.load(path), height=self.height, where=where
+        )
 
 
 class PalatePainter:
@@ -165,8 +179,8 @@ class PalatePainter:
     def __init__(self, predictor):
         self.predictor = predictor
 
-    def __call__(self, surface, scan_path: str) -> tuple:
-        return self.predictor(surface)
+    def __call__(self, surface, scan_path: str, where: str = None) -> tuple:
+        return self.predictor(surface, where=where)
 
 
 # ---------------------------------------------------------------------------
@@ -181,16 +195,27 @@ def register_patient(
     relative_key: str,
     suffix: str,
     prior_transforms: dict = None,
+    position: str = None,
 ) -> dict:
     """Register one patient's two timepoints. Returns a report entry.
 
     Raises `icp.RegistrationError`, `surfaces.SurfaceError`, `mgl.PatchError` or
     `landmarks.LandmarkError` when this patient cannot be registered; the caller
     records that and moves on.
+
+    `position` is this subject's place in the run ("subject 3 of 8"), handed to
+    the painter with the timepoint so its log lines say which mesh they are
+    about without naming it.
     """
     registered = jaws[registered_jaw]
-    t1_surface, t1_note = painter(surfaces.read_surface(registered["t1"]), registered["t1"])
-    t2_surface, t2_note = painter(surfaces.read_surface(registered["t2"]), registered["t2"])
+    t1_surface, t1_note = painter(
+        surfaces.read_surface(registered["t1"]), registered["t1"],
+        where=_where(position, "T1"),
+    )
+    t2_surface, t2_note = painter(
+        surfaces.read_surface(registered["t2"]), registered["t2"],
+        where=_where(position, "T2"),
+    )
 
     matrix = icp.align(
         butterfly.patch_cloud(t2_surface, painter.array_name),
@@ -248,6 +273,11 @@ def register_patient(
     if notes:
         entry["notes"] = notes
     return entry
+
+
+def _where(position: str, timepoint: str) -> str:
+    """"subject 3 of 8, T1", or the timepoint alone outside a run."""
+    return f"{position}, {timepoint}" if position else timepoint
 
 
 def _write(surface, source_path: str, destination: str, suffix: str) -> str:

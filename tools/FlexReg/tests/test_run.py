@@ -245,7 +245,7 @@ def test_one_unusable_surface_does_not_cost_the_others(tmp_path):
 def test_a_batch_where_nothing_worked_raises_rather_than_reporting_success(tmp_path):
     (tmp_path / "bad.vtk").write_bytes(b"truncated")
 
-    with pytest.raises(ToolInputError, match="None of the"):
+    with pytest.raises(ToolInputError, match="0 of 1 surfaces processed"):
         sadt_flexreg.run(surfaces=tmp_path, output_dir=tmp_path / "out", mode="Patch")
 
 
@@ -349,7 +349,7 @@ def test_a_tooth_the_arch_does_not_have_fails_the_surface(tmp_path, monkeypatch)
     monkeypatch.setattr(make_butterfly, "butterflyPatch", _missing)
     _write_surface(tmp_path / "lower.vtk")
 
-    with pytest.raises(ToolInputError, match="None of the"):
+    with pytest.raises(ToolInputError, match="UR6"):
         sadt_flexreg.run(surfaces=tmp_path / "lower.vtk",
                          output_dir=tmp_path / "out", mode="Patch")
 
@@ -358,14 +358,16 @@ def test_a_tooth_the_arch_does_not_have_fails_the_surface(tmp_path, monkeypatch)
 
 
 def test_a_run_where_nothing_worked_still_writes_its_report(tmp_path):
-    """The refusal points at the report, so the report has to exist. It was the
-    one case that wrote none."""
+    """A local caller still gets the per-surface reasons. The refusal itself
+    must not point at the report: on the server a failed run's directory is
+    deleted, so it carries the cause instead."""
     (tmp_path / "bad.vtk").write_bytes(b"truncated")
 
-    with pytest.raises(ToolInputError, match="FlexReg_report.json"):
+    with pytest.raises(ToolInputError, match="most common failure: ToolInputError") as refused:
         sadt_flexreg.run(surfaces=tmp_path, output_dir=tmp_path / "out", mode="Patch")
 
     assert (tmp_path / "out" / "FlexReg_report.json").is_file()
+    assert "report" not in str(refused.value)
 
 
 def test_a_batch_says_which_surface_it_is_on(tmp_path, monkeypatch):
@@ -386,3 +388,158 @@ def test_a_batch_says_which_surface_it_is_on(tmp_path, monkeypatch):
     events = [json.loads(line) for line in events_file.read_text().splitlines() if line]
     assert [e["message"] for e in events] == ["surface 1 of 2", "surface 2 of 2"]
     assert [e["fraction"] for e in events] == [0.0, 0.5]
+
+
+# ---------------------------------------------------------------------------
+# What an operator sees
+
+
+def _patched(path, values=None):
+    """A labelled surface also carrying a `Butterfly` patch array."""
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(_write_surface(path))
+    reader.Update()
+    surface = reader.GetOutput()
+    array = numpy_to_vtk(np.array(values or [1, 1, 1, 1], dtype=np.int32), deep=True)
+    array.SetName(pipeline.BUTTERFLY_ARRAY)
+    surface.GetPointData().AddArray(array)
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetFileName(str(path))
+    writer.SetInputData(surface)
+    writer.Write()
+    return str(path)
+
+
+def test_every_flexreg_logger_reaches_the_package_logger():
+    """Upstream gave each module its own logger name ("FlexReg_ICP", ...) with
+    propagate off and a stdout handler, so not one line reached the server,
+    which collects records under the package's name only."""
+    import importlib
+    import logging
+    import pkgutil
+
+    for module in pkgutil.iter_modules(sadt_flexreg.__path__):
+        importlib.import_module("sadt_flexreg." + module.name)
+
+    names = [name for name in logging.root.manager.loggerDict
+             if name.startswith("sadt_flexreg") or name.startswith("FlexReg")]
+    assert "sadt_flexreg.ICP" in names
+    for name in names:
+        logger = logging.getLogger(name)
+        assert name.startswith("sadt_flexreg"), name
+        assert logger.propagate, name
+        assert not logger.handlers, name
+
+
+def test_a_failed_surface_is_logged_by_position_class_and_reason(tmp_path, caplog):
+    _write_surface(tmp_path / "a_good.vtk")
+    (tmp_path / "b_bad.vtk").write_bytes(b"truncated")
+
+    with caplog.at_level("INFO", logger="sadt_flexreg"):
+        sadt_flexreg.run(surfaces=tmp_path, output_dir=tmp_path / "out", mode="Patch",
+                         patch="Mucogingival line")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(m.startswith("surface 2 of 2: reading failed (ToolInputError: ")
+               and "holds no surface points" in m for m in warnings), warnings
+    assert "1 of 2 surfaces processed, 1 failed" in warnings
+    assert not any("b_bad" in m for m in warnings)
+
+
+def test_a_batch_where_nothing_worked_for_a_server_fault_is_not_a_caller_error(
+        tmp_path, monkeypatch):
+    """Only an input refusal is the caller's to fix; anything else must not be
+    answered with a 422."""
+    def _broken(path, argument=None):
+        raise OSError("disk unreadable")
+
+    monkeypatch.setattr(sadt_flexreg, "read_surface", _broken)
+    _write_surface(tmp_path / "in" / "arch.vtk")
+
+    with pytest.raises(RuntimeError, match=r"0 of 1 surfaces processed; most common failure: "
+                                           r"OSError: disk unreadable \(1 of 1\)") as raised:
+        sadt_flexreg.run(surfaces=tmp_path / "in", output_dir=tmp_path / "out",
+                         mode="Patch", patch="Mucogingival line")
+    assert not isinstance(raised.value, ValueError)
+
+
+def test_a_missing_reference_is_named_by_its_argument(tmp_path):
+    with pytest.raises(ToolInputError, match="^'reference' path does not exist"):
+        sadt_flexreg.run(surfaces=tmp_path / "absent", output_dir=tmp_path / "out",
+                         mode="Register", reference=tmp_path / "nowhere.vtk")
+
+
+def test_a_reference_without_the_patch_is_refused_before_the_batch(tmp_path):
+    """From inside the engine this read "This tooth UR8 is not segmented" -- the
+    patch label 1 taken for a tooth number -- naming neither the input nor the
+    patch. `surfaces` does not exist here: the refusal comes first."""
+    reference = _write_surface(tmp_path / "ref.vtk")
+
+    with pytest.raises(ToolInputError, match="^'reference' carries no 'Butterfly' patch array"):
+        sadt_flexreg.run(surfaces=tmp_path / "absent", output_dir=tmp_path / "out",
+                         mode="Register", reference=reference)
+
+
+def test_a_reference_whose_patch_marks_nothing_is_refused(tmp_path):
+    reference = _patched(tmp_path / "ref.vtk", values=[0, 0, 0, 0])
+
+    with pytest.raises(ToolInputError, match="'reference''s 'Butterfly' patch array marks no point"):
+        sadt_flexreg.run(surfaces=tmp_path / "absent", output_dir=tmp_path / "out",
+                         mode="Register", reference=reference)
+
+
+def test_an_unsegmented_surface_is_named_as_such(tmp_path, caplog):
+    """The engine said "This surf doesnt have this property Universal_ID"."""
+    _write_surface(tmp_path / "in" / "arch.vtk", labelled=False)
+
+    with caplog.at_level("WARNING", logger="sadt_flexreg"):
+        with pytest.raises(ToolInputError, match="no 'Universal_ID' labels"):
+            sadt_flexreg.run(surfaces=tmp_path / "in", output_dir=tmp_path / "out", mode="Patch")
+
+    assert any(r.getMessage().startswith("surface 1 of 1: building the palate patch failed")
+               for r in caplog.records)
+
+
+def test_a_registration_logs_its_residual(tmp_path, caplog):
+    reference = _patched(tmp_path / "ref.vtk")
+    _patched(tmp_path / "in" / "arch.vtk")
+
+    with caplog.at_level("INFO", logger="sadt_flexreg"):
+        sadt_flexreg.run(surfaces=tmp_path / "in", output_dir=tmp_path / "out",
+                         mode="Register", reference=reference)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("surface 1 of 1: ICP RMS residual 0.00 mm") for m in messages), messages
+    report = json.loads((tmp_path / "out" / "FlexReg_report.json").read_text())
+    assert report["surfaces"]["arch.vtk"]["residual_mm"] == pytest.approx(0.0, abs=1e-3)
+
+
+def test_a_large_residual_is_a_warning(tmp_path, caplog, monkeypatch):
+    reference = _patched(tmp_path / "ref.vtk")
+    _patched(tmp_path / "in" / "arch.vtk")
+    monkeypatch.setattr(sadt_flexreg, "register",
+                        lambda surface, target, array: (surface, np.eye(4), 2.5))
+
+    with caplog.at_level("INFO", logger="sadt_flexreg"):
+        sadt_flexreg.run(surfaces=tmp_path / "in", output_dir=tmp_path / "out",
+                         mode="Register", reference=reference)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(m.startswith("surface 1 of 1: ICP RMS residual 2.50 mm, above 1.0 mm")
+               for m in warnings), warnings
+
+
+def test_no_cuda_device_is_a_deployment_fault(monkeypatch):
+    """Upstream called `.cuda()` unconditionally; on a CPU-only server that
+    surfaced as a torch error from deep inside the dilation."""
+    import torch
+    from sadt_flexreg import propagation
+    from sadt_flexreg.errors import ToolUnavailableError
+
+    propagation.require_cuda.cache_clear()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    try:
+        with pytest.raises(ToolUnavailableError, match="CUDA GPU"):
+            propagation.Dilation(0, None, None, None)
+    finally:
+        propagation.require_cuda.cache_clear()

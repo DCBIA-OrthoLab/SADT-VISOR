@@ -1251,3 +1251,215 @@ def test_both_halves_are_installed_or_neither():
         configuration_manager = None
 
     assert low_memory.install(_NoLabelManager()) is False
+
+
+# ---------------------------------------------------------------------------
+# What an operator reads when a run fails: position, class, cause
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402 - kept beside the tests that use it
+
+
+def test_a_cpu_device_runs_nnunet_in_this_process(fake_predictor, tmp_path):
+    """On the CPU there is no overlap for the workers to buy, and a worker
+    that dies there reads only "Background workers died"."""
+    nnunet_runner.predict_folder(
+        "model", str(tmp_path / "in"), str(tmp_path / "out"), "cpu", gpu_resampling=True
+    )
+
+    assert fake_predictor.calls == ["initialize", "predict_from_files_sequential"]
+
+
+def test_a_dead_worker_is_reported_with_its_usual_cause(monkeypatch, fake_predictor, tmp_path):
+    def died(*args, **kwargs):
+        raise RuntimeError("Background workers died. Look for the error message further up!")
+
+    monkeypatch.setattr(fake_predictor, "predict_from_files", died)
+
+    with pytest.raises(RuntimeError) as caught:
+        nnunet_runner.predict_folder(
+            "model", str(tmp_path / "in"), str(tmp_path / "out"), "cuda", gpu_resampling=False
+        )
+
+    assert str(caught.value).startswith(
+        "nnUNet prediction failed on cuda (RuntimeError: an nnUNet worker process died, "
+        "most often for lack of RAM")
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_a_low_memory_path_that_did_not_apply_is_a_warning(monkeypatch, caplog):
+    from sadt_batchdentalseg import low_memory
+
+    monkeypatch.setattr(low_memory, "install", lambda predictor: False)
+    manager = _configuration_manager()
+
+    with caplog.at_level(logging.INFO, logger="sadt_batchdentalseg"):
+        assert nnunet_runner._enable_gpu_resampling(_PredictorWithPlans(manager), "cuda")
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("low-memory per-class resampling was not applied")
+               for m in warnings), warnings
+
+
+def test_a_whole_batch_nnunet_failure_names_the_scan_model_and_device(
+    tmp_path, monkeypatch, caplog
+):
+    def fail_on_the_second(model_folder, input_dir, output_dir, device, **kwargs):
+        _stub_prediction((1,))(model_folder, input_dir, output_dir, device)
+        os.remove(os.path.join(output_dir, "case_0001.nii.gz"))
+        raise RuntimeError("nnUNet prediction failed on cpu (MemoryError: out of RAM)")
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", fail_on_the_second)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested=None: "cpu")
+    _write_scan(str(tmp_path / "in" / "Smith_John.nii.gz"))
+    _write_scan(str(tmp_path / "in" / "Zulu_Zoe.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    with caplog.at_level(logging.INFO, logger="sadt_batchdentalseg"), \
+            pytest.raises(RuntimeError, match="MemoryError: out of RAM"):
+        pipeline.segment(
+            output_dir=str(tmp_path / "out"), input_path=str(tmp_path / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        )
+
+    records = [r for r in caplog.records if r.getMessage().startswith("nnUNet failed at")]
+    assert [r.getMessage() for r in records] == [
+        "nnUNet failed at scan 2 of 2 (model=DentalSegmentator, device=cpu, gpu_resampling=True)"
+    ]
+    assert records[0].exc_info is not None
+
+
+def test_no_scan_segmented_raises_a_runtime_error_with_the_commonest_cause(
+    tmp_path, monkeypatch, caplog
+):
+    """Every scan readable and nnUNet wrote nothing: not the caller's fault,
+    so not an input error, and never a report of a successful empty run."""
+
+    def write_nothing(model_folder, input_dir, output_dir, device, **kwargs):
+        os.makedirs(output_dir, exist_ok=True)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", write_nothing)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested=None: "cpu")
+    _write_scan(str(tmp_path / "in" / "Smith_John.nii.gz"))
+    _write_scan(str(tmp_path / "in" / "Zulu_Zoe.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    with caplog.at_level(logging.INFO, logger="sadt_batchdentalseg"), \
+            pytest.raises(RuntimeError) as caught:
+        pipeline.segment(
+            output_dir=str(tmp_path / "out"), input_path=str(tmp_path / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        )
+
+    assert not isinstance(caught.value, ValueError)
+    assert str(caught.value) == (
+        "0 of 2 scans segmented; most common failure: RuntimeError: nnUNet wrote no mask "
+        "(2 of 2)"
+    )
+    messages = [r.getMessage() for r in caplog.records]
+    assert "scan 1 of 2: nnUNet wrote no mask" in messages
+    assert "scan 2 of 2: nnUNet wrote no mask" in messages
+    assert not os.path.isfile(os.path.join(str(tmp_path / "out"), "BatchDentalSeg_report.json"))
+
+
+def test_a_partial_batch_ends_on_a_warning_and_lines_carry_position_and_class(
+    tmp_path, stub_nnunet, caplog
+):
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "Smith_John.nii.gz"))
+    with open(str(tmp_path / "in" / "Zulu_Zoe.nii.gz"), "wb") as handle:
+        handle.write(b"not a volume")
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    with caplog.at_level(logging.INFO, logger="sadt_batchdentalseg"):
+        pipeline.segment(
+            output_dir=str(tmp_path / "out"), input_path=str(tmp_path / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("scan 2 of 2: reading failed (RuntimeError: ") for m in messages), \
+        messages
+    assert not any("Zulu_Zoe" in m or "Smith_John" in m for m in messages), messages
+    summary = [r for r in caplog.records if r.getMessage() == "1 of 2 scans segmented, 1 failed"]
+    assert [r.levelno for r in summary] == [logging.WARNING]
+
+
+def test_a_batch_of_only_unreadable_scans_names_the_commonest_cause(tmp_path, stub_nnunet):
+    stub_nnunet()
+    os.makedirs(str(tmp_path / "in"), exist_ok=True)
+    for name in ("a.nii.gz", "b.nii.gz"):
+        with open(str(tmp_path / "in" / name), "wb") as handle:
+            handle.write(b"not a volume")
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    with pytest.raises(ToolInputError, match=r"^0 of 2 scans could be read .*\(2 of 2\)$") \
+            as caught:
+        pipeline.segment(
+            output_dir=str(tmp_path / "out"), input_path=str(tmp_path / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        )
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_input_errors_name_the_argument_and_describe_layouts_in_words(tmp_path, stub_nnunet):
+    with pytest.raises(FileNotFoundError) as missing:
+        pipeline.discover_scans(str(tmp_path / "nowhere"), "Seg")
+    assert str(missing.value) == "'scans' path does not exist"
+
+    stub_nnunet()
+    os.makedirs(str(tmp_path / "in"), exist_ok=True)
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+    with pytest.raises(ToolInputError) as empty:
+        pipeline.segment(
+            output_dir=str(tmp_path / "out"), input_path=str(tmp_path / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        )
+    assert "'scans'" in str(empty.value)
+    assert ".nii" not in str(empty.value) and "nii, nrrd, gipl" in str(empty.value)
+
+    os.makedirs(str(tmp_path / "bare" / "DentalSegmentator"))
+    with pytest.raises(ToolInputError) as bundle:
+        pipeline.resolve_model(str(tmp_path / "bare" / "DentalSegmentator"))
+    assert "fold-0 final checkpoint" in str(bundle.value)
+    assert "fold_0/" not in str(bundle.value) and ".pth" not in str(bundle.value)
+
+
+def test_a_failed_surface_write_raises_instead_of_passing_silently(tmp_path):
+    from sadt_batchdentalseg import mesh_export
+    import vtk
+
+    target = tmp_path / "blocked"
+    target.write_text("a file where a folder should be")
+    with pytest.raises(Exception):
+        mesh_export._write(vtk.vtkPolyData(), "vtkPolyDataWriter",
+                           str(target / "x.vtk"), True)
+
+    # The folder exists but cannot be written into: VTK returns 0, prints to
+    # stderr, and raised nothing before this check.
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    readonly.chmod(0o500)
+    try:
+        if os.access(str(readonly), os.W_OK):
+            pytest.skip("running with permissions that ignore the mode bits")
+        with pytest.raises(RuntimeError, match="^writing a surface failed"):
+            mesh_export._write(vtk.vtkPolyData(), "vtkPolyDataWriter",
+                               str(readonly / "x.vtk"), True)
+    finally:
+        readonly.chmod(0o700)
+
+
+def test_no_label_for_a_surface_is_logged_with_the_scan_position(tmp_path, caplog):
+    from sadt_batchdentalseg import mesh_export
+
+    labels = sitk.Image(6, 6, 6, sitk.sitkUInt8)
+    model = catalogs.get("DentalSegmentator")
+    formats = ["STL"]
+
+    with caplog.at_level(logging.INFO, logger="sadt_batchdentalseg"):
+        mesh_export.write(labels, model, "base", str(tmp_path), "Seg", formats,
+                          where="scan 3 of 4: ")
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert "scan 3 of 4: no label in this scan, so no surface was written" in messages, messages

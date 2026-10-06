@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
@@ -225,46 +226,108 @@ def run(
             # was then printed over by an unconditional "All files processed
             # successfully!".
             #
-            # Logged by position and by the KIND of failure only: the note's
-            # path is patient metadata, and a reader's own exception can name
-            # the file it could not open. The full reason goes to the report,
-            # which returns to whoever sent the notes.
+            # Logged by position, step, class AND message: the class alone
+            # ("ValueError") told an operator nothing about which of the four
+            # things that can go wrong with a note did. Never by the note's
+            # path, which is patient metadata; a reader's own message can
+            # still name the file it could not open, and the server's
+            # redaction is what removes that.
+            step = entry.pop("step", "extraction")
             logger.warning(
-                "CNE could not extract from note %d of %d: %s",
-                index, len(found), type(exc).__name__,
+                "note %d of %d: %s failed (%s: %s)",
+                index, len(found), step, type(exc).__name__, exc,
             )
+            # The report is not named here: it is deleted with the job
+            # directory when no note at all succeeds.
             progress.log(
-                f"note {index} of {len(found)} could not be extracted; the "
-                f"report says why", "warning", user=True,
+                f"note {index} of {len(found)} could not be extracted: {step} "
+                f"failed ({type(exc).__name__})", "warning", user=True,
             )
             entry["status"] = "failed"
+            entry["failed_step"] = step
             entry["reason"] = f"{type(exc).__name__}: {exc}"
-            failures.append(type(exc))
+            failures.append(exc)
         report["notes"].append(entry)
 
     report["summary"] = f"{len(written)}/{len(found)} note(s) extracted"
     report["duration_seconds"] = round(time.monotonic() - started, 2)
+    _log_summary(len(written), len(found), failures)
 
     if not written:
-        reasons = "; ".join(
-            f"{note['input']}: {note.get('reason', 'unknown')}"
-            for note in report["notes"]
-        )
-        # A batch that failed only because this deployment lacks a reader is a
-        # deployment problem (503), not the caller's (422). Both messages name
-        # what went wrong per note.
-        if failures and all(kind is ToolUnavailableError for kind in failures):
-            raise ToolUnavailableError(
-                f"CNE could not read any of the notes it was given. {reasons}"
-            )
-        raise ValueError(
-            f"CNE extracted nothing from any of the notes it was given. {reasons}"
-        )
+        raise _nothing_extracted(report["notes"], failures) from failures[0]
 
     (output_dir / REPORT_NAME).write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
     return output_dir
+
+
+def _is_input_failure(exc: BaseException) -> bool:
+    """Whether a note failed because of what the caller sent.
+
+    The classes the server answers 422 to. `ToolUnavailableError` is a
+    RuntimeError and so is never one of them; neither is an engine crash.
+    """
+    return isinstance(exc, (ValueError, FileNotFoundError))
+
+
+def _failure_counts(failures) -> Counter:
+    """How many notes failed with each exception class, most common first."""
+    return Counter(type(exc).__name__ for exc in failures)
+
+
+def _log_summary(extracted: int, total: int, failures) -> None:
+    """One closing line: how many notes made it, and what stopped the rest.
+
+    INFO when every note was extracted, WARNING otherwise, so a partial run is
+    visible at the level an operator filters on.
+    """
+    if not failures:
+        logger.info("%d of %d notes extracted", extracted, total)
+        return
+    categories = ", ".join(
+        f"{name} {count}" for name, count in _failure_counts(failures).most_common()
+    )
+    logger.warning(
+        "%d of %d notes extracted, %d failed; failures by category: %s",
+        extracted, total, len(failures), categories,
+    )
+
+
+def _nothing_extracted(entries, failures) -> Exception:
+    """The exception for a run in which no note at all was extracted.
+
+    Its CLASS is chosen by who can fix it, because that is all the server
+    reads. Every note refused for what it held (empty, truncated, unreadable
+    format) is the caller's to fix: ValueError, 422, and the message names each
+    note so they can find it. Any note lost to a missing package, and nothing
+    worse, is the deployment's: ToolUnavailableError, 503. Anything else -- the
+    engine crashing, a disk error -- is this server failing: RuntimeError, 500,
+    where upstream and this port both used to say ValueError and blame the
+    request. The most common cause comes FIRST, because long messages are cut.
+    """
+    total = len(entries)
+    name, count = _failure_counts(failures).most_common(1)[0]
+    first = next(exc for exc in failures if type(exc).__name__ == name)
+    headline = (
+        f"0 of {total} notes extracted; most common failure: {name}: "
+        f"{first} ({count} of {total})"
+    )
+    if all(_is_input_failure(exc) for exc in failures):
+        reasons = "; ".join(
+            f"{entry['input']}: {entry.get('reason', 'unknown')}"
+            for entry in entries
+        )
+        error = ValueError(f"CNE extracted nothing: {headline}. Per note: {reasons}")
+    elif all(_is_input_failure(exc) or isinstance(exc, ToolUnavailableError)
+             for exc in failures):
+        # Some notes were the caller's fault and the rest were the
+        # deployment's; the deployment's is the one the caller cannot work
+        # around, so it decides the answer.
+        error = ToolUnavailableError(f"CNE could not read any of the notes: {headline}")
+    else:
+        error = RuntimeError(headline)
+    return error
 
 
 def plan_outputs(found, root: Path, output_dir: Path) -> dict:
@@ -298,7 +361,12 @@ def plan_outputs(found, root: Path, output_dir: Path) -> dict:
 
 def _extract_one(engine, note: Path, notes_type: str, destination, output_dir,
                  max_tokens: int, temperature: float, entry: dict) -> None:
-    """One note, read to written. Raises rather than writing anything doubtful."""
+    """One note, read to written. Raises rather than writing anything doubtful.
+
+    `entry["step"]` names the stage under way, so a failure can be reported by
+    WHERE it happened; the caller pops it whatever the outcome.
+    """
+    entry["step"] = "reading the note"
     text, details = read_note(note)
     entry.update(details)
     entry["characters"] = len(text)
@@ -314,6 +382,7 @@ def _extract_one(engine, note: Path, notes_type: str, destination, output_dir,
             "layer, and CNE does not perform OCR."
         )
 
+    entry["step"] = "asking the model"
     answer, finish_reason = complete(
         engine, build_messages(notes_type, text), max_tokens, temperature
     )
@@ -326,6 +395,7 @@ def _extract_one(engine, note: Path, notes_type: str, destination, output_dir,
             f"extraction is incomplete. Raise max_tokens and run this note again."
         )
 
+    entry["step"] = "parsing the answer"
     data = parse_extraction(answer)
     if data is None:
         raise ValueError(
@@ -334,6 +404,7 @@ def _extract_one(engine, note: Path, notes_type: str, destination, output_dir,
             "successful extraction."
         )
 
+    entry["step"] = "writing the extraction"
     json_path, text_path = destination
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
@@ -341,6 +412,7 @@ def _extract_one(engine, note: Path, notes_type: str, destination, output_dir,
     )
     text_path.write_text(render_extraction(data), encoding="utf-8")
 
+    del entry["step"]
     entry["status"] = "ok"
     entry["fields"] = len(data)
     entry["output"] = json_path.relative_to(output_dir).as_posix()

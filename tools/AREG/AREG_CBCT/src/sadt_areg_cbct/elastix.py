@@ -18,6 +18,9 @@ oriented data, ASO having recentred it.
 """
 
 import logging
+import os
+import re
+import tempfile
 
 import numpy as np
 import SimpleITK as sitk
@@ -34,7 +37,22 @@ _INSTALL_HINT = (
 
 
 class RegistrationError(Exception):
-    """One patient could not be registered. Reported, and the batch goes on."""
+    """One patient could not be registered. Reported, and the batch goes on.
+
+    `cause` says whose problem it is, because a run where nothing registered
+    has to come back as the caller's fault or the server's, and only the place
+    that raised knows which:
+
+    * "input" -- the caller's data or arguments (a label the mask does not
+      hold, a scan that cannot be read);
+    * "mask" -- the mask does not fit its scan, which is the caller's fault
+      when they sent the mask and the segmentation step's when it made it;
+    * "engine" -- the registration itself.
+    """
+
+    def __init__(self, message: str, cause: str = "engine"):
+        super().__init__(message)
+        self.cause = cause
 
 
 def check_dependencies() -> None:
@@ -150,12 +168,14 @@ def apply_mask(image: sitk.Image, mask: sitk.Image, label: int = None) -> tuple:
     if mask.GetSize() != image.GetSize():
         raise RegistrationError(
             f"the mask is {mask.GetSize()} voxels and the scan is {image.GetSize()}: "
-            f"they are not the same sampling of the same patient."
+            f"they are not the same sampling of the same patient.",
+            cause="mask",
         )
     if not np.allclose(mask.GetSpacing(), image.GetSpacing(), atol=1e-4):
         raise RegistrationError(
             f"the mask's spacing {tuple(round(v, 4) for v in mask.GetSpacing())} differs "
-            f"from the scan's {tuple(round(v, 4) for v in image.GetSpacing())}."
+            f"from the scan's {tuple(round(v, 4) for v in image.GetSpacing())}.",
+            cause="mask",
         )
     # Same sampling: any remaining origin/direction difference is the float
     # drift a round trip through a segmentation tool leaves behind.
@@ -169,7 +189,8 @@ def apply_mask(image: sitk.Image, mask: sitk.Image, label: int = None) -> tuple:
             raise RegistrationError(
                 f"the mask holds no label {label} (it has "
                 f"{', '.join(str(int(value)) for value in present)}). Set "
-                f"'segmentation_label' to 0 to use the whole mask."
+                f"'segmentation_label' to 0 to use the whole mask.",
+                cause="input",
             )
         binary = sitk.GetImageFromArray((array == label).astype(np.uint8))
         binary.CopyInformation(image)
@@ -202,11 +223,74 @@ def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Transform:
     """
     itk = _import_elastix()
 
+    # Said BEFORE the call: when elastix fails, what it was asked to do is the
+    # half of the diagnosis its own message never carries.
+    logger.info(
+        "elastix rigid registration: fixed %s voxels at %s mm, moving %s voxels at "
+        "%s mm (%s, %s resolutions, up to %s iterations)",
+        "x".join(str(v) for v in fixed.GetSize()),
+        "x".join(f"{v:.3g}" for v in fixed.GetSpacing()),
+        "x".join(str(v) for v in moving.GetSize()),
+        "x".join(f"{v:.3g}" for v in moving.GetSpacing()),
+        _RIGID_PARAMETERS["Metric"][0],
+        _RIGID_PARAMETERS["NumberOfResolutions"][0],
+        _RIGID_PARAMETERS["MaximumNumberOfIterations"][0],
+    )
+
     registration = itk.ElastixRegistrationMethod.New(_to_itk(fixed), _to_itk(moving))
     registration.SetParameterObject(rigid_parameter_map())
     registration.SetLogToConsole(False)
-    registration.UpdateLargestPossibleRegion()
+    # The log goes to a private temporary directory, removed on return. The
+    # exception elastix raises says only "Internal elastix error: See elastix
+    # log", so without the log a failure has no cause at all; with it the ITK
+    # `Description:` line names one ("fewer than four pixels along direction
+    # 0"). The log holds parameters and metric values, never image data, and the
+    # directory is unique per call, so concurrent runs cannot share it.
+    with tempfile.TemporaryDirectory(prefix="areg_elastix_") as log_dir:
+        registration.SetLogToFile(True)
+        registration.SetOutputDirectory(log_dir)
+        try:
+            registration.UpdateLargestPossibleRegion()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"elastix rigid registration failed: {_failure_description(exc, log_dir)}"
+            ) from exc
     return retrieve_transform(registration.GetTransformParameterObject())
+
+
+# "ITK ERROR: RecursiveGaussianImageFilter(0x59508e2d5540): " -- the class and
+# the object's address say nothing an operator can act on, and the address
+# changes every run.
+_ITK_PREFIX = re.compile(r"^(ITK ERROR:\s*)?\w+\(0x[0-9a-fA-F]+\):\s*")
+
+
+def describe(exc: BaseException) -> str:
+    """The one meaningful line of an ITK exception.
+
+    ITK's message is the C++ source file and line it was raised at, then the
+    object, then the sentence. Only the sentence is kept: the source path is
+    the build machine's, and the whole thing would be cut by the log line's
+    length long before reaching the cause. A `Description:` line wins when
+    there is one, the last non-empty line otherwise.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("Description:"):
+            return _ITK_PREFIX.sub("", line[len("Description:"):].strip())
+    return _ITK_PREFIX.sub("", lines[-1]) if lines else type(exc).__name__
+
+
+def _failure_description(exc: BaseException, log_dir: str) -> str:
+    """The `Description:` line of elastix's log, or of the exception itself."""
+    try:
+        with open(os.path.join(log_dir, "elastix.log"), encoding="utf-8",
+                  errors="replace") as handle:
+            for line in handle:
+                if line.strip().startswith("Description:"):
+                    return describe(RuntimeError(line))
+    except OSError:
+        pass
+    return describe(exc)
 
 
 def retrieve_transform(parameter_object) -> sitk.Transform:

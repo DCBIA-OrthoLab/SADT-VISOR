@@ -6,12 +6,13 @@ reaches the supervisor.
 """
 
 import json
+import logging
 
 import pytest
 
 from sadt_agent import ADVICE_NAME, DECISION_NAME, MODE_ASK, REPORT_NAME, run
 from sadt_agent.errors import (
-    CatalogError,
+    ModelAnswerError,
     SupervisorRequired,
     ToolInputError,
     ToolUnavailableError,
@@ -172,7 +173,7 @@ def test_a_router_answer_that_is_not_json_is_an_error(
     tmp_path, catalog_file, stub_model
 ):
     stub_model("I would rather not.")
-    with pytest.raises(ToolInputError):
+    with pytest.raises(ModelAnswerError):
         invoke(tmp_path, catalog_file)
 
 
@@ -522,7 +523,7 @@ def test_a_missing_catalogue_is_refused_before_any_model_call(
 ):
     monkeypatch.delenv("SADT_API", raising=False)
     stub = stub_model()
-    with pytest.raises(CatalogError):
+    with pytest.raises(ToolUnavailableError):
         run(prompt="anything", output_dir=tmp_path / "out")
     assert stub.calls == []
 
@@ -542,3 +543,100 @@ def test_the_output_directory_is_created(tmp_path, catalog_file, stub_model):
     stub_model(routed("Bone_Seg"), extracted({}))
     output_dir = invoke(tmp_path, catalog_file, output_dir=tmp_path / "a" / "b" / "c")
     assert output_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# What an operator sees while it runs, and when it stops
+# ---------------------------------------------------------------------------
+
+def progress_messages(path):
+    return [
+        json.loads(line).get("message")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") != "log"
+    ]
+
+
+def test_each_stage_is_announced_before_it_starts(
+    tmp_path, catalog_file, stub_model, monkeypatch
+):
+    """A run stalled on the model has to say WHICH round trip it is waiting on;
+    before, the last progress message was whatever the server wrote at start."""
+    events = tmp_path / "progress.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events))
+    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    invoke(tmp_path, catalog_file)
+    assert progress_messages(events) == [
+        "reading catalogue", "router call", "extraction call (tool Bone_Seg)",
+    ]
+
+
+def test_each_model_call_is_logged_with_its_duration(
+    tmp_path, catalog_file, stub_model, caplog
+):
+    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        invoke(tmp_path, catalog_file)
+    lines = [record.getMessage() for record in caplog.records]
+    assert any(line.startswith("catalogue read: ") for line in lines)
+    assert any(line.startswith("router call answered in ") for line in lines)
+    assert any(
+        line.startswith("extraction call (tool Bone_Seg) answered in ")
+        for line in lines
+    )
+
+
+def test_a_failed_model_call_is_logged_with_its_duration_and_class(
+    tmp_path, catalog_file, monkeypatch, caplog
+):
+    def unreachable(*args, **kwargs):
+        raise ToolUnavailableError("router call exceeded timeout_seconds=1")
+
+    monkeypatch.setattr("sadt_agent.llm.chat", unreachable)
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        with pytest.raises(ToolUnavailableError):
+            invoke(tmp_path, catalog_file)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        line.startswith("router call failed after ") and "ToolUnavailableError" in line
+        for line in warnings
+    )
+
+
+def test_the_call_name_reaches_the_model_client(tmp_path, catalog_file, stub_model):
+    """So a timeout can say which call ran out of time."""
+    stub = stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    invoke(tmp_path, catalog_file)
+    assert [call["kwargs"]["call"] for call in stub.calls] == [
+        "router call", "extraction call (tool Bone_Seg)",
+    ]
+
+
+def test_the_routing_outcome_is_one_info_line(
+    tmp_path, catalog_file, stub_model, caplog
+):
+    stub_model(routed("Bone_Seg", 0.92), extracted({"scans": "/d"}))
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        invoke(tmp_path, catalog_file)
+    outcomes = [
+        record for record in caplog.records
+        if record.getMessage().startswith("routing outcome: ")
+    ]
+    assert len(outcomes) == 1
+    assert outcomes[0].levelno == logging.INFO
+    assert outcomes[0].getMessage() == (
+        "routing outcome: tool=Bone_Seg, confidence=0.92, 0 error(s), "
+        "1 required argument(s) missing"
+    )
+
+
+def test_no_tool_chosen_is_still_summarised(
+    tmp_path, catalog_file, stub_model, caplog
+):
+    stub_model(routed(None, 0.3))
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        invoke(tmp_path, catalog_file)
+    assert (
+        "routing outcome: tool=none, confidence=0.30, 1 error(s), "
+        "0 required argument(s) missing"
+    ) in [record.getMessage() for record in caplog.records]

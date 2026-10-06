@@ -23,7 +23,7 @@ import json
 import logging
 import os
 
-from .errors import ToolInputError
+from .errors import ToolInputError, describe_failure, nothing_succeeded
 from .discovery import find_scans
 from .scans import split_scan_extension
 
@@ -126,21 +126,24 @@ def read_cohort(root: str) -> dict:
     separately and a measurement needs both. Read by glob rather than by group
     name, so a group renamed in ALI changes nothing here.
     """
-    found: dict = {}
+    paths = []
     for directory, subdirectories, names in os.walk(root or ""):
         subdirectories.sort()
-        for name in sorted(names):
-            if name.startswith(".") or not name.lower().endswith(MARKUPS_EXTENSION):
-                continue
-            path = os.path.join(directory, name)
-            try:
-                points = read_markups(path)
-            except Exception as exc:  # noqa: BLE001 - one file must not cost the batch
-                logger.warning("VFACE could not read one landmark file: %s",
-                               type(exc).__name__)
-                continue
-            if points:
-                found.setdefault(patient_of(name), {}).update(points)
+        paths.extend(
+            os.path.join(directory, name) for name in sorted(names)
+            if not name.startswith(".") and name.lower().endswith(MARKUPS_EXTENSION)
+        )
+
+    found: dict = {}
+    for index, path in enumerate(paths, start=1):
+        try:
+            points = read_markups(path)
+        except Exception as exc:  # noqa: BLE001 - one file must not cost the batch
+            logger.warning("VFACE: landmark file %d of %d: read failed (%s)",
+                           index, len(paths), describe_failure(exc))
+            continue
+        if points:
+            found.setdefault(patient_of(os.path.basename(path)), {}).update(points)
     return found
 
 
@@ -201,11 +204,12 @@ def pad_scans(scans_dir: str, output_dir: str, margin_mm: int = DEFAULT_MARGIN_M
     found = find_scans(scans_dir)
     if not found:
         raise ToolInputError(
-            f"No scan to give room to under {os.path.basename(scans_dir)}."
+            "No scan to give room to: the scans handed to the landmark search "
+            "hold no volume."
         )
 
     os.makedirs(output_dir, exist_ok=True)
-    for path in found:
+    for index, path in enumerate(found, start=1):
         destination = os.path.join(output_dir, os.path.relpath(path, scans_dir))
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         try:
@@ -214,8 +218,8 @@ def pad_scans(scans_dir: str, output_dir: str, margin_mm: int = DEFAULT_MARGIN_M
             background = float(sitk.GetArrayFromImage(image).min())
             sitk.WriteImage(sitk.ConstantPad(image, pad, pad, background), destination)
         except Exception as exc:  # noqa: BLE001 - an unpadded scan is still worth searching
-            logger.warning("VFACE could not pad one scan, using it as it is: %s",
-                           type(exc).__name__)
+            logger.warning("VFACE: scan %d of %d: padding failed, searched as it is (%s)",
+                           index, len(found), describe_failure(exc))
             if report is not None:
                 report.setdefault("not_padded", {})[
                     os.path.relpath(path, scans_dir)
@@ -268,7 +272,8 @@ def derive_into_frame(source_landmarks: str, source_transforms: str,
     source = read_cohort(source_landmarks)
     if not source:
         raise ToolInputError(
-            f"No landmark file to derive from under {os.path.basename(source_landmarks)}."
+            "No landmark file to derive from: the landmark search in the source "
+            "frame wrote no readable landmark file."
         )
 
     from_source = transforms_by_patient(source_transforms)
@@ -278,10 +283,15 @@ def derive_into_frame(source_landmarks: str, source_transforms: str,
     os.makedirs(output_dir, exist_ok=True)
 
     written = []
-    for patient, points in sorted(source.items()):
+    failures = []
+    total = len(source)
+    for index, (patient, points) in enumerate(sorted(source.items()), start=1):
         if patient not in from_source or patient not in to_target:
-            logger.warning("VFACE: one patient has no orientation transform, its "
-                           "landmarks cannot be derived")
+            missing = "source" if patient not in from_source else "target"
+            logger.warning("VFACE: patient %d of %d: landmarks not derived (no "
+                           "orientation transform for the %s frame)",
+                           index, total, missing)
+            failures.append(f"no orientation transform for the {missing} frame")
             if report is not None:
                 report.setdefault("not_derived", {})[patient] = (
                     "no orientation transform for "
@@ -292,8 +302,9 @@ def derive_into_frame(source_landmarks: str, source_transforms: str,
             to_centred = sitk.ReadTransform(from_source[patient])
             from_centred = sitk.ReadTransform(to_target[patient]).GetInverse()
         except Exception as exc:  # noqa: BLE001 - one patient must not cost the cohort
-            logger.warning("VFACE could not read one orientation transform: %s",
-                           type(exc).__name__)
+            logger.warning("VFACE: patient %d of %d: orientation transform "
+                           "unreadable (%s)", index, total, describe_failure(exc))
+            failures.append(exc)
             if report is not None:
                 report.setdefault("not_derived", {})[patient] = (
                     f"{type(exc).__name__}: {exc}"
@@ -308,6 +319,9 @@ def derive_into_frame(source_landmarks: str, source_transforms: str,
             by_group.setdefault(group_of(label), {})[label] = list(moved)
 
         if not by_group:
+            logger.warning("VFACE: patient %d of %d: none of the %d landmark(s) "
+                           "asked for were found", index, total, len(wanted))
+            failures.append(f"none of the {len(wanted)} landmark(s) asked for were found")
             if report is not None:
                 report.setdefault("not_derived", {})[patient] = (
                     f"none of the {len(wanted)} landmark(s) asked for were found"
@@ -324,11 +338,18 @@ def derive_into_frame(source_landmarks: str, source_transforms: str,
     if not written:
         # Counted on what was WRITTEN. A guard counting the patients walked past
         # would pass on a cohort where not one of them could be derived.
-        raise ToolInputError(
-            f"No patient's landmarks could be expressed in the target frame, out "
-            f"of {len(source)} with landmarks. The per-patient reasons are in the "
-            "run report."
+        # The reasons are said in the error itself: the run report that holds
+        # them per patient is deleted with the job when the run fails. Every
+        # one of them is the pipeline's -- a transform the orientation did not
+        # write, landmarks the search did not find -- so this is not the
+        # caller's 422.
+        raise nothing_succeeded(
+            total, "patient(s)' landmarks expressed in the target frame", failures
         )
-    logger.info("VFACE: landmarks derived into the target frame for %d patient(s)",
-                len(source) - len((report or {}).get("not_derived", {})))
+    if failures:
+        logger.warning("VFACE: landmarks derived into the target frame for %d of %d "
+                       "patient(s), %d failed", total - len(failures), total, len(failures))
+    else:
+        logger.info("VFACE: landmarks derived into the target frame for %d of %d "
+                    "patient(s)", total, total)
     return output_dir

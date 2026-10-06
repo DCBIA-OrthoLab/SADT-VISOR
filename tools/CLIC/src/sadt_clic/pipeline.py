@@ -30,7 +30,10 @@ laptop with someone watching:
 import logging
 import os
 
-logger = logging.getLogger("CLIC")
+# Named after the module, not the tool: the server shows the records of the
+# loggers under this package and nothing else, so a logger called "CLIC" was
+# written for nobody.
+logger = logging.getLogger(__name__)
 
 # What nibabel actually reads, which is the list this tool advertises.
 SCAN_EXTENSIONS = (".nii", ".nii.gz")
@@ -130,8 +133,24 @@ def build_model(checkpoint_path: str, device: str):
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
     from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
-    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    classes = class_count(state)
+    # A file that is not there stays the OSError it is: a wrong name is the
+    # caller's to fix, and the server answers it as such. A file that IS there
+    # and cannot be used is the deployment's fault -- the checkpoint is
+    # installed by whoever runs the server -- so everything past this point is
+    # a RuntimeError, never the ValueError that would blame the request.
+    try:
+        state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except OSError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"checkpoint could not be read ({type(exc).__name__}: "
+            f"{_first_line(exc)})"
+        ) from exc
+    try:
+        classes = class_count(state)
+    except ValueError as exc:
+        raise RuntimeError(f"checkpoint is unusable: {exc}") from exc
 
     model = maskrcnn_resnet50_fpn(weights=None)
     box_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -139,9 +158,25 @@ def build_model(checkpoint_path: str, device: str):
     mask_features = model.roi_heads.mask_predictor.conv5_mask.in_channels
     model.roi_heads.mask_predictor = MaskRCNNPredictor(mask_features, 256, classes)
 
-    model.load_state_dict(state)
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as exc:
+        # torch lists every mismatched tensor, one per line, and the operator
+        # sees only the first few hundred characters: the cause goes first.
+        raise RuntimeError(
+            f"checkpoint weights do not fit the Mask R-CNN layout "
+            f"({_first_line(exc)})"
+        ) from exc
     model.to(device).eval()
     return model, classes
+
+
+def _first_line(exc) -> str:
+    """The first non-empty line of an exception's message, which is the cause."""
+    for line in str(exc).splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
 
 
 def normalise(slice_2d):

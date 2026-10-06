@@ -17,6 +17,7 @@ import logging
 import os
 
 from . import progress
+from .errors import ToolInputError, ToolUnavailableError
 
 logger = logging.getLogger("DOCShapeAXI")
 
@@ -66,6 +67,55 @@ def is_surface_file(name) -> bool:
     return os.fspath(name).lower().endswith(SURFACE_EXTENSIONS)
 
 
+def check_surfaces(found: list) -> None:
+    """Refuse the batch when a surface has no points or no faces.
+
+    Read with the reader shapeaxi itself uses for `.vtk`. A file it cannot
+    parse comes back as an empty polydata rather than as an exception, and the
+    renderer then fails several calls deeper with a tensor-shape error that
+    says nothing about which surface, or why. Checked up front, by position,
+    so the message names the item without naming the file.
+    """
+    import vtk
+
+    total = len(found)
+    for index, path in enumerate(found, start=1):
+        reader = vtk.vtkPolyDataReader()
+        reader.SetFileName(path)
+        reader.Update()
+        surface = reader.GetOutput()
+        points = surface.GetNumberOfPoints() if surface is not None else 0
+        faces = surface.GetNumberOfPolys() if surface is not None else 0
+        if points == 0 or faces == 0:
+            raise ToolInputError(
+                f"'surfaces': surface {index} of {total} is empty or unreadable "
+                f"({points} points, {faces} faces); DOCShapeAXI needs a "
+                f"triangle mesh in legacy VTK polydata format."
+            )
+
+
+def check_unique_names(found: list) -> None:
+    """Refuse surfaces that share a file name across subfolders.
+
+    Each explained surface is written flat into the output folder under its
+    own file name, and the outputs mapping is keyed by that name's stem, so two
+    same-named surfaces from different subfolders would silently overwrite
+    each other. Only the count is reported: the names are patient data.
+    """
+    seen = {}
+    for path in found:
+        name = os.path.basename(path)
+        seen[name] = seen.get(name, 0) + 1
+    clashing = sum(count for count in seen.values() if count > 1)
+    if clashing:
+        raise ToolInputError(
+            f"'surfaces': {clashing} of {len(found)} surfaces share a file name "
+            f"with another surface in a different subfolder, and their "
+            f"explained outputs would overwrite each other. Give each surface "
+            f"a unique file name, or run with explain off."
+        )
+
+
 def resolve_device(requested: str) -> str:
     torch = import_torch()
     if requested == "cuda" and not torch.cuda.is_available():
@@ -101,10 +151,12 @@ def check_backbone_is_staged() -> None:
     cached = backbone_cache_path()
     if os.path.isfile(cached):
         return
-    raise FileNotFoundError(
-        f"The EfficientNet backbone '{BACKBONE_FILE}' is not staged. shapeaxi "
-        f"builds it around every checkpoint and would otherwise download it "
-        f"mid-request, which a server holding patient data must not do. Stage "
+    # ToolUnavailableError, not FileNotFoundError: the server reads the
+    # latter as the caller's fault, and no request can stage a file here.
+    raise ToolUnavailableError(
+        f"The EfficientNet backbone '{BACKBONE_FILE}' is not staged on this "
+        f"server. shapeaxi builds it around every checkpoint and would "
+        f"otherwise download it mid-request, which a server holding patient data must not do. Stage "
         f"it at '{cached}' (from {BACKBONE_URL}), or point TORCH_HOME at a "
         f"directory that already holds it."
     )
@@ -132,7 +184,8 @@ def allow_checkpoint_globals() -> None:
     torch.serialization.add_safe_globals(allowed)
 
 
-def load_network(checkpoint: str, network_name: str, device: str):
+def load_network(checkpoint: str, network_name: str, device: str,
+                 anatomy: str = "the requested analysis"):
     """The shapeaxi network named by the checkpoint's row in the catalog.
 
     Resolved from `saxi_nets_lightning`, which is where these two classes live.
@@ -143,17 +196,39 @@ def load_network(checkpoint: str, network_name: str, device: str):
     # shapeaxi is a startup-shaped mistake, and saying so costs no filesystem.
     network_class = getattr(saxi_nets_lightning, network_name, None)
     if network_class is None:
-        raise ValueError(
+        # RuntimeError, not ValueError: this is the server's installation
+        # disagreeing with itself, and nothing the caller sends will fix it.
+        raise RuntimeError(
             f"shapeaxi {_shapeaxi_version()} has no `{network_name}` in "
             f"saxi_nets_lightning. The checkpoint catalog and the installed "
             f"shapeaxi disagree."
         )
     check_backbone_is_staged()
     allow_checkpoint_globals()
-    model = network_class.load_from_checkpoint(checkpoint, strict=False)
-    model.eval()
-    model.to(device)
+    # Said before the call: a failed load's own message is a long Lightning or
+    # pickle traceback whose useful part is its last line, and the operator
+    # needs to know what was being attempted to read it.
+    logger.info("loading %s checkpoint for %s on %s", network_name, anatomy, device)
+    try:
+        model = network_class.load_from_checkpoint(checkpoint, strict=False)
+        model.eval()
+        model.to(device)
+    except Exception as exc:
+        raise RuntimeError(
+            f"loading the {network_name} checkpoint on {device} failed: "
+            f"{last_line(exc)}"
+        ) from exc
     return model
+
+
+def last_line(exc: BaseException) -> str:
+    """The last non-empty line of an exception's message, with its class.
+
+    Third-party loaders put the actual cause at the end of a long message,
+    and the server cuts long reasons from the end.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return f"{type(exc).__name__}: {lines[-1] if lines else ''}".rstrip(": ")
 
 
 def _shapeaxi_version() -> str:

@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import shutil
+from collections import Counter
 
 from . import catalogs
 from . import markups
@@ -166,7 +167,13 @@ def orient(
         "reference": os.path.basename(str(reference_path).rstrip(os.sep)),
         "cases": {},
     }
+    logger.info("ASO: %s, %s", modality, automation)
 
+    # Patients whose failure was the caller's own input -- an unreadable scan,
+    # no landmarks to register on. Kept apart so that a run where EVERY
+    # patient failed that way is answered as the caller's to fix (422), and
+    # any other total failure as the server's (500).
+    input_faults = set()
     try:
         input_root = _as_directory(input_path, os.path.join(work_dir, "input"))
         reference_root = _as_directory(reference_path, os.path.join(work_dir, "reference"))
@@ -198,6 +205,7 @@ def orient(
                 seed=seed,
                 report=report,
                 sup=sup,
+                input_faults=input_faults,
             )
         else:
             _run_ios(
@@ -220,7 +228,7 @@ def orient(
         # what is left under output_dir is results and nothing else.
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    _summarize(report)
+    _summarize(report, input_faults)
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
 
@@ -611,7 +619,9 @@ def _collect(output_dir: str) -> dict:
 def _run_cbct(
     input_root, reference_root, automation, requested, landmarks_path, landmark_model,
     dicom_input, output_dir, work_dir, suffix, max_triplets, seed, report, sup,
+    input_faults=None,
 ) -> None:
+    input_faults = input_faults if input_faults is not None else set()
     # Asked of the DATA, not of the caller. DICOM slices routinely carry no
     # extension, so a clinician could not tell from a file name either -- and
     # answering wrong produced a run that failed for a reason nobody could see.
@@ -635,6 +645,19 @@ def _run_cbct(
     # "there are no scans here" is the useful answer, and complaining about the
     # landmark selection first would bury it.
     _check_selection_against_reference(requested, reference_landmarks)
+    logger.info("ASO CBCT: %d patient(s), %d landmark(s) requested",
+                len(patients), len(requested))
+    # Every log line about a patient leads with its position in the whole
+    # cohort, never its key: the key is the scan's name.
+    position = {key: index for index, key in enumerate(sorted(patients), start=1)}
+    total = len(patients)
+
+    def failed(key, step, reason, caller_input=False):
+        logger.warning("patient %d of %d: %s failed (%s)",
+                       position[key], total, step, reason)
+        report["cases"][key] = {"status": "failed", "reason": reason}
+        if caller_input:
+            input_faults.add(key)
 
     # A supplied landmark folder makes a fully-automated run behave like a
     # semi-automated one: the points are the caller's, wherever they came from.
@@ -726,7 +749,11 @@ def _run_cbct(
         try:
             image, translation = cbct_pipeline.prepare(entry["scan"], destination)
         except RuntimeError as exc:
+            # ITK's read error: the scan the caller sent is not one it can open.
+            logger.warning("patient %d of %d: reading the scan failed (%s: %s)",
+                           position[key], total, type(exc).__name__, exc)
             report["cases"][key] = {"status": "failed", "reason": str(exc)}
+            input_faults.add(key)
             continue
         prepared[key] = {
             # Kept in RAM only when it is used next -- a predicted patient's
@@ -748,10 +775,27 @@ def _run_cbct(
         _predict_landmarks(centered_root, landmark_model, requested, work_dir, sup)
         if to_predict else {}
     )
+    if to_predict:
+        # Compared with what was SENT. The nested call succeeds as a whole when
+        # it placed landmarks on any scan at all, so a scan it returned nothing
+        # for -- or a file whose name matched no patient -- is only visible
+        # here.
+        sent = [key for key in prepared if key in to_predict]
+        returned = [key for key in sent if predictions.get(key)]
+        unmatched = sorted(set(predictions) - set(sent))
+        logger.log(
+            logging.WARNING if len(returned) < len(sent) or unmatched else logging.INFO,
+            "%s returned landmarks for %d of %d scan(s); %d predicted file(s) "
+            "matched no scan",
+            LANDMARK_TOOL, len(returned), len(sent), len(unmatched),
+        )
     for key, entry in prepared.items():
         if key in to_predict:
             # Already in the centred space: the tool ran on the centred scans.
             entry["landmarks"] = predictions.get(key, {})
+            if not entry["landmarks"]:
+                logger.warning("patient %d of %d: %s returned no landmarks",
+                               position[key], total, LANDMARK_TOOL)
             continue
         # The caller's, moved into the centred space -- they describe the
         # ORIGINAL volume, wherever they came from, and the registration
@@ -759,7 +803,9 @@ def _run_cbct(
         found = (
             by_patient.get(key, {})
             if by_patient is not None
-            else cbct_pipeline.load_landmarks(patients[key]["markups"])
+            else cbct_pipeline.load_landmarks(
+                patients[key]["markups"], patient=(position[key], total)
+            )
         )
         entry["landmarks"] = cbct_pipeline.center_landmarks(found, entry["translation"])
 
@@ -770,25 +816,31 @@ def _run_cbct(
     for index, (key, entry) in enumerate(sorted(prepared.items()), start=1):
         progress.report(index, len(prepared), "orienting patient", start=registration_start)
         if not entry["landmarks"]:
-            report["cases"][key] = {
-                "status": "failed",
-                "reason": (
-                    "no predicted landmarks for this scan"
-                    if fully
-                    else _no_landmarks_reason(
-                        key,
-                        [] if supplied else patients[key]["markups"],
-                        orphans,
-                    )
+            predicted = key in to_predict
+            failed(
+                key, "landmark lookup",
+                f"no landmarks predicted by {LANDMARK_TOOL} for this scan"
+                if predicted
+                else _no_landmarks_reason(
+                    key,
+                    [] if supplied else patients[key]["markups"],
+                    orphans,
                 ),
-            }
+                # Landmarks the caller was to send are the caller's to fix;
+                # ones the landmark tool failed to place are not.
+                caller_input=not predicted,
+            )
             continue
-        image = entry["image"]
-        if image is None:
-            import SimpleITK as sitk  # local: only the fully-automated path re-reads
-
-            image = sitk.ReadImage(entry["centered_path"])
+        step = "re-reading the centred scan"
         try:
+            image = entry["image"]
+            if image is None:
+                import SimpleITK as sitk  # local: only the fully-automated path re-reads
+
+                # Inside the per-patient guard: a centred volume that cannot
+                # be read back used to stop the cohort at this patient.
+                image = sitk.ReadImage(entry["centered_path"])
+            step = "registration"
             report["cases"][key] = cbct_pipeline.orient_patient(
                 centered=image,
                 pre_transform=entry["translation"],
@@ -802,8 +854,9 @@ def _run_cbct(
                 max_triplets=max_triplets,
                 seed=seed,
             )
-        except cbct_pipeline.icp.RegistrationError as exc:
-            report["cases"][key] = {"status": "failed", "reason": str(exc)}
+        except (cbct_pipeline.icp.RegistrationError, RuntimeError, OSError) as exc:
+            failed(key, step, f"{type(exc).__name__}: {exc}"
+                   if not isinstance(exc, cbct_pipeline.icp.RegistrationError) else str(exc))
         entry["image"] = None  # a batch must not hold every volume in RAM
 
 
@@ -824,6 +877,8 @@ def _run_ios(
             f"token says which jaw it is (e.g. 'P1_U_Seg.vtk')."
         )
 
+    logger.info("ASO IOS: %d patient(s), %d tooth/teeth requested",
+                len(patients), len(teeth))
     report["requested_teeth"] = list(teeth)
     # Both are reported: which one a jaw used is decided per jaw, so a cohort
     # can legitimately have registered some on landmarks and some on centroids,
@@ -856,6 +911,7 @@ def _run_ios(
             max_triplets=max_triplets,
             seed=seed,
             cache=cache,
+            patient=(index, len(patients)),
         )
 
     # Unconditional now. It only fires when EVERY jaw failed for want of tooth
@@ -934,17 +990,50 @@ def _as_directory(path: str, destination: str) -> str:
     return destination
 
 
-def _summarize(report: dict) -> None:
+def _short(text, limit: int = 200) -> str:
+    """The first line of a reason, cut to fit in front of a count.
+
+    The server keeps only the first few hundred characters of a failed run's
+    message, and the count that follows the reason is what says how much of
+    the cohort it cost.
+    """
+    lines = str(text).strip().splitlines()
+    first = lines[0] if lines else ""
+    return first if len(first) <= limit else first[: limit - 3] + "..."
+
+
+def _summarize(report: dict, input_faults=frozenset()) -> None:
+    """Count the outcome, say it, and refuse a run that oriented nobody.
+
+    A run with no patient oriented used to return success with an empty output
+    folder. It raises now, led by the count and the reason most patients
+    failed for -- the report holding the per-patient reasons is deleted with
+    the job directory when a run fails, so this message is all that is left.
+    """
     statuses = [entry.get("status") for entry in report["cases"].values()]
     report["summary"] = {
         "cases": len(statuses),
         "oriented": statuses.count("ok"),
         "failed": statuses.count("failed"),
     }
-    logger.info(
-        "%s %s: %d/%d oriented",
-        report["modality"],
-        report["automation"],
-        report["summary"]["oriented"],
-        report["summary"]["cases"],
+    summary = report["summary"]
+    logger.log(
+        logging.WARNING if summary["failed"] else logging.INFO,
+        "%s %s: %d of %d patients oriented, %d failed",
+        report["modality"], report["automation"],
+        summary["oriented"], summary["cases"], summary["failed"],
     )
+    if summary["cases"] and not summary["oriented"]:
+        reasons = [
+            entry.get("reason") or entry.get("status") or "unknown"
+            for entry in report["cases"].values()
+        ]
+        reason, count = Counter(reasons).most_common(1)[0]
+        message = (
+            f"0 of {summary['cases']} patients oriented; most common failure: "
+            f"{_short(reason)} ({count} of {summary['cases']})"
+        )
+        if set(report["cases"]) <= set(input_faults):
+            # Every patient failed on what the caller sent: their fix, a 422.
+            raise ToolInputError(message)
+        raise RuntimeError(message)
