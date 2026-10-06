@@ -183,21 +183,28 @@ def predict_ios_landmarks(sup, mesh_dir: str, model_path: str, span=None) -> str
 
 
 def orient_cbct(sup, scan_dir: str, reference_path: str, landmark_model: str = "",
-                span=None) -> str:
+                span=None, frame: str = "") -> str:
     """Put the CBCT in the reference frame before anything is matched onto it.
 
     ASO's fully-automated CBCT mode: it predicts its own landmarks and registers
     the scan onto the gold reference. Upstream reaches this through three
     separate CLI modules (PRE_ASO_CBCT, SEMI_ASO_CBCT, PRE_ASO_IOS); ours is one
     tool taking the mode as data.
+
+    `frame` is named in ASO's own words and ASO resolves the reference bundle
+    that defines it: the bundles are ASO's. `reference_path` is an override for
+    a caller that named one, and wins when given.
     """
     _waypoint(sup, span, "orienting the CBCT with ASO")
     parameters = {
         "input": scan_dir,
-        "reference": reference_path,
         "modality": "CBCT",
         "automation": "Fully-Automated",
     }
+    if reference_path:
+        parameters["reference"] = reference_path
+    elif frame:
+        parameters["frame"] = frame
     if landmark_model:
         parameters["landmark_model"] = landmark_model
     return _returned(sup.run("ASO", **parameters, **_span(span)))

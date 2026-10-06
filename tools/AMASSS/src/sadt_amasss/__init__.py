@@ -8,7 +8,39 @@ from pathlib import Path
 from typing import Literal
 
 from .catalog import merge_modes, structure_codes
+from .errors import ToolInputError
 from .pipeline import segment
+
+
+# The DATA folder this tool's weights live in, and the one bundle inside it.
+# Written rather than derived, for the reason ALI_CBCT gives about its own:
+# which folder serves which tool is a deployment fact, and this is the name
+# `scripts/data-manifest.yml` unpacks AMASSS's archive to.
+#
+# There is a single AMASSS model, and AMASSS owns it. A neighbour that needs
+# masks -- AREG, VFACE -- asks for structures and names no weights, the way
+# ASO asks ALI_CBCT for landmarks: holding the name of another tool's bundle
+# meant holding a copy of it under its own data folder too.
+_DATA_NAME = "AMASSS"
+_BUNDLE = "AMASSS_Models"
+
+
+def _own_bundle(data_root) -> Path:
+    """`<root>/AMASSS/models/AMASSS_Models`, or a refusal a caller can act on."""
+    if data_root is None:
+        raise ToolInputError(
+            "No 'model' given and no data root to look in. Name the model "
+            "bundle, or run this through a server that publishes one."
+        )
+    bundle = Path(data_root) / _DATA_NAME / "models" / _BUNDLE
+    if not bundle.is_dir():
+        raise ToolInputError(
+            f"No 'model' given, and this deployment has no '{_BUNDLE}' bundle in "
+            f"the {_DATA_NAME} models folder of its data root. Install it with "
+            f"the setup-models script for the {_DATA_NAME} tool, or name a bundle "
+            "in 'model'."
+        )
+    return bundle
 
 
 # Two caveats that used to sit in `run()`'s docstring, and so in the panel:
@@ -19,8 +51,12 @@ from .pipeline import segment
 # to read while choosing what to segment.
 def run(
     scans: Path,
-    model: Path,
     output_dir: Path,
+    # After `output_dir` and optional, which is the shape that lets a neighbour
+    # ask for masks WITHOUT naming weights -- the shape ALI_CBCT took for the
+    # same reason. Empty means "my own", resolved below from this tool's data
+    # folder. Over HTTP nothing changes: the server still fills it.
+    model: Path = "",
     # The options are spelled out because `Literal` takes literals only -- it
     # cannot be built from catalog.STRUCTURE_CODES. That makes this a second
     # declaration of the same set, which is the thing this contract otherwise
@@ -39,6 +75,7 @@ def run(
     num_workers: int = 0,
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Segment craniofacial structures on a CBCT scan.
 
@@ -48,7 +85,8 @@ def run(
             recursively, and files that look like a previous AMASSS output are
             skipped so a folder can be re-run in place.
         model: The model bundle: one subfolder per structure code (MAND/, MAX/,
-            ...), each holding an nnUNet v2 model.
+            ...), each holding an nnUNet v2 model. Left empty, the bundle this
+            deployment publishes for AMASSS is used.
         output_dir: Where results are written -- one `<scan>_<ID>_SegOut/`
             folder per scan, plus `AMASSS_report.json`. Nothing is written
             outside it.
@@ -92,7 +130,9 @@ def run(
     output_dir = Path(output_dir)
     segment(
         input_path=Path(scans),
-        model_path=Path(model),
+        # Its OWN bundle when nobody named one. A caller that names a bundle
+        # is pinning which weights ran and is obeyed.
+        model_path=Path(model) if model else _own_bundle(data_root),
         output_dir=output_dir,
         structures=structure_codes(structures),
         merge=merge_modes(merge),

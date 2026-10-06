@@ -80,9 +80,9 @@ LAYOUT = {
     # under the shared name would have made the facade refuse to publish at all.
     # AREG_IOSCBCT names its own `cbct_reference` for exactly this reason.
     #
-    # Not offered: one frame the chain expects (dispatch._own_bundle), so there
-    # is nothing here for a clinician to decide and a wrong pick is a chain
-    # oriented into the wrong reference.
+    # Not offered: there is one intraoral reference and it is ASO's, which ASO
+    # resolves itself, so there is nothing here for a clinician to decide and a
+    # wrong pick is a chain oriented into the wrong reference.
     "ios_reference": {
         "hidden": True,
         "section": _REGISTRATION, "label": "Orientation reference", "visible_when": _FULLY,

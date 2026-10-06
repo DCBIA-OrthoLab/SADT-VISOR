@@ -72,63 +72,28 @@ class RegistrationRun:
 
 
 
-# The DATA folder this tool's bundles live in, and the segmentation bundle
-# inside it. Written rather than derived, for the reason ALI_CBCT gives about
-# its own: which folder serves which engine is a DEPLOYMENT fact (AREG_CBCT,
-# AREG_IOS and AREG_IOSCBCT share `DATA/AREG/`), and a wrong guess is a folder
-# that is simply not there.
-#
-# The bundle name is the one `scripts/data-manifest.yml` unpacks AMASSS's
-# archive to for AREG, so an installation set up by `setup-models.sh` has it
-# without anybody choosing anything.
-_DATA_NAME = "AREG"
-_SEGMENTATION_BUNDLE = "AMASSS_Models"
-# Which bundle each frame is defined by lives in the shared catalog
-# (`catalogs.ORIENTATION_BUNDLES`), because the panel offers the frame by name
-# and this resolves the name -- one table, read from both ends.
+# The frame each `orientation` asks ASO for, in ASO's own words. ASO owns the
+# reference bundles that define its frames and resolves the one a frame names
+# from its own data folder; AREG names the frame and holds no copy. Written as
+# a table rather than passed through because the two vocabularies are two
+# tools' published schemas, which happen to agree today.
+ASO_FRAMES = {
+    catalogs.ORIENTATION_FRANKFURT: "Frankfurt horizontal",
+    catalogs.ORIENTATION_OCCLUSAL: "Occlusal plane",
+}
 
 
-def _own_segmentation(data_root):
-    """The AMASSS bundle this deployment publishes for AREG, or "".
+def _named_reference(reference) -> str:
+    """A reference bundle the caller actually named, or "".
 
-    There is nothing for a clinician to decide here: the modes that segment
-    segment with AMASSS, and the only bundle that answers is the one the
-    deployment already holds. Asking which folder to use was asking a question
-    with one possible answer -- and one that a caller could get wrong in ways
-    that only surface fifteen seconds into a child process.
-
-    Returns "" rather than raising, so the single refusal below keeps saying
-    what is missing, now including where this looked.
+    `reference` carries `server_selectable = "model"`, so a request that names
+    nothing arrives holding `DATA/AREG/models/` -- the FOLDER, which is no
+    bundle and which ASO cannot orient onto. That is "not named", and the
+    frame `orientation` names answers instead.
     """
-    if not data_root:
+    if not reference or os.path.basename(str(reference).rstrip(os.sep)) == "models":
         return ""
-    candidate = os.path.join(str(data_root), _DATA_NAME, "models", _SEGMENTATION_BUNDLE)
-    return candidate if os.path.isdir(candidate) else ""
-
-
-def _own_reference(data_root, orientation: str) -> str:
-    """The bundle this deployment publishes for the frame `orientation` names.
-
-    A reference defines its frame through what it CARRIES -- the two published
-    bundles hold disjoint landmark sets -- so naming the frame is naming the
-    bundle, and this is the whole of the translation.
-
-    Two reasons the path is resolved here rather than asked for. `reference`
-    carries `server_selectable = "model"`, so a request that names nothing
-    arrives holding `DATA/AREG/models/`: the FOLDER, eight bundles deep, which
-    ASO cannot orient onto. And a dropdown of bundle FOLDERS asks a clinician to
-    recognise `CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane` where the
-    question is "Frankfurt horizontal or occlusal plane".
-
-    Returns "" for the frame that is no frame, and for a deployment that does
-    not publish the bundle -- the refusal in `_check_cbct` then keeps saying what
-    is missing.
-    """
-    bundle = catalogs.ORIENTATION_BUNDLES.get(str(orientation or ""))
-    if not data_root or not bundle:
-        return ""
-    candidate = os.path.join(str(data_root), _DATA_NAME, "models", bundle)
-    return candidate if os.path.isdir(candidate) else ""
+    return str(reference)
 
 
 def derive_automation(automation: str, t1_masks,
@@ -171,7 +136,7 @@ def derive_automation(automation: str, t1_masks,
 
 
 def _check_cbct(automation: str, regions: list, t1_masks, reference,
-                segmentation_model=None, sup=None, landmark_model=None) -> None:
+                sup=None, landmark_model=None, frame=None) -> None:
     if not regions:
         raise ToolInputError(
             "Select at least one anatomical region to register on in 'cbct_regions' "
@@ -194,13 +159,11 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
     tools.require(sup, "AMASSS", f"{automation} CBCT registration")
     if automation == catalogs.AUTOMATION_ORIENTED:
         tools.require(sup, "ASO", "Oriented + Fully-Automated CBCT registration")
-        if not reference:
+        if not reference and not frame:
             raise ToolInputError(
                 "Oriented + Fully-Automated CBCT orients the T1 scans before "
-                "registering onto them, which needs an orientation reference, and "
-                "this deployment publishes none for the frame asked for: pick a "
-                "frame in 'orientation' whose bundle is installed, or name a "
-                "bundle from this tool's data listing in 'cbct_reference'."
+                "registering onto them, which needs a frame to orient into: pick "
+                "one in 'orientation', or name a reference bundle in 'reference'."
             )
         # `landmark_model` is NOT required here any more. Which weights the
         # landmark tool predicts with is that tool's business -- ALI_CBCT
@@ -208,20 +171,9 @@ def _check_cbct(automation: str, regions: list, t1_masks, reference,
         # comment says it should -- and demanding a name here made AREG hold a
         # name for its neighbour's storage. An explicit one is still obeyed.
 
-    if not segmentation_model:
-        # Named here rather than left to AMASSS, which receives None and fails on
-        # `TypeError: expected str, bytes or os.PathLike object, not NoneType` --
-        # fifteen seconds in, from inside a child process, and opaque to whoever
-        # sent the request. The tool is reachable; what is missing is which
-        # weights it should load.
-        raise ToolInputError(
-            f"{automation} CBCT segments the T1 scans before registering, which "
-            f"needs the segmentation weights. This deployment publishes none: the "
-            f"{_DATA_NAME} models folder of the data root holds no "
-            f"'{_SEGMENTATION_BUNDLE}' bundle. Install it with the setup-models "
-            f"script for the {_DATA_NAME} tool, or name another bundle from this "
-            f"tool's data listing in 'segmentation_model'."
-        )
+    # `segmentation_model` is NOT required either, for the same reason: there
+    # is one AMASSS model, AMASSS resolves it from its own data folder and says
+    # so itself when the deployment lacks it. An explicit one is still obeyed.
 
 
 
@@ -325,6 +277,7 @@ def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
     suffix, report, sup=None, landmark_model=None, segmentations=None, num_workers=0,
+    orientation_frame="",
 ) -> None:
     # Imported here rather than at module level: the CBCT engine pulls in
     # SimpleITK and itk-elastix, and AREG must load on a server without them so
@@ -381,9 +334,10 @@ def _run_cbct(
         sent = tools.count_scans(t1_root)
         oriented = tools.orient_scans(
             sup,
-            t1_root, orientation_reference, catalogs.MODALITY_CBCT,
+            t1_root, orientation_reference or "", catalogs.MODALITY_CBCT,
             landmark_model=landmark_model or "",
             span=orient_span,
+            frame=orientation_frame,
         )
         # ASO drops a scan it cannot orient rather than failing the run, and a
         # dropped T1 surfaces below as a subject nobody paired -- which reads as
@@ -771,6 +725,7 @@ def register(
         segmentation_model=segmentation_model,
         segmentation_label=int(segmentation_label or 0),
         orientation_reference=orientation_reference,
+        orientation_frame=ASO_FRAMES.get(str(orientation or ""), ""),
         dicom_input=dicom_input,
         output_dir=output_dir,
         work_dir=work_dir,
@@ -810,7 +765,6 @@ def main(
     output_suffix="Reg",
     output_dir=None,
     sup=None,
-    data_root=None,
     num_workers=0,
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
@@ -834,27 +788,19 @@ def main(
         )
 
     regions = _selected(cbct_regions, catalogs.REGION_CHOICES)
-    reference = cbct_reference
-    # Resolved BEFORE the checks, so the refusal below judges what will
-    # actually be loaded rather than what the caller happened to name.
-    if not segmentation_model:
-        segmentation_model = _own_segmentation(data_root)
-    # Same treatment, and the hidden field makes it the only one: a `reference`
-    # nobody named arrives as the whole models FOLDER (see `_own_reference`), so
-    # "did the caller name one" is asked of the bundle, not of the string.
-    # A `reference` nobody named arrives as the whole models FOLDER (see
-    # `_own_reference`), so "did the caller name a bundle" is asked of the
-    # bundle, not of the string -- and the frame the panel offered answers it.
-    if not reference or os.path.basename(str(reference).rstrip(os.sep)) == "models":
-        reference = _own_reference(data_root, orientation) or reference
+    # Neither AMASSS's weights nor ASO's reference bundles are resolved here:
+    # each of those tools owns its model and finds its own. AREG sends the
+    # structures it wants and the frame `orientation` names. A bundle the
+    # caller named explicitly is still forwarded, as an override.
+    reference = _named_reference(cbct_reference)
     # The checks judge the mode that will RUN, not the word the request carried:
     # with `automation` left on its default, that word names no mode. `register`
     # derives it again from the same inputs, so the rule lives in one place and
     # the report says which of the two it was.
     resolved, _source = derive_automation(automation, t1_masks, orientation)
     _check_cbct(
-        resolved, regions, t1_masks, reference, segmentation_model, sup,
-        landmark_model,
+        resolved, regions, t1_masks, reference, sup, landmark_model,
+        frame=ASO_FRAMES.get(str(orientation or "")),
     )
 
     run = register(

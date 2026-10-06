@@ -168,6 +168,17 @@ def test_the_orientation_request_is_asos_fully_automated_cbct_mode(tmp_path):
     assert params["landmark_model"] == "/models/ali"
 
 
+def test_with_no_reference_named_aso_is_asked_for_the_frame(tmp_path):
+    """The reference bundles are ASO's own: this engine names the frame and
+    hands over none of them."""
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted(tmp_path, "or")})
+    tools.orient_cbct(sup, str(tmp_path / "cbct"), "", frame="Frankfurt horizontal")
+
+    params = sup.asked("ASO")
+    assert params["frame"] == "Frankfurt horizontal"
+    assert "reference" not in params
+
+
 def test_no_callee_is_told_where_to_write(tmp_path):
     """Where a supervised tool writes is the SUPERVISOR's business.
 
@@ -304,11 +315,16 @@ def test_fully_automated_orients_the_cbct_first(tmp_path):
     assert sup.asked("ALI_CBCT")["input"] == str(tmp_path / "cbct")
 
 
-def test_fully_automated_without_a_reference_is_refused_before_anything_runs(tmp_path):
+def test_fully_automated_asks_aso_for_its_frame_and_no_bundle(tmp_path):
+    """Every tool owns its model. With no reference named, ASO is asked for
+    the Frankfurt horizontal frame by name and resolves its own bundle; this
+    engine no longer refuses for a bundle it was never meant to hold."""
     sup, arguments = semi_automated(tmp_path, automation=catalogs.AUTOMATION_FULLY)
-    with pytest.raises(ToolInputError, match="cbct_reference"):
-        dispatch.main(**arguments)
-    assert sup.calls == []
+    dispatch.main(**arguments)
+
+    params = sup.asked("ASO")
+    assert params["frame"] == "Frankfurt horizontal"
+    assert "reference" not in params
 
 
 def test_a_sibling_tool_failing_takes_the_run_with_it(tmp_path):

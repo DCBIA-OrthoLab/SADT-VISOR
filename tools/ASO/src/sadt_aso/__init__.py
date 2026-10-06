@@ -23,8 +23,18 @@ CASE_INPUT = "input"
 
 def run(
     input: Path,
-    reference: Path,
     output_dir: Path,
+    # After `output_dir` and optional, which is the shape that lets a neighbour
+    # ask for an orientation WITHOUT naming one of this tool's bundles -- the
+    # shape ALI_CBCT and AMASSS took for the same reason. Empty means "my own":
+    # the bundle `frame` names, or the one the selection needs, resolved from
+    # this tool's data folder.
+    reference: Path = "",
+    # Spelled out because `Literal` takes literals only -- it cannot be built
+    # from catalogs.FRAME_CHOICES. A test asserts the two agree.
+    frame: Literal[
+        "From the landmarks", "Frankfurt horizontal", "Occlusal plane"
+    ] = "From the landmarks",
     modality: Literal["CBCT", "IOS"] = "CBCT",
     automation: Literal["Semi-Automated", "Fully-Automated"] = "Semi-Automated",
     landmarks: Path = "",
@@ -69,6 +79,7 @@ def run(
     seed: int = 0,
     *,
     sup=None,
+    data_root=None,
 ) -> Path:
     """Orient CBCT scans or intra-oral scans onto a standard reference frame.
 
@@ -78,11 +89,19 @@ def run(
             Folders are searched recursively and the output keeps their tree.
             In Semi-Automated mode the landmark files (.mrk.json) travel beside
             the scans, paired by name.
-        reference: The already-oriented case defining the target frame -- its
-            landmark file for CBCT, its landmarks and meshes for IOS.
         output_dir: Where results are written -- per patient, the oriented scan,
             its landmarks and the transform (.tfm) -- plus `ASO_report.json`.
             Nothing is written outside it.
+        reference: The already-oriented case defining the target frame -- its
+            landmark file for CBCT, its landmarks and meshes for IOS -- or a
+            folder of such bundles to choose from. Left empty, this tool's own
+            bundles are used.
+        frame: Which CBCT frame to orient into, by name. Left on "From the
+            landmarks", the reference is the one carrying every landmark
+            selected; naming a frame picks the bundle that defines it, which
+            is how another tool asks for a frame without holding this tool's
+            files. With `cbct_landmarks` sent empty, the landmarks registered
+            on are the ones that frame's reference defines.
         modality: CBCT volumes or intra-oral surface scans. Never inferred from
             the file extension: a folder can hold either, and guessing wrong
             means orienting a patient against the wrong reference and calling
@@ -104,8 +123,9 @@ def run(
             missed that rule by one letter and would have asked for a 4.7 GB
             bundle from a laptop.
         cbct_landmarks: Which landmarks to register on; at least 3, and they
-            must exist in the reference. The default seven are the points both
-            published reference bundles are built on.
+            must exist in the reference. The default seven are the points the
+            Frankfurt horizontal reference is built on. Sent empty, every
+            landmark the reference defines.
         ios_teeth: Which teeth to register on, 3 or 4 spread across each arch.
         ios_landmark_types: Which point on each tooth, combined with the teeth
             above into `<tooth><type>` keys, e.g. UR6 x O -> UR6O. Used for the
@@ -133,8 +153,10 @@ def run(
     output_dir = Path(output_dir)
     orient(
         input_path=str(input),
-        reference_path=str(reference),
+        reference_path=str(reference) if reference else "",
         output_dir=str(output_dir),
+        frame=frame,
+        data_root=data_root,
         modality=modality,
         automation=automation,
         cbct_landmarks=cbct_landmarks,

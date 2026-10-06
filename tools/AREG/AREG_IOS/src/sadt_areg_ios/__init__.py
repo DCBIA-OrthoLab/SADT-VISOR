@@ -56,7 +56,8 @@ def run(
         automation: Semi-Automated takes meshes that already carry their tooth
             labels and orientation; Fully-Automated labels and orients them
             first, through the crown-segmentation and orientation tools.
-        ios_reference: The frame the arches are oriented onto before registering.
+        ios_reference: A reference to orient the arches onto instead of the
+            one ASO holds. Left empty -- the normal case -- ASO uses its own.
         patch: Which part of the arch to match on -- the palate for an upper
             arch, the band around the mucogingival line for a lower one.
         registration_model: The model that finds the palatal patch. Not used by

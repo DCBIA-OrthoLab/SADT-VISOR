@@ -219,15 +219,12 @@ def _orient(sup, scans_dir: str, work_dir: str, reference_of: dict,
     oriented = {}
     spans = tools.split_span(span, [1] * len(catalogs.FRAMES))
     for (frame, entry), frame_span in zip(catalogs.FRAMES.items(), spans):
-        reference = reference_of.get(frame)
-        if not reference:
-            raise ToolInputError(
-                f"Orienting into the {entry['reference']} frame needs its reference "
-                f"case, and none was named."
-            )
+        # The frame, by name: ASO resolves the reference bundle that defines
+        # it. A reference the caller named is an override, forwarded as is.
         oriented[frame] = tools.orient_scans(
-            sup, scans_dir, reference, entry["landmarks"], entry["suffix"],
+            sup, scans_dir, entry["aso_frame"], entry["landmarks"], entry["suffix"],
             landmark_model, label=frame, span=frame_span,
+            reference=reference_of.get(frame) or "",
         )
     return oriented
 
@@ -439,24 +436,25 @@ def _short(region: str) -> str:
 
 # Which DATA folder this tool's bundles live in, and the name of each. Written
 # rather than derived: which folder serves which tool is a deployment fact, and
-# these are the names the manifest unpacks those archives to.
+# these are the names the manifest unpacks those archives to (a test reads the
+# manifest and holds the two together).
 #
-# Resolved here rather than asked of the caller, for the reason the three AREG
-# engines resolve theirs: `models/` holds all six bundles at once, so an unnamed
-# argument arrived as that FOLDER -- which is not a bundle -- and the run died
-# after the segmentation and the orientation had already been paid for. None of
-# them is a clinical choice either: one classifier, one mirror transform, one
-# reference per frame.
+# Resolved here rather than asked of the caller: `models/` holds every bundle
+# at once, so an unnamed argument arrived as that FOLDER -- which is not a
+# bundle -- and the run died after the segmentation and the orientation had
+# already been paid for. None of them is a clinical choice either: one
+# classifier, one mirror transform, one measurement list per region.
 #
-# `landmark_model` is absent on purpose. ALI_CBCT resolves its own weights from
-# the same data root, so the empty string it gets here is the right answer, not
-# an omission.
+# ONLY VFACE's own bundles. Every tool owns its model: AMASSS resolves its own
+# segmentation weights, ASO the reference bundle of the frame it is asked for,
+# ALI_CBCT its landmark weights. `segmentation_model`, `cranial_base_reference`,
+# `maxilla_reference` and `landmark_model` are therefore absent on purpose --
+# left empty they are not sent at all, and the callee answers from its own data
+# folder. Holding their names here meant keeping copies of AMASSS's and ASO's
+# bundles under DATA/VFACE/, which is exactly what a deployment did not have.
 _DATA_NAME = "VFACE"
 _BUNDLES = {
-    "segmentation_model": "AMASSS_Models",
     "classifier_model": "VFACE_classifier",
-    "cranial_base_reference": "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
-    "maxilla_reference": "CBCT_Gold_Occlusal_Midsagittal_Plane",
     "mirror_reference": "Mirror_matrix",
     "measurements": "DefaultList",
     "feature_template": "DefaultList",
@@ -485,11 +483,9 @@ def main(t1, output_dir, mode=None, study=None, outputs=None, regions=None,
     # checks below then see a real bundle, and their message stays about what is
     # missing from the DEPLOYMENT rather than about a field the panel no longer
     # shows. `feature_template` is a file inside its bundle, not the bundle.
-    segmentation_model = segmentation_model or _own_bundle(data_root, "segmentation_model")
+    # The segmentation model and the two orientation references are NOT filled:
+    # they are AMASSS's and ASO's, and those tools resolve their own.
     classifier_model = classifier_model or _own_bundle(data_root, "classifier_model")
-    cranial_base_reference = cranial_base_reference or _own_bundle(
-        data_root, "cranial_base_reference")
-    maxilla_reference = maxilla_reference or _own_bundle(data_root, "maxilla_reference")
     mirror_reference = mirror_reference or _own_bundle(data_root, "mirror_reference")
     measurements = measurements or _own_bundle(data_root, "measurements")
     if not feature_template:
@@ -570,11 +566,9 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
         tools.require(sup, "AREG_CBCT", "A mode that registers")
         if study == catalogs.STUDY_ASYMMETRY:
             tools.require(sup, "AutoMatrix", "An asymmetry assessment")
-        if not segmentation_model:
-            raise ToolInputError(
-                "Registering needs masks around the regions measured, and "
-                "'segmentation_model' names the bundle that makes them."
-            )
+        # `segmentation_model` is NOT required, for the reason `landmark_model`
+        # is not below: AMASSS resolves its own weights from the deployment's
+        # data folder. An explicit one is still obeyed.
     if wants_measurements:
         tools.require(sup, "ALI_CBCT", "Measuring")
         tools.require(sup, "AutoMatrix", "Measuring")
@@ -640,8 +634,8 @@ def _run(t1, output_dir, work_dir, mode, study, outputs, regions, t2,
         ]
         masks = {
             frame: tools.segment_masks(
-                sup, folder, segmentation_model, structures, label=frame,
-                span=frame_span,
+                sup, folder, structures, label=frame, span=frame_span,
+                model=segmentation_model,
             )
             for (frame, folder, structures), frame_span
             in zip(to_segment, tools.split_span(span, [1] * len(to_segment)))

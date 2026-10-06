@@ -174,8 +174,8 @@ def _oriented_run(tmp_path, sups=None):
         write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
         return out
 
-    reference = tmp_path / "reference"
-    reference.mkdir()
+    # No AMASSS model and no ASO reference: both tools resolve their own. The
+    # frame is what AREG asks ASO for.
     sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
     if sups is not None:
         sups.append(sup)
@@ -184,12 +184,63 @@ def _oriented_run(tmp_path, sups=None):
         t2_path=str(tmp_path / "T2"),
         automation=catalogs.AUTOMATION_ORIENTED,
         regions=["Cranial base"],
-        segmentation_model="/models/AMASSS",
-        orientation_reference=str(reference),
+        orientation=catalogs.ORIENTATION_FRANKFURT,
         output_dir=str(tmp_path / "out"),
         sup=sup,
     )
     return run, fixed
+
+
+def test_an_oriented_run_names_the_frame_and_none_of_its_neighbours_bundles(tmp_path):
+    """Every tool owns its model. ASO is asked for the frame by name and
+    handed none of its own reference bundles; AMASSS is asked for structures
+    and handed no weights. Each resolves its own from its own data folder."""
+    sups = []
+    _oriented_run(tmp_path, sups)
+    sup = sups[0]
+
+    (aso,) = [params for name, params in sup.calls if name == "ASO"]
+    assert aso["frame"] == "Frankfurt horizontal"
+    assert "reference" not in aso
+    # Empty: every landmark the frame's own reference defines, read by ASO.
+    assert aso["cbct_landmarks"] == []
+    (amasss,) = [params for name, params in sup.calls if name == "AMASSS"]
+    assert "model" not in amasss
+
+
+def test_a_bundle_the_caller_named_is_still_forwarded(tmp_path):
+    """An override, not the normal path: a reference or a segmentation model
+    named explicitly reaches the callee as named."""
+    fixed = phantom(origin=(-18.8, -18.8, -18.8))
+    moving, _truth = displaced(fixed)
+    write(fixed, tmp_path / "T1" / "P1_T1_scan.nii.gz")
+    write(moving, tmp_path / "T2" / "P1_T2_scan.nii.gz")
+    reference = tmp_path / "reference"
+    reference.mkdir()
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    dispatch.register(
+        t1_path=str(tmp_path / "T1"), t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+        orientation=catalogs.ORIENTATION_OCCLUSAL,
+        segmentation_model="/models/AMASSS", orientation_reference=str(reference),
+        output_dir=str(tmp_path / "out"), sup=sup,
+    )
+
+    sent = dict(sup.calls)
+    assert sent["ASO"]["reference"] == str(reference)
+    assert "frame" not in sent["ASO"]
+    assert sent["AMASSS"]["model"] == "/models/AMASSS"
 
 
 def test_an_oriented_run_moves_its_bar_forward_through_every_step(tmp_path, monkeypatch):
@@ -536,20 +587,16 @@ def test_masks_win_over_asking_for_an_orientation():
     assert mode == catalogs.AUTOMATION_SEMI
 
 
-def test_each_frame_resolves_to_its_own_bundle(tmp_path):
-    """A reference defines its frame through what it CARRIES, so naming the
-    frame is naming the bundle -- and the two carry disjoint landmark sets, which
-    is why one cannot stand in for the other."""
-    models = tmp_path / "AREG" / "models"
-    for bundle in catalogs.ORIENTATION_BUNDLES.values():
-        (models / bundle).mkdir(parents=True)
-
-    for frame, bundle in catalogs.ORIENTATION_BUNDLES.items():
-        assert dispatch._own_reference(str(tmp_path), frame) == str(models / bundle)
-
-    # The frame that is no frame resolves to nothing, rather than to the first
-    # bundle it finds.
-    assert dispatch._own_reference(str(tmp_path), catalogs.ORIENTATION_NONE) == ""
+def test_each_orientation_asks_aso_for_the_frame_aso_publishes():
+    """The bundles that define the frames are ASO's, so AREG names the frame
+    in ASO's own words and ASO resolves the bundle. Spelled out here rather
+    than imported: the two tools share no virtualenv."""
+    assert dispatch.ASO_FRAMES == {
+        catalogs.ORIENTATION_FRANKFURT: "Frankfurt horizontal",
+        catalogs.ORIENTATION_OCCLUSAL: "Occlusal plane",
+    }
+    # The frame that is no frame asks for nothing.
+    assert catalogs.ORIENTATION_NONE not in dispatch.ASO_FRAMES
 
 
 def test_the_orientation_reference_is_never_a_mode_signal():
@@ -601,44 +648,53 @@ def test_the_report_says_whether_anybody_chose_the_mode(tmp_path):
 # which ASO cannot orient onto. The field is hidden and the tool answers.
 
 
-def test_a_deployment_without_the_bundle_says_nothing_rather_than_guessing(tmp_path):
-    """Returns "" so the single refusal in `_check_cbct` keeps saying what is
-    missing, instead of handing ASO a path that is not there."""
-    (tmp_path / "AREG" / "models").mkdir(parents=True)
-
-    assert dispatch._own_reference(
-        str(tmp_path), catalogs.ORIENTATION_FRANKFURT
-    ) == ""
-
-
-def test_the_models_folder_is_not_mistaken_for_a_bundle(tmp_path):
+def test_the_models_folder_is_not_mistaken_for_a_named_bundle(tmp_path):
     """The whole point: `main` has to tell "the caller named a bundle" from
-    "the server filled this in with the folder holding all of them".
+    "the server filled this in with the folder holding all of them". The
+    folder is "not named", and the frame answers."""
+    models = tmp_path / "data" / "AREG" / "models"
+    models.mkdir(parents=True)
 
-    Asserted through `main`, because the discrimination lives there -- and a run
-    that got the folder died inside ASO, minutes in, on a path that looks
-    perfectly valid.
-    """
-    data_root = tmp_path / "data"
-    frame = catalogs.ORIENTATION_FRANKFURT
-    bundle = (data_root / "AREG" / "models"
-              / catalogs.ORIENTATION_BUNDLES[frame])
-    bundle.mkdir(parents=True)
-    cohort(tmp_path)
+    assert dispatch._named_reference(str(models)) == ""
+    assert dispatch._named_reference(str(models) + os.sep) == ""
+    assert dispatch._named_reference("") == ""
+    assert dispatch._named_reference(None) == ""
+    assert dispatch._named_reference("/own/reference") == "/own/reference"
 
-    with pytest.raises(Exception):  # noqa: B017 - no supervisor, so ASO is absent
-        dispatch.main(
-            automation=catalogs.AUTOMATION_ORIENTED,
-            t1=os.path.join(str(tmp_path), "T1"),
-            t2=os.path.join(str(tmp_path), "T2"),
-            cbct_regions=["Cranial base"],
-            cbct_reference=os.path.join(str(data_root), "AREG", "models"),
-            output_dir=os.path.join(str(tmp_path), "out"),
-            data_root=str(data_root),
-        )
-    # What matters is that the refusal is about the missing ASO tool, not about
-    # a reference -- the folder was replaced by the bundle before the check.
-    assert dispatch._own_reference(str(data_root), frame) == str(bundle)
+
+def test_the_models_folder_the_server_fills_in_never_reaches_aso(tmp_path):
+    """Asserted through `main`, because the discrimination lives there -- and a
+    run that got the folder died inside ASO, minutes in, on a path that looks
+    perfectly valid."""
+    fixed = phantom(origin=(-18.8, -18.8, -18.8))
+    moving, _truth = displaced(fixed)
+    write(fixed, tmp_path / "T1" / "P1_T1_scan.nii.gz")
+    write(moving, tmp_path / "T2" / "P1_T2_scan.nii.gz")
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    dispatch.main(
+        automation=catalogs.AUTOMATION_AUTO,
+        t1=str(tmp_path / "T1"), t2=str(tmp_path / "T2"),
+        cbct_regions=["Cranial base"],
+        cbct_reference=str(tmp_path / "data" / "AREG" / "models"),
+        orientation=catalogs.ORIENTATION_OCCLUSAL,
+        output_dir=str(tmp_path / "out"), sup=sup,
+    )
+
+    sent = dict(sup.calls)
+    assert "reference" not in sent["ASO"]
+    assert sent["ASO"]["frame"] == "Occlusal plane"
+    assert "model" not in sent["AMASSS"]
 
 
 def test_the_orientation_reference_is_not_put_to_the_reader():
@@ -819,27 +875,31 @@ def test_dicom_conversion_is_announced_and_its_failure_names_the_argument(tmp_pa
     assert messages[-1] == "converting DICOM (T1)"
 
 
-def test_the_missing_segmentation_bundle_is_described_not_pathed():
-    with pytest.raises(ToolInputError) as raised:
-        dispatch._check_cbct(
-            automation=catalogs.AUTOMATION_FULLY, regions=["Cranial base"],
-            t1_masks=None, reference=None, segmentation_model=None,
-            sup=FakeSup("/tmp/areg-rules"),
-        )
-    message = str(raised.value)
-    assert "'segmentation_model'" in message and "AMASSS_Models" in message
-    assert "/" not in message
+def test_no_segmentation_bundle_is_required_of_the_caller():
+    """There is one AMASSS model and AMASSS resolves it; the request is not
+    refused for a field nobody is meant to fill."""
+    assert dispatch._check_cbct(
+        automation=catalogs.AUTOMATION_FULLY, regions=["Cranial base"],
+        t1_masks=None, reference=None, sup=FakeSup("/tmp/areg-rules"),
+    ) is None
 
 
-def test_the_missing_reference_names_the_arguments_not_an_endpoint():
+def test_an_oriented_run_with_a_frame_needs_no_reference():
+    assert dispatch._check_cbct(
+        automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+        t1_masks=None, reference=None, sup=FakeSup("/tmp/areg-rules"),
+        frame="Frankfurt horizontal",
+    ) is None
+
+
+def test_the_missing_frame_names_the_arguments_not_an_endpoint():
     with pytest.raises(ToolInputError) as raised:
         dispatch._check_cbct(
             automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
-            t1_masks=None, reference=None, segmentation_model="/models/AMASSS",
-            sup=FakeSup("/tmp/areg-rules"),
+            t1_masks=None, reference=None, sup=FakeSup("/tmp/areg-rules"),
         )
     message = str(raised.value)
-    assert "'orientation'" in message and "'cbct_reference'" in message
+    assert "'orientation'" in message and "'reference'" in message
     assert "/" not in message
 
 

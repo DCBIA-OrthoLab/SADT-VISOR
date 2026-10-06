@@ -151,6 +151,82 @@ def test_run_accepts_the_old_display_names(tmp_path, stub_predictor):
 
 
 # ---------------------------------------------------------------------------
+# Its own bundle, when nobody names one
+# ---------------------------------------------------------------------------
+
+def test_with_no_model_named_it_segments_with_its_own_staged_bundle(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """What a neighbour calling through the supervisor relies on: it asks for
+    structures and names no weights, and AMASSS finds its single bundle under
+    its own data folder."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    data_root = tmp_path / "DATA"
+    own = _make_model_bundle(data_root / "AMASSS" / "models" / "AMASSS_Models", ["MAND"])
+    used = []
+    real_resolve = pipeline.resolve_models
+    monkeypatch.setattr(
+        pipeline, "resolve_models",
+        lambda model_path, structures: used.append(str(model_path))
+        or real_resolve(model_path, structures),
+    )
+
+    output = run(scans=tmp_path / "input", output_dir=tmp_path / "out",
+                 structures=["MAND"], data_root=data_root)
+
+    assert used == [own]
+    assert (output / "patient01_Pred_SegOut" / "patient01_Pred_MAND.nii.gz").is_file()
+
+
+def test_a_named_model_still_wins_over_its_own_bundle(tmp_path, stub_predictor, monkeypatch):
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    data_root = tmp_path / "DATA"
+    _make_model_bundle(data_root / "AMASSS" / "models" / "AMASSS_Models", ["MAND"])
+    named = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+    used = []
+    real_resolve = pipeline.resolve_models
+    monkeypatch.setattr(
+        pipeline, "resolve_models",
+        lambda model_path, structures: used.append(str(model_path))
+        or real_resolve(model_path, structures),
+    )
+
+    run(scans=tmp_path / "input", model=Path(named), output_dir=tmp_path / "out",
+        structures=["MAND"], data_root=data_root)
+
+    assert used == [named]
+
+
+def test_with_no_model_and_no_bundle_staged_it_says_what_to_install(tmp_path):
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    (tmp_path / "DATA" / "AMASSS" / "models").mkdir(parents=True)
+
+    with pytest.raises(ToolInputError, match="AMASSS_Models") as caught:
+        run(scans=tmp_path / "input", output_dir=tmp_path / "out",
+            data_root=tmp_path / "DATA")
+    assert "setup-models" in str(caught.value)
+
+
+def test_with_no_model_and_no_data_root_it_refuses_clearly(tmp_path):
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+
+    with pytest.raises(ToolInputError, match="No 'model' given"):
+        run(scans=tmp_path / "input", output_dir=tmp_path / "out")
+
+
+def test_model_is_optional_and_data_root_is_injected_not_published():
+    """Optional so a supervised call may omit it; `data_root` keyword-only and
+    unannotated, which is the shape the runner injects and `describe.py`
+    keeps out of the schema."""
+    import inspect
+
+    parameters = inspect.signature(run).parameters
+    assert parameters["model"].default == ""
+    assert parameters["data_root"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["data_root"].annotation is inspect.Parameter.empty
+
+
+# ---------------------------------------------------------------------------
 # split_scan_extension / is_previous_output
 # ---------------------------------------------------------------------------
 

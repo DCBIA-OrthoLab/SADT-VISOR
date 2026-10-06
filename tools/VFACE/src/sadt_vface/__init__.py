@@ -83,14 +83,18 @@ def run(
             measures, and what it refuses without -- the orientation transforms
             beside the scans are a different matrix, and using them would move
             the landmarks wrongly while the run reported success.
-        cranial_base_reference: The already-oriented case defining the
-            Frankfort horizontal and mid-sagittal frame.
-        maxilla_reference: The already-oriented case defining the occlusal and
-            mid-sagittal frame.
+        cranial_base_reference: An already-oriented case defining the
+            Frankfort horizontal and mid-sagittal frame, to use instead of the
+            one ASO holds for it. Left empty -- the normal case -- ASO orients
+            onto its own.
+        maxilla_reference: An already-oriented case defining the occlusal and
+            mid-sagittal frame, to use instead of the one ASO holds for it.
+            Left empty -- the normal case -- ASO orients onto its own.
         mirror_reference: The transform that reflects a scan across the
             mid-sagittal plane. What an asymmetry assessment compares against.
-        segmentation_model: The bundle that segments the bone each region is
-            registered on.
+        segmentation_model: A bundle to segment the bone each region is
+            registered on, instead of AMASSS's own. Left empty -- the normal
+            case -- AMASSS uses the model it holds.
         landmark_model: The bundle that places the landmarks every measurement
             is computed from.
         classifier_model: The bundle holding the three asymmetry models.

@@ -125,8 +125,13 @@ def orient(
     max_triplets: int = 2500,
     seed: int = 0,
     sup=None,
+    frame: str = catalogs.FRAME_FROM_LANDMARKS,
+    data_root=None,
 ) -> OrientationRun:
     """Orient every case under `input_path` onto `reference_path`.
+
+    An empty `reference_path` means this tool's own bundles, under the data
+    root; `frame` then names which one, or the selection decides.
 
     Every cross-argument rule is checked BEFORE any file is read: a request that
     cannot work has to come back in a second, not after minutes of registration.
@@ -136,6 +141,18 @@ def orient(
     suffix = (output_suffix or "Or").strip() or "Or"
     if os.sep in suffix or (os.altsep and os.altsep in suffix):
         raise ToolInputError("'output_suffix' is a name fragment, not a path.")
+
+    frame = str(frame or catalogs.FRAME_FROM_LANDMARKS)
+    if frame not in catalogs.FRAME_CHOICES:
+        raise ToolInputError(
+            f"Unknown 'frame' {frame!r}. Expected one of: "
+            f"{', '.join(catalogs.FRAME_CHOICES)}"
+        )
+    if frame != catalogs.FRAME_FROM_LANDMARKS and modality != catalogs.MODALITY_CBCT:
+        raise ToolInputError(
+            f"'frame' names a CBCT reference frame, and this is a {modality} run. "
+            f"Leave it on '{catalogs.FRAME_FROM_LANDMARKS}'."
+        )
 
     if modality == catalogs.MODALITY_CBCT:
         requested = _selected(cbct_landmarks, catalogs.CBCT_LANDMARK_CHOICES, "cbct_landmarks")
@@ -167,6 +184,8 @@ def orient(
         "reference": os.path.basename(str(reference_path).rstrip(os.sep)),
         "cases": {},
     }
+    if frame != catalogs.FRAME_FROM_LANDMARKS:
+        report["frame"] = frame
     logger.info("ASO: %s, %s", modality, automation)
 
     # Patients whose failure was the caller's own input -- an unreadable scan,
@@ -176,18 +195,52 @@ def orient(
     input_faults = set()
     try:
         input_root = _as_directory(input_path, os.path.join(work_dir, "input"))
-        reference_root = _as_directory(reference_path, os.path.join(work_dir, "reference"))
+        if reference_path:
+            reference_root = _as_directory(reference_path, os.path.join(work_dir, "reference"))
+        else:
+            # Nobody named one: this tool's own, which is what a neighbour
+            # calling through the supervisor gets. The folder of bundles, the
+            # same shape the server hands a hidden hosted-model argument.
+            reference_root = _own_models(data_root)
         # Either a bundle, or the folder that HOLDS the bundles. The server
         # fills a hidden hosted-model argument with the whole of
         # `DATA/ASO/models/`, so both shapes arrive here and the difference is
-        # visible: a bundle carries markups, a folder of bundles does not.
+        # visible: a bundle carries markups, a folder of bundles does not. A
+        # bundle named outright wins over a frame named beside it.
         if not _is_reference_bundle(reference_root):
-            reference_root = choose_reference(
-                reference_root,
-                modality,
-                selection["cbct_landmarks"] if modality == catalogs.MODALITY_CBCT else [],
-            )
+            if frame != catalogs.FRAME_FROM_LANDMARKS:
+                reference_root = _frame_bundle(reference_root, frame)
+            else:
+                if modality == catalogs.MODALITY_CBCT and not selection["cbct_landmarks"]:
+                    # Nothing to choose a reference BY: an empty selection
+                    # means "the reference's own", which needs one named.
+                    raise ToolInputError(
+                        "No landmark is selected in 'cbct_landmarks', and no reference "
+                        "or 'frame' says which reference's own landmarks to use. Select "
+                        f"at least {_MIN_CBCT_LANDMARKS}, or name a frame."
+                    )
+                reference_root = choose_reference(
+                    reference_root,
+                    modality,
+                    selection["cbct_landmarks"] if modality == catalogs.MODALITY_CBCT else [],
+                )
             report["reference"] = os.path.basename(reference_root.rstrip(os.sep))
+
+        if modality == catalogs.MODALITY_CBCT and not selection["cbct_landmarks"]:
+            # Sent empty: every landmark the reference defines, which is what a
+            # caller naming a frame wants without restating that frame's set.
+            # Read off the reference itself, so a new reference orients on its
+            # own landmarks without a table here changing.
+            carried = set(_reference_landmarks(reference_root))
+            selection["cbct_landmarks"] = [
+                name for name in catalogs.CBCT_LANDMARKS if name in carried
+            ]
+            if len(selection["cbct_landmarks"]) < _MIN_CBCT_LANDMARKS:
+                raise ToolInputError(
+                    f"CBCT orientation registers on at least {_MIN_CBCT_LANDMARKS} "
+                    f"landmarks, and the reference defines "
+                    f"{len(selection['cbct_landmarks'])} this tool knows."
+                )
 
         if modality == catalogs.MODALITY_CBCT:
             _run_cbct(
@@ -260,10 +313,16 @@ def _selected(value, choices: dict, argument: str) -> list:
     return [name for name in choices if name in wanted]
 
 
+# The fewest landmarks a rigid registration can be fitted on.
+_MIN_CBCT_LANDMARKS = 3
+
+
 def _check_cbct(
     automation: str, landmarks: list, landmarks_path: str, landmark_model: str, sup
 ) -> None:
-    if len(landmarks) < 3:
+    # Empty is not too few: it means "every landmark the reference defines",
+    # counted once the reference is known.
+    if landmarks and len(landmarks) < _MIN_CBCT_LANDMARKS:
         raise ToolInputError(
             f"CBCT orientation registers on at least 3 landmarks; "
             f"{len(landmarks)} are selected in 'cbct_landmarks'."
@@ -314,6 +373,42 @@ def _no_landmarks_reason(key: str, markups_paths: list, orphans: list) -> str:
         "registers on landmarks you provide, so they must travel with the scans -- "
         "send the whole FOLDER rather than the single scan file, pass them in "
         "'landmarks', or use Fully-Automated mode to have them predicted"
+    )
+
+
+# The DATA folder this tool's bundles live in. Written rather than derived, for
+# the reason ALI_CBCT gives about its own: which folder serves which tool is a
+# deployment fact, and a wrong guess is a folder that is simply not there.
+_DATA_NAME = "ASO"
+
+
+def _own_models(data_root) -> str:
+    """`<root>/ASO/models`, or a refusal a caller can act on."""
+    if not data_root:
+        raise ToolInputError(
+            "No 'reference' given and no data root to look in. Name the reference "
+            "bundle, or run this through a server that publishes one."
+        )
+    models_root = os.path.join(str(data_root), _DATA_NAME, "models")
+    if not os.path.isdir(models_root):
+        raise ToolInputError(
+            "No 'reference' given, and this deployment stages no reference bundle "
+            f"for {_DATA_NAME}. Install them with `setup-models.sh --tool "
+            f"{_DATA_NAME}`, or name a reference in 'reference'."
+        )
+    return models_root
+
+
+def _frame_bundle(models_root: str, frame: str) -> str:
+    """The bundle inside `models_root` that defines `frame`, or a refusal."""
+    bundle = catalogs.FRAME_BUNDLES[frame]
+    candidate = os.path.join(models_root, bundle)
+    if os.path.isdir(candidate):
+        return candidate
+    raise ToolInputError(
+        f"The '{frame}' frame is defined by the '{bundle}' reference bundle, and "
+        f"this deployment does not stage it. Install it with `setup-models.sh "
+        f"--tool {_DATA_NAME}`, or name a reference in 'reference'."
     )
 
 

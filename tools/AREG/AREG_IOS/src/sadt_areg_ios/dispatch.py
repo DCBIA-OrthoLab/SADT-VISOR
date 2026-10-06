@@ -78,15 +78,18 @@ class RegistrationRun:
 # unpacks those archives to.
 #
 # Resolved here rather than asked of the caller. `models/` holds every AREG
-# bundle together, around sixty checkpoints, so an unset field arrived as the
-# WHOLE folder and the run died on "has to name an entry holding exactly one"
-# after it had already segmented and oriented both timepoints. Neither of these
-# is a clinical choice: `AREG_model` holds exactly one checkpoint and
-# `IOS_Gold_files` is the frame the published test data is oriented into. A
-# deployment that wants another still names it, and what it names wins.
+# bundle together, so an unset field arrived as the WHOLE folder and the run
+# died on "has to name an entry holding exactly one" after it had already
+# segmented and oriented both timepoints. It is not a clinical choice:
+# `AREG_model` holds exactly one checkpoint. A deployment that wants another
+# still names it, and what it names wins.
+#
+# The orientation reference is NOT resolved here. The intraoral reference
+# arches are ASO's own bundle, and ASO resolves it from its own data folder
+# when it is asked to orient with none named -- there is one intraoral
+# reference. `ios_reference` stays an override a caller may still name.
 _DATA_NAME = "AREG"
 _REGISTRATION_BUNDLE = "AREG_model"
-_ORIENTATION_REFERENCE = "IOS_Gold_files"
 
 
 def _own_bundle(data_root, name):
@@ -113,9 +116,9 @@ def derive_automation(automation: str, t1_root: str) -> tuple:
     mixed cohort, which `pipeline` already refuses by patient with a message
     about the pair.
 
-    NOT read off `ios_reference`, unlike the CBCT engine's `reference`: this
-    deployment resolves its own orientation bundle (`_own_bundle`), so one is
-    always present and its presence says nothing about what the caller wants.
+    NOT read off `ios_reference`, unlike the CBCT engine's `reference`: ASO
+    resolves its own intraoral reference, so naming one is an override and its
+    presence says nothing about which mode the caller wants.
     """
     if automation and automation != catalogs.AUTOMATION_AUTO:
         return automation, "requested"
@@ -134,7 +137,7 @@ def derive_automation(automation: str, t1_root: str) -> tuple:
     return catalogs.AUTOMATION_FULLY, "from the data"
 
 
-def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, height,
+def _check_ios(automation, patch, registration_model, mgl_landmarks, height,
                sup=None) -> None:
     if patch not in catalogs.PATCH_CHOICES:
         raise ToolInputError(
@@ -168,12 +171,7 @@ def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, 
         return
     tools.require(sup, "Crown_Seg", "Fully-Automated IOS registration")
     tools.require(sup, "ASO", "Fully-Automated IOS registration")
-    if not reference:
-        raise ToolInputError(
-            "Fully-Automated IOS orients both timepoints before registering, which "
-            "needs an orientation reference: name one in 'ios_reference' (see "
-            "GET /tools/AREG_IOS/data)."
-        )
+    # No orientation reference is required: ASO orients onto its own.
 
 
 # How an IOS run shares its bar, as fractions of the whole, per supervised call
@@ -680,10 +678,11 @@ def main(
     registration_model_named = bool(registration_model)
     registration_model = registration_model or _own_bundle(
         data_root, _REGISTRATION_BUNDLE)
-    reference = ios_reference or _own_bundle(data_root, _ORIENTATION_REFERENCE)
+    # Forwarded only when a caller named one: ASO owns the intraoral reference.
+    reference = ios_reference
     # The mode is read off the meshes, and the meshes are not extracted yet --
     # so what is checked here is FULLY's requirements, which are the superset:
-    # everything Semi needs, plus Crown_Seg, ASO and an orientation reference.
+    # everything Semi needs, plus Crown_Seg and ASO.
     # Checking the superset keeps the promise this function's docstring makes,
     # that a request which cannot work comes back in a second rather than after
     # an hour of registration.
@@ -694,7 +693,7 @@ def main(
     # and `tools.require` says so.
     checked = (catalogs.AUTOMATION_FULLY
                if automation in ("", catalogs.AUTOMATION_AUTO) else automation)
-    _check_ios(checked, patch, registration_model, reference,
+    _check_ios(checked, patch, registration_model,
                mgl_landmarks, mgl_patch_height, sup)
 
     run = register(

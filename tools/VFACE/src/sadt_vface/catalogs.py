@@ -62,14 +62,18 @@ FRAME_MAXILLA = "MAX"
 
 FRAMES = {
     FRAME_CRANIAL_BASE: {
-        # The subfolder of the orientation reference bundle. Upstream joins
-        # these names onto `gold_folder`, and the published bundle carries both.
+        # The plane, in words, for a message about it. Upstream joins these
+        # names onto `gold_folder`, and the published bundle carries both.
         "reference": "Frankfurt Horizontal and Midsagittal Plane",
+        # The frame as ASO names it. ASO owns the reference bundles that define
+        # its frames and resolves the one this names; VFACE holds no copy.
+        "aso_frame": "Frankfurt horizontal",
         "landmarks": ["Ba", "LPo", "N", "RPo", "S", "LOr", "ROr"],
         "suffix": "CB_Or",
     },
     FRAME_MAXILLA: {
         "reference": "Occlusal and Midsagittal Plane",
+        "aso_frame": "Occlusal plane",
         "landmarks": ["ANS", "IF", "PNS", "UL6O", "UR1O", "UR6O"],
         "suffix": "MAX_Or",
     },
