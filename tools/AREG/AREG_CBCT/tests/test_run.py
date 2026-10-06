@@ -576,13 +576,14 @@ def _events(path) -> list:
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line]
 
 
-def test_progress_names_the_region_and_counts_the_subjects(tmp_path, monkeypatch):
-    """Two loops, nested, and the bar has to cross them once rather than twice.
+def test_progress_counts_the_registrations_as_they_finish(tmp_path, monkeypatch):
+    """One bar across every registration, moved as each one FINISHES.
 
-    Each region is given its own slice of the run: without that the second
-    region sends the fraction back to zero, which a watcher reads as a run
-    starting over. The region is named because it is anatomy; the subject is
-    only ever a number, the key being built from the caller's file names.
+    The registrations run side by side, so "subject 2 of 2" would name one that
+    may already be done or not yet started; a count of finished ones is the
+    only thing true at every instant, and it never goes back. A region with no
+    mask is not a registration and moves nothing. No subject is named: the key
+    is built from the caller's file names.
     """
     events_file = tmp_path / "events.jsonl"
     monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
@@ -594,17 +595,16 @@ def test_progress_names_the_region_and_counts_the_subjects(tmp_path, monkeypatch
         t1_masks_path=str(tmp_path / "masks"),
         automation=catalogs.AUTOMATION_SEMI,
         # Only the cranial base has a mask here, so the mandible costs no
-        # registration -- the events still have to be there for it.
+        # registration.
         regions=["Cranial base", "Mandible"],
         output_dir=str(tmp_path / "out"),
     )
 
     events = _events(events_file)
     assert [event["message"] for event in events] == [
-        "Cranial base: subject 1 of 2", "Cranial base: subject 2 of 2",
-        "Mandible: subject 1 of 2", "Mandible: subject 2 of 2",
+        "registration 1 of 2", "registration 2 of 2",
     ]
-    assert [event["fraction"] for event in events] == [0.0, 0.25, 0.5, 0.75]
+    assert [event["fraction"] for event in events] == [0.5, 1.0]
 
 
 def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
@@ -634,5 +634,56 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
 
     assert sup.messages == []
     assert [event["message"] for event in _events(events_file)] == [
-        "Cranial base: subject 1 of 1",
+        "registration 1 of 1",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registrations side by side
+# ---------------------------------------------------------------------------
+
+def _register_cohort(root, out, **extra):
+    return dispatch.register(
+        t1_path=str(root / "T1"), t2_path=str(root / "T2"),
+        t1_masks_path=str(root / "masks"), automation=catalogs.AUTOMATION_SEMI,
+        regions=["Cranial base"], output_dir=str(out), **extra)
+
+
+def test_registrations_side_by_side_produce_what_one_at_a_time_does(tmp_path):
+    """Each registration is the same one-thread elastix run whichever process
+    it lands in, so the order they finish in is all that changes -- with one
+    caveat, measured: elastix's preprocessing sums in an order set by ITK's
+    thread count, and a worker gets its share of the run's threads rather than
+    all of them. Same thread count, identical to the bit; different, the
+    transform moves by about 1e-10 mm. That already happens between two runs
+    the server granted different cores, and it is noise by eight orders of
+    magnitude against the 0.03 mm separating this port from the original.
+    """
+    TestSemiAutomatedCBCT._cohort(tmp_path, subjects=("P1", "P2"))
+    serial = _register_cohort(tmp_path, tmp_path / "serial", num_workers=1)
+    wide = _register_cohort(tmp_path, tmp_path / "wide", num_workers=2)
+
+    assert serial.report["patients"] == wide.report["patients"]
+    for subject in ("P1", "P2"):
+        one = sitk.ReadTransform(str(tmp_path / "serial" / "CB" / f"{subject}_CB_Reg_transform.tfm"))
+        two = sitk.ReadTransform(str(tmp_path / "wide" / "CB" / f"{subject}_CB_Reg_transform.tfm"))
+        assert np.allclose(one.GetParameters(), two.GetParameters(), rtol=0, atol=1e-8)
+        a = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "serial" / "CB" / f"{subject}_CB_Reg.nii.gz")))
+        b = sitk.GetArrayFromImage(sitk.ReadImage(str(tmp_path / "wide" / "CB" / f"{subject}_CB_Reg.nii.gz")))
+        differing = a != b
+        assert differing.mean() < 1e-4 and np.abs(a.astype(int) - b)[differing].max(initial=0) <= 1
+
+
+def test_the_width_is_asked_of_the_supervisor_and_capped_by_the_caller():
+    asked = []
+
+    class Sup:
+        def channels(self, wanted):
+            asked.append(wanted)
+            return 3
+
+    assert dispatch._registration_width(Sup(), 6) == 3
+    assert asked == [6]
+    assert dispatch._registration_width(Sup(), 6, declared=2) == 2
+    assert dispatch._registration_width(None, 6) == 1
+    assert dispatch._registration_width(None, 6, declared=4) == 4

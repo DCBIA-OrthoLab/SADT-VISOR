@@ -291,7 +291,7 @@ def _collect_oriented(oriented_dir, output_dir, report) -> None:
 def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
-    suffix, report, sup=None, landmark_model=None, segmentations=None,
+    suffix, report, sup=None, landmark_model=None, segmentations=None, num_workers=0,
 ) -> None:
     # Imported here rather than at module level: the CBCT engine pulls in
     # SimpleITK and itk-elastix, and AREG must load on a server without them so
@@ -372,18 +372,15 @@ def _run_cbct(
             f"{len(matched.t1_only)} T1-only and {len(matched.t2_only)} T2-only subject(s)."
         )
 
-    # One region at a time over the whole cohort, so the bar is given each
-    # region's slice of the run rather than restarting per region. The region
-    # is named because it is anatomy; the subject is only ever a number.
-    for region_index, code in enumerate(codes):
+    # Every registration is independent -- one region of one subject, on that
+    # subject's two scans -- so they are listed first and run as wide as the
+    # machine pays for. Each is still one elastix thread and the same
+    # deterministic computation, so running them side by side changes the
+    # order they finish in and nothing they produce.
+    jobs = []
+    for code in codes:
         masks = cbct_pipeline.find_masks(mask_roots, code, scan_keys=matched.matched)
-        span = 1.0 / len(codes)
-        for index, (key, entry) in enumerate(sorted(matched.matched.items()), start=1):
-            progress.report(
-                index, len(matched.matched),
-                f"{catalogs.region_name(code)}: subject",
-                start=region_index * span, end=(region_index + 1) * span,
-            )
+        for key, entry in sorted(matched.matched.items()):
             record = report["patients"].setdefault(key, {"status": "ok", "regions": {}})
             mask_path = masks.get(key)
             if not mask_path:
@@ -392,23 +389,61 @@ def _run_cbct(
                     "reason": _no_mask_reason(automation, code),
                 }
                 continue
-            try:
-                record["regions"][code] = cbct_pipeline.register_patient(
-                    t1_path=entry["t1"],
-                    t2_path=entry["t2"],
-                    mask_path=mask_path,
-                    region=code,
-                    output_dir=output_dir,
-                    relative_key=key,
-                    suffix=suffix,
-                    segmentation_label=segmentation_label or None,
-                )
-            except elastix.RegistrationError as exc:
-                record["regions"][code] = {"status": "failed", "reason": str(exc)}
-            except RuntimeError as exc:
-                record["regions"][code] = {"status": "failed", "reason": f"registration failed: {exc}"}
+            jobs.append((code, key, {
+                "t1_path": entry["t1"],
+                "t2_path": entry["t2"],
+                "mask_path": mask_path,
+                "region": code,
+                "output_dir": output_dir,
+                "relative_key": key,
+                "suffix": suffix,
+                "segmentation_label": segmentation_label or None,
+            }))
+
+    width = _registration_width(sup, len(jobs), num_workers)
+    logger.info("AREG CBCT: %d registration(s), %d at a time", len(jobs), width)
+    # Declared around the registrations and nowhere else: the peak is there,
+    # one pair of volumes per channel, and what runs before it is the chain's.
+    progress.set_width(width)
+    try:
+        finished = cbct_pipeline.register_all(
+            [kwargs for _code, _key, kwargs in jobs], width,
+            on_done=lambda done, total: progress.emit(
+                done / total, "registration {} of {}".format(done, total)),
+        )
+    finally:
+        progress.set_width(None)
+    # In the order they were listed, whatever order they finished in.
+    for (code, key, _kwargs), entry in zip(jobs, finished):
+        report["patients"][key]["regions"][code] = entry
 
     _roll_up_regions(report["patients"])
+
+
+def _registration_width(sup, wanted: int, declared: int = 0) -> int:
+    """How many registrations to run at once: what the machine will pay for.
+
+    The supervisor answers from what one registration was measured to cost and
+    what this run's reservation holds. A number the caller named is a ceiling on
+    the ask, never a floor. One without a supervisor unless the caller named a
+    number -- how this tool runs from a CLI and in its own tests.
+    """
+    wanted = max(1, int(wanted or 1))
+    try:
+        declared = int(declared or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared > 0:
+        wanted = min(wanted, declared)
+    ask = getattr(sup, "channels", None)
+    if ask is None:
+        return wanted if declared > 0 else 1
+    try:
+        return max(1, min(wanted, int(ask(wanted))))
+    except Exception:  # noqa: BLE001 - a grant must never fail a run
+        logger.warning("Could not ask for channels; registering one at a time",
+                       exc_info=True)
+        return 1
 
 
 def _no_mask_reason(automation: str, code: str) -> str:
@@ -515,6 +550,7 @@ def register(
     output_dir: str = None,
     sup=None,
     segmentations=None,
+    num_workers=0,
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
@@ -562,6 +598,7 @@ def register(
         sup=sup,
         landmark_model=landmark_model,
         segmentations=segmentations,
+        num_workers=num_workers,
     )
 
     # Extracted inputs, converted DICOM, the oriented copies and whatever the
@@ -592,6 +629,7 @@ def main(
     output_dir=None,
     sup=None,
     data_root=None,
+    num_workers=0,
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -653,6 +691,7 @@ def main(
         output_dir=output_dir,
         sup=sup,
         segmentations=segmentations,
+        num_workers=num_workers,
     )
 
     return run.output_dir

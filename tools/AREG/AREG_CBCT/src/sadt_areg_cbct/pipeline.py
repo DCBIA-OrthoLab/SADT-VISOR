@@ -106,6 +106,64 @@ def register_patient(
     return entry
 
 
+def register_all(jobs: list, width: int, on_done=None) -> list:
+    """Run `register_patient(**job)` for every job, `width` at a time.
+
+    Returns one report entry per job, in the order given. A registration that
+    cannot be done is a failed entry, never an exception, exactly as one at a
+    time. `spawn` workers, so none inherits state it did not build; each holds
+    its own pair of volumes, which is what a channel costs.
+    """
+    total = len(jobs)
+    entries = [None] * total
+    if width <= 1 or total <= 1:
+        for index, job in enumerate(jobs):
+            entries[index] = _register_safely(job)
+            if on_done:
+                on_done(index + 1, total)
+        return entries
+    import multiprocessing
+    from concurrent import futures
+
+    threads = _threads_per_worker(width)
+    with futures.ProcessPoolExecutor(
+            max_workers=width, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_worker_setup, initargs=(threads,)) as pool:
+        pending = {pool.submit(_register_safely, job): index for index, job in enumerate(jobs)}
+        for done, future in enumerate(futures.as_completed(pending), start=1):
+            entries[pending[future]] = future.result()
+            if on_done:
+                on_done(done, total)
+    return entries
+
+
+def _register_safely(job: dict) -> dict:
+    """One registration, its failure reported rather than raised."""
+    try:
+        return register_patient(**job)
+    except elastix.RegistrationError as exc:
+        return {"status": "failed", "reason": str(exc)}
+    except RuntimeError as exc:
+        return {"status": "failed", "reason": f"registration failed: {exc}"}
+
+
+def _threads_per_worker(width: int) -> int:
+    """The threads this run was granted, shared between its workers -- for the
+    resampling and the I/O around elastix, which itself runs on one."""
+    try:
+        granted = int(os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS") or 0)
+    except ValueError:
+        granted = 0
+    granted = granted or (os.cpu_count() or 1)
+    return max(1, granted // max(1, width))
+
+
+def _worker_setup(threads: int) -> None:
+    os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(threads)
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+
+
 def _origin_in_fixed_frame(moving: sitk.Image, transform: sitk.Transform) -> tuple:
     """The origin that puts the T2's grid, unchanged in size, spacing and
     direction, centred on where the T2's centre lands in the T1's frame.
