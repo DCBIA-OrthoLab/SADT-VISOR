@@ -129,9 +129,10 @@ def class_count(state_dict) -> int:
 def build_model(checkpoint_path: str, device: str):
     """The network, with its heads resized to the checkpoint's class count."""
     torch = import_torch()
-    from torchvision.models.detection import maskrcnn_resnet50_fpn
+    from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-    from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+    from torchvision.models.detection.mask_rcnn import MaskRCNN, MaskRCNNPredictor
+    from torchvision.ops.misc import FrozenBatchNorm2d
 
     # A file that is not there stays the OSError it is: a wrong name is the
     # caller's to fix, and the server answers it as such. A file that IS there
@@ -152,7 +153,23 @@ def build_model(checkpoint_path: str, device: str):
     except ValueError as exc:
         raise RuntimeError(f"checkpoint is unusable: {exc}") from exc
 
-    model = maskrcnn_resnet50_fpn(weights=None)
+    # The layout `maskrcnn_resnet50_fpn(weights=None)` builds, assembled by
+    # hand so that no pretrained weight is ever fetched. That call still
+    # defaults `weights_backbone` to the ImageNet ResNet50, which torchvision
+    # downloads into TORCH_HOME: an outbound call mid-request on a server
+    # holding patient data, which fails outright where TORCH_HOME is
+    # read-only, and pointless since the checkpoint replaces every weight
+    # below. Passing `weights_backbone=None` alone is not equivalent: with no
+    # pretrained weights torchvision swaps the backbone's FrozenBatchNorm2d
+    # for BatchNorm2d. The norm layer and the three trainable stages are
+    # therefore named here, exactly as the pretrained path chooses them.
+    backbone = resnet_fpn_backbone(
+        backbone_name="resnet50",
+        weights=None,
+        norm_layer=FrozenBatchNorm2d,
+        trainable_layers=3,
+    )
+    model = MaskRCNN(backbone, num_classes=91)
     box_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(box_features, classes)
     mask_features = model.roi_heads.mask_predictor.conv5_mask.in_channels
