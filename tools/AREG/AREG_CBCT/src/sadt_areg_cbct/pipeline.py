@@ -106,6 +106,73 @@ def register_patient(
     return entry
 
 
+def register_all(jobs: list, width: int, on_done=None) -> list:
+    """Run `register_patient(**job)` for every job, `width` at a time.
+
+    Returns one report entry per job, in the order given. A registration that
+    cannot be done is a failed entry, never an exception, exactly as one at a
+    time. `spawn` workers, so none inherits state it did not build; each holds
+    its own pair of volumes, which is what a channel costs.
+    """
+    total = len(jobs)
+    entries = [None] * total
+    if width <= 1 or total <= 1:
+        for index, job in enumerate(jobs):
+            entries[index] = _register_safely(job)
+            if on_done:
+                on_done(index + 1, total)
+        return entries
+    import multiprocessing
+    from concurrent import futures
+
+    threads = _threads_per_worker(width)
+    with futures.ProcessPoolExecutor(
+            max_workers=width, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_worker_setup, initargs=(threads,)) as pool:
+        pending = {pool.submit(_register_safely, job): index for index, job in enumerate(jobs)}
+        for done, future in enumerate(futures.as_completed(pending), start=1):
+            entries[pending[future]] = future.result()
+            if on_done:
+                on_done(done, total)
+    return entries
+
+
+def _register_safely(job: dict) -> dict:
+    """One registration, its failure reported rather than raised."""
+    try:
+        return register_patient(**job)
+    except elastix.RegistrationError as exc:
+        return {"status": "failed", "reason": str(exc)}
+    except RuntimeError as exc:
+        return {"status": "failed", "reason": f"registration failed: {exc}"}
+
+
+def _threads_per_worker(width: int) -> int:
+    """The threads ONE registration may open.
+
+    elastix speeds up with ITK's thread count -- 97 s on ten threads, 43 s on
+    fifty-six, for one region of the test pair -- so this is the number that
+    decides how long a registration takes. Under a server it is what the
+    server set for one CHANNEL: AREG_CBCT's channels each bring their own share
+    of cores (`cores_per_channel` in the server's deployment.toml), so the
+    variable already holds one registration's threads and is taken as it is.
+    With no server, the machine's cores are shared between the workers.
+    """
+    try:
+        granted = int(os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS") or 0)
+    except ValueError:
+        granted = 0
+    if granted > 0:
+        return granted
+    return max(1, (os.cpu_count() or 1) // max(1, width))
+
+
+def _worker_setup(threads: int) -> None:
+    os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(threads)
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+
+
 def _origin_in_fixed_frame(moving: sitk.Image, transform: sitk.Transform) -> tuple:
     """The origin that puts the T2's grid, unchanged in size, spacing and
     direction, centred on where the T2's centre lands in the T1's frame.

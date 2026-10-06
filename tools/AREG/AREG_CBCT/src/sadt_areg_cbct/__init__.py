@@ -82,6 +82,7 @@ def run(
         "Leave as scanned", "Frankfurt horizontal", "Occlusal plane"
     ] = "Leave as scanned",
     output_suffix: str = "Reg",
+    num_workers: int = 0,
     *,
     sup=None,
     data_root=None,
@@ -130,6 +131,8 @@ def run(
             afterwards does not say the same thing. Read only when no masks are
             supplied.
         output_suffix: Added to each output name, e.g. `scan_Reg.nii.gz`.
+        num_workers: How many registrations to run at once. Left at 0 the
+            server decides, from what one registration was measured to cost.
 
     Returns:
         The output directory.
@@ -151,6 +154,7 @@ def run(
         dicom_input=dicom_input,
         orientation=orientation,
         output_suffix=output_suffix,
+        num_workers=num_workers,
         sup=sup,
         data_root=data_root,
     )
