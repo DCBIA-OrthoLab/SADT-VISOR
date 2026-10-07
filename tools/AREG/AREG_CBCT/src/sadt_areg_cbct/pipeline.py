@@ -110,7 +110,7 @@ def register_patient(
 def _register(masked: sitk.Image, moving: sitk.Image) -> tuple:
     """`(transform, engine)`: on the card when there is one, elastix otherwise.
 
-    The GPU engine solves the same problem six times faster (see `gpu_rigid`).
+    The GPU engine solves the same problem four times faster (see `gpu_rigid`).
     A failure there -- the card full of other runs, a driver error -- falls
     back to elastix rather than failing the patient: the answer is the same to
     within a few hundredths of a millimetre, only slower.

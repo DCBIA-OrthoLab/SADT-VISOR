@@ -104,3 +104,42 @@ def test_the_transform_is_centred_where_elastix_centres_it():
     moving, _truth = _moved(fixed)
     centre = gpu_rigid.register(fixed, moving).GetCenter()
     assert np.allclose(centre, gpu_rigid._geometric_centre(fixed))
+
+
+@pytest.mark.gpu
+@needs_gpu
+def test_a_level_built_slab_by_slab_is_the_whole_volume_blurred(monkeypatch):
+    """The slabs are cut across an axis the blur does not run along, so none
+    needs its neighbours: put back together they are the whole volume."""
+    array = np.random.default_rng(0).random((40, 36, 44)).astype(np.float32)
+    device = torch.device("cuda")
+    kernel, radius = gpu_rigid._gaussian(2, device)
+    whole = torch.from_numpy(array).to(device)
+    for axis in range(3):
+        whole = gpu_rigid._blur_axis(whole, axis, 2, kernel, radius)
+    monkeypatch.setattr(gpu_rigid, "SLAB_BYTES", 4 * 36 * 44 * 3)  # a few rows per slab
+    slabbed = gpu_rigid._level_volume(array, 2, device)
+    assert slabbed.shape == whole.shape
+    assert torch.allclose(slabbed, whole, atol=1e-5)
+
+
+@pytest.mark.gpu
+@needs_gpu
+def test_the_batched_gradient_is_the_whole_histogram_s_gradient(monkeypatch):
+    """Two passes -- the histogram, then dMI/dJ pushed back batch by batch --
+    give the gradient one pass over every sample gives, by the chain rule."""
+    fixed = phantom(size=48)
+    moving, _truth = _moved(fixed)
+    registration = gpu_rigid._Registration(fixed, moving, torch.device("cuda"))
+    level = gpu_rigid._Level(registration, factor=1, stride=1)
+    params = torch.tensor([0.5, -0.3, 0.2, 0.4, -0.6, 0.3], device="cuda", requires_grad=True)
+
+    whole = registration._batch_joint(level, params, 0, level.points.shape[0])
+    registration._negative_mi(whole).backward()
+    expected = params.grad.clone()
+
+    params.grad = None
+    monkeypatch.setattr(gpu_rigid, "BATCH_SAMPLES", 10_000)
+    assert len(level.batches()) > 5
+    registration._gradient(level, params)
+    assert torch.allclose(params.grad, expected, rtol=1e-4, atol=1e-7)
