@@ -288,7 +288,12 @@ def test_a_t2_far_from_the_oriented_t1_comes_back_whole_and_on_it(tmp_path):
 
     on_t1 = sitk.GetArrayFromImage(sitk.Resample(registered, fixed, sitk.Transform(), sitk.sitkLinear, 0.0))
     t1 = sitk.GetArrayFromImage(fixed)
-    assert (on_t1 != 0).mean() > 0.9
+    # Whole, not a corner: the old grid kept one eighth. Not all of it either,
+    # because the phantom's displacement turns it by about two degrees and a
+    # turned cube's corners leave the T1's box -- 89 % of the voxels on the GPU
+    # engine, which finds that rotation (0.05 mm from the truth). elastix found
+    # almost none of it here (1.6 mm from the truth) and so kept more.
+    assert (on_t1 != 0).mean() > 0.85
     assert np.corrcoef(t1.ravel(), on_t1.ravel())[0, 1] > 0.9
 
 
@@ -755,7 +760,9 @@ def test_a_complete_run_summarises_at_info(tmp_path, caplog):
 
 def test_a_run_where_the_engine_failed_everyone_is_a_server_error(tmp_path, monkeypatch):
     """Not an archive with nothing in it, and not the caller's fault."""
-    from sadt_areg_cbct import elastix
+    from sadt_areg_cbct import elastix, gpu_rigid
+    # The engine that fails here is elastix: keep the card out of it.
+    monkeypatch.setattr(gpu_rigid, "available", lambda: False)
 
     cohort(tmp_path, subjects=("P1", "P2"), size=32)
 
@@ -775,7 +782,9 @@ def test_a_run_where_the_engine_failed_everyone_is_a_server_error(tmp_path, monk
 
 def test_one_server_fault_among_input_faults_keeps_it_a_server_error(tmp_path, monkeypatch):
     """ToolInputError is "your fault"; that is only true when ALL of it was."""
-    from sadt_areg_cbct import elastix
+    from sadt_areg_cbct import elastix, gpu_rigid
+    # The engine that fails here is elastix: keep the card out of it.
+    monkeypatch.setattr(gpu_rigid, "available", lambda: False)
 
     cohort(tmp_path, subjects=("P1", "P2"), size=32)
     os.remove(str(tmp_path / "masks" / "P2_T1_CB_seg.nii.gz"))

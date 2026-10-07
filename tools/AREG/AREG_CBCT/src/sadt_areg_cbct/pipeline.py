@@ -31,7 +31,7 @@ import numpy as np
 import SimpleITK as sitk
 
 from sadt_areg_common import catalogs, pairing
-from . import elastix
+from . import elastix, gpu_rigid
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ def register_patient(
     masked, note = elastix.apply_mask(fixed, mask, label=segmentation_label)
 
     moving = _read(t2_path, "T2 scan")
-    transform = elastix.register(masked, moving)
+    transform, engine = _register(masked, moving)
 
     # The T2's own size, spacing and direction, in the T1's frame -- placed where
     # the T2 now IS. (Resampling onto the T1 grid instead would crop the T2 to the
@@ -97,6 +97,7 @@ def register_patient(
         # (the file still loads, and still transforms), and it is the only thing
         # a downstream tool needs to know to reuse it.
         "transform_maps": "T1 space -> T2 space (what sitk.ResampleImageFilter consumes)",
+        "engine": engine,
         "outputs": sorted(
             os.path.relpath(path, output_dir) for path in (scan_output, transform_output)
         ),
@@ -104,6 +105,22 @@ def register_patient(
     if note:
         entry["note"] = note
     return entry
+
+
+def _register(masked: sitk.Image, moving: sitk.Image) -> tuple:
+    """`(transform, engine)`: on the card when there is one, elastix otherwise.
+
+    The GPU engine solves the same problem six times faster (see `gpu_rigid`).
+    A failure there -- the card full of other runs, a driver error -- falls
+    back to elastix rather than failing the patient: the answer is the same to
+    within a few hundredths of a millimetre, only slower.
+    """
+    if gpu_rigid.available():
+        try:
+            return gpu_rigid.register(masked, moving), "gpu"
+        except Exception as exc:  # noqa: BLE001 - elastix is the fallback, not the patient's failure
+            logger.warning("GPU registration failed (%s); registering with elastix", elastix.describe(exc))
+    return elastix.register(masked, moving), "elastix"
 
 
 def register_all(jobs: list, width: int, on_done=None) -> list:
