@@ -432,9 +432,16 @@ def discover_masks(root: str, region: str) -> dict:
     segmentation token (mask/seg/pred) and one of that region's own tokens --
     or when it is the only candidate in a folder that holds nothing but masks,
     which is what AMASSS's own output looks like (`P1_seg_CBMASK.nii.gz`).
+
+    When one patient has several, the region's registration mask wins
+    (`CBMASK` over `CB`). AMASSS writes both side by side when the caller also
+    asked for the anatomy, and `_CB` sorts first: taking the first match
+    registered on the whole cranial base instead of its mask, silently.
     """
     found: dict = {}
+    preferred: dict = {}
     wanted = catalogs.REGION_TOKENS[region]
+    mask_token = (catalogs.REGION_MASK_STRUCTURES[region].lower(),)
     anatomy = ANATOMY_TOKENS | set(catalogs.MASK_TOKENS)
 
     for directory, _, file_names in os.walk(root):
@@ -449,5 +456,8 @@ def discover_masks(root: str, region: str) -> dict:
             if not has_token(stem, wanted):
                 continue
             key = os.path.join(prefix, patient_stem(file_name, also_drop=anatomy))
-            found.setdefault(key, os.path.join(directory, file_name))
+            is_mask = has_token(stem, mask_token)
+            if key not in found or (is_mask and not preferred[key]):
+                found[key] = os.path.join(directory, file_name)
+                preferred[key] = is_mask
     return found

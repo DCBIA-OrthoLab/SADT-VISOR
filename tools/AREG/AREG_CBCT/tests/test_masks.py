@@ -63,6 +63,19 @@ def test_one_regions_mask_is_not_another_regions(tmp_path):
     assert pairing.discover_masks(str(tmp_path), "CB") == {}
 
 
+@pytest.mark.parametrize("region", sorted(catalogs.REGION_MASK_STRUCTURES))
+def test_the_registration_mask_wins_over_the_anatomy_beside_it(tmp_path, region):
+    """A caller who registers on a region AND asks for its anatomy gets both
+    from one AMASSS call, `_CB` sorting before `_CBMASK`. The first match used
+    to win, so the registration ran on the whole structure, not its mask."""
+    mask = catalogs.REGION_MASK_STRUCTURES[region]
+    for code in (region, mask):
+        write(phantom(size=16), str(tmp_path / f"P1_T1_Or_seg_{code}.nii.gz"))
+    found = pairing.discover_masks(str(tmp_path), region)
+    assert [os.path.basename(path) for path in found.values()] == [
+        f"P1_T1_Or_seg_{mask}.nii.gz"]
+
+
 def test_a_mask_keys_to_the_patient_its_scan_keys_to(tmp_path):
     """`P1_T1_MAND_seg.nii.gz` has to key to `P1`, the same key
     `P1_T1_scan.nii.gz` gets, or nothing ever matches."""
