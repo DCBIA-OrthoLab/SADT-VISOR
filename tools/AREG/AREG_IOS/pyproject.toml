@@ -20,6 +20,11 @@ dependencies = [
     "SimpleITK==2.5.6",
     "numpy==2.3.2",
     "vtk==9.6.2",
+    # Not used directly: torch pulls it in. From 3.30 it installs a process-wide
+    # audit hook that raises on an os.fork while another thread is mid-fork with
+    # a lock held ("os.fork is unsafe while filelock is changing descriptor
+    # ownership"), which lost a structure in one AMASSS run in two. 3.29 has none.
+    "filelock<3.30",
 ]
 
 [tool.sadt]

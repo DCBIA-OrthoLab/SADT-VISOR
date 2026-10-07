@@ -28,6 +28,11 @@ dependencies = [
     "monai==1.6.0",
     "vtk==9.6.2",
     "numpy==2.3.2",
+    # Not used directly: torch pulls it in. From 3.30 it installs a process-wide
+    # audit hook that raises on an os.fork while another thread is mid-fork with
+    # a lock held ("os.fork is unsafe while filelock is changing descriptor
+    # ownership"), which lost a structure in one AMASSS run in two. 3.29 has none.
+    "filelock<3.30",
 ]
 
 # What makes this directory a tool. A directory holding a pyproject.toml

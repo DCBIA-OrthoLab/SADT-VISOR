@@ -321,7 +321,11 @@ def prepare(scan_path: str, destination: str = None) -> tuple:
     centered, translation = recenter(sitk.ReadImage(scan_path))
     if destination:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
-        sitk.WriteImage(centered, destination, useCompression=True)
+        # Compressed only when the name asks for it: the caller's scratch copy
+        # for the landmark tool is a plain .nii, because gzip on one core is
+        # most of what this step costs -- 20.9 s for a 732x732x647 CBCT against
+        # 0.5 s uncompressed, for a file read once and deleted with the run.
+        sitk.WriteImage(centered, destination, useCompression=destination.endswith(".gz"))
     return centered, translation
 
 

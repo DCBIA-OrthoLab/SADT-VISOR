@@ -293,17 +293,20 @@ def _prepare_scan(scan_path: str, work_dir: str) -> dict:
     """
     os.makedirs(work_dir, exist_ok=True)
 
+    # Plain .nii throughout: these are read back within seconds and deleted
+    # with the run, and gzip on one core was most of the preprocessing -- 34 s
+    # on a 732x732x647 CBCT, three compressed writes and two compressed reads.
     base = os.path.basename(scan_path)
-    corrected = os.path.join(work_dir, base)
+    stem = scan_stem(base)
+    corrected = os.path.join(work_dir, f"{stem}.nii")
     preprocess.correct_histogram(scan_path, corrected)
 
-    stem = scan_stem(base)
     resampled = {}
     for spacing in catalog.SCALE_SPACINGS:
         key = catalog.scale_key(spacing)
         # Written as NIfTI whatever the input was: this is a real read/write
         # conversion, not the rename the original relied on for NRRD and GIPL.
-        destination = os.path.join(work_dir, f"{stem}_sp{key}.nii.gz")
+        destination = os.path.join(work_dir, f"{stem}_sp{key}.nii")
         preprocess.set_spacing(corrected, spacing, destination)
         resampled[key] = destination
     return resampled

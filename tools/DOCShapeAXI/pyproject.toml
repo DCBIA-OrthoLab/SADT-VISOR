@@ -50,6 +50,11 @@ dependencies = [
     # from a library that is already here. `tests/test_run.py` pins the two
     # against each other to 1e-5.
     "tqdm==4.67.1",
+    # Not used directly: torch pulls it in. From 3.30 it installs a process-wide
+    # audit hook that raises on an os.fork while another thread is mid-fork with
+    # a lock held ("os.fork is unsafe while filelock is changing descriptor
+    # ownership"), which lost a structure in one AMASSS run in two. 3.29 has none.
+    "filelock<3.30",
 ]
 
 # What makes this directory a tool. `name` is the API identity: what a client
