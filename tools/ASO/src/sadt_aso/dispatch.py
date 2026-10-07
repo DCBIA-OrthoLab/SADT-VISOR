@@ -833,14 +833,9 @@ def _run_cbct(
     for index, (key, entry) in enumerate(sorted(patients.items()), start=1):
         progress.report(index, len(patients), "centring scan", end=LANDMARK_SPAN[0])
         _, extension = split_scan_extension(os.path.basename(entry["scan"]))
-        destination = (
-            os.path.join(
-                centered_root,
-                f"{key}{cbct_pipeline.compressed_extension(extension)}",
-            )
-            if key in to_predict
-            else None
-        )
+        # Uncompressed: read by the landmark tool and once more below, then
+        # deleted with the run (see `cbct_pipeline.prepare`).
+        destination = os.path.join(centered_root, f"{key}.nii") if key in to_predict else None
         try:
             image, translation = cbct_pipeline.prepare(entry["scan"], destination)
         except RuntimeError as exc:

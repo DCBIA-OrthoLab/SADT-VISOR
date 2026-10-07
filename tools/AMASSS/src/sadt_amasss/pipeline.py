@@ -238,9 +238,21 @@ def _convert_to_nifti(scan_path: str, destination: str) -> None:
     it doubled the bytes to gzip on the way out and to gunzip on the way back
     in, for 2.4s + 0.4s per scan buying nothing: nnUNet's reader casts to
     float32 itself, and int16 CBCT values are exact in float32 either way.
+
+    A scan that already IS what nnUNet reads -- gzipped NIfTI, the name it is
+    given here -- is linked rather than rewritten: the read is 3.7 s and the
+    gzip on one core 20.9 s for a 732x732x647 CBCT, to produce the same bytes.
     """
     import SimpleITK as sitk
 
+    if scan_path.lower().endswith(".nii.gz") and destination.endswith(".nii.gz"):
+        # The header, read here, keeps an unreadable scan an input error at
+        # this step rather than a prediction failure inside nnUNet.
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(scan_path)
+        reader.ReadImageInformation()
+        os.symlink(os.path.abspath(scan_path), destination)
+        return
     image = sitk.ReadImage(scan_path)
     sitk.WriteImage(image, destination)
 
