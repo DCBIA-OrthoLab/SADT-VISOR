@@ -9,8 +9,8 @@ coinciding geometric centres (elastix's `GeometricalCenter`).
 
 Measured on a clinical pair (fixed 732x732x647 at 0.25 mm, moving 610x610x538
 at 0.3 mm), on the deployment's RTX 6000 Ada: elastix 114 s on ten threads,
-this 19 s, the two transforms 0.027 mm apart on average over the mask's voxels
-(0.058 mm at worst). On the phantom `test_run.py` holds elastix to, 0.048 mm
+this 29 s at a 1.63 GiB peak on the card, the two transforms 0.027 mm apart on
+average over the mask's voxels (0.058 mm at worst). On the phantom `test_run.py` holds elastix to, 0.048 mm
 from the ground truth, elastix 0.025 mm.
 
 **Deterministic, bit for bit**, like elastix's single-threaded map: this is
@@ -20,6 +20,18 @@ nor the interpolation uses one: the histogram is a matrix product of a one-hot
 fixed bin per sample and four B-spline weights per sample, and the moving image
 is interpolated by gathering its eight neighbours (`F.grid_sample`'s backward
 accumulates with atomics).
+
+**A fixed ceiling on the card, whatever the scan.** The server reserves a run's
+measured peak for the whole run, and AREG holds its reservation from its first
+second to its last while the registration itself takes twenty: a peak of
+9.7 GiB kept two AREG on a 37.6 GiB budget. Now 1.63 GiB, for 29 s instead
+of 19: the second pass is the price, and two AREG side by side become four. So the volumes stay in host memory
+and only each level, blurred and shrunk slab by slab, goes to the card; and the
+histogram is summed over fixed-size batches of samples, its gradient taken
+exactly in two passes (the joint histogram first, without a graph; then the
+derivative of the mutual information with respect to it, pushed back batch by
+batch). The batches are the same size on every run, so the sums happen in the
+same order and the result stays identical to the bit.
 """
 
 import logging
@@ -50,6 +62,12 @@ RADIUS = 50.0
 # The cost of an iteration is its number of samples, not the resolution of the
 # volume: above this many, a level samples every other voxel of its grid.
 MAX_SAMPLES = 8_000_000
+# Samples per batch of the histogram, and bytes per slab of a volume sent to
+# the card. Fixed, never derived from what the card has free: a batch size that
+# moved with the server's load would move the summation order, and with it the
+# last bits of the transform.
+BATCH_SAMPLES = 1 << 20
+SLAB_BYTES = 256 << 20
 
 
 def available() -> bool:
@@ -101,31 +119,75 @@ def _geometric_centre(image: sitk.Image) -> np.ndarray:
     return np.array(image.TransformContinuousIndexToPhysicalPoint(((size - 1) / 2.0).tolist()))
 
 
-def _blur_and_shrink(volume, factor: int):
-    """Gaussian blur (sigma = factor / 2 voxels), then keep every factor-th voxel."""
+def _gaussian(factor: int, device):
+    """The blur that precedes keeping every factor-th voxel: sigma = factor / 2."""
     import torch
-    import torch.nn.functional as F
 
-    if factor == 1:
-        return volume
     sigma = factor / 2.0
     radius = int(math.ceil(3 * sigma))
-    x = torch.arange(-radius, radius + 1, device=volume.device, dtype=volume.dtype)
+    x = torch.arange(-radius, radius + 1, device=device, dtype=torch.float32)
     kernel = torch.exp(-0.5 * (x / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-    v = volume[None, None]
-    for axis in range(3):
-        shape = [1, 1, 1, 1, 1]
-        shape[2 + axis] = kernel.numel()
-        pad = [0] * 6
-        pad[2 * (2 - axis)] = pad[2 * (2 - axis) + 1] = radius
-        v = F.conv3d(F.pad(v, pad, mode="replicate"), kernel.view(shape))
-        # Subsampled right after its own axis is blurred, so the next axis
-        # convolves a volume already factor times smaller.
-        index = [slice(None)] * 5
-        index[2 + axis] = slice(None, None, factor)
-        v = v[tuple(index)]
-    return v[0, 0].contiguous()
+    return kernel / kernel.sum(), radius
+
+
+def _blur_axis(volume, axis: int, factor: int, kernel, radius: int):
+    """Blur a (z, y, x) tensor along `axis`, edges replicated, then keep every
+    factor-th voxel along it."""
+    import torch.nn.functional as F
+
+    shape = [1, 1, 1, 1, 1]
+    shape[2 + axis] = kernel.numel()
+    pad = [0] * 6
+    pad[2 * (2 - axis)] = pad[2 * (2 - axis) + 1] = radius
+    v = F.conv3d(F.pad(volume[None, None], pad, mode="replicate"), kernel.view(shape))
+    index = [slice(None)] * 5
+    index[2 + axis] = slice(None, None, factor)
+    return v[tuple(index)][0, 0]
+
+
+def _in_slabs(source, axis: int, along: int, factor: int, kernel, radius: int, device):
+    """`_blur_axis` over `source` cut into slabs ACROSS `along`.
+
+    `along` is never the blurred axis, so no slab needs its neighbours' voxels
+    and the slabs put back together are the whole volume blurred. `source` may
+    be a host array: only one slab of it is on the card at a time.
+    """
+    import torch
+
+    slab_shape = list(source.shape)
+    slab_shape[along] = 1
+    per_slab = max(1, SLAB_BYTES // (4 * int(np.prod(slab_shape))))
+    # Written in place, slab by slab: gathering the slabs and concatenating
+    # them would hold the result twice at its largest.
+    shape = list(source.shape)
+    shape[axis] = -(-shape[axis] // factor)
+    result = torch.empty(shape, device=device, dtype=torch.float32)
+    for start in range(0, source.shape[along], per_slab):
+        index = [slice(None)] * 3
+        index[along] = slice(start, start + per_slab)
+        slab = source[tuple(index)]
+        if isinstance(slab, np.ndarray):
+            slab = torch.from_numpy(np.ascontiguousarray(slab)).to(device)
+        result[tuple(index)] = _blur_axis(slab, axis, factor, kernel, radius)
+        del slab
+    return result
+
+
+def _level_volume(array: np.ndarray, factor: int, device):
+    """The host volume `array` (z, y, x) blurred and shrunk by `factor`, on the card.
+
+    Axis by axis, the full-size volume never on the card: the first pass reads
+    host slabs and leaves a volume `factor` times smaller, which the other two
+    passes then work on.
+    """
+    import torch
+
+    if factor == 1:
+        return torch.from_numpy(np.ascontiguousarray(array)).to(device)
+    kernel, radius = _gaussian(factor, device)
+    volume = _in_slabs(array, axis=0, along=1, factor=factor, kernel=kernel, radius=radius, device=device)
+    volume = _in_slabs(volume, axis=1, along=0, factor=factor, kernel=kernel, radius=radius, device=device)
+    return _in_slabs(volume, axis=2, along=0, factor=factor, kernel=kernel, radius=radius, device=device)
 
 
 def _euler_matrix(angles):
@@ -179,7 +241,6 @@ class _Level:
 
     def __init__(self, registration, factor: int, stride: int):
         import torch
-        import torch.nn.functional as F
 
         device = registration.device
         fixed, moving = registration.fixed, registration.moving
@@ -188,8 +249,8 @@ class _Level:
         m_spacing = np.array(moving.GetSpacing())
         m_direction = np.array(moving.GetDirection()).reshape(3, 3)
 
-        self.moving = _blur_and_shrink(registration.moving_volume, factor)
-        fixed_level = _blur_and_shrink(registration.fixed_volume, factor)
+        self.moving = _level_volume(registration.moving_array, factor, device)
+        fixed_level = _level_volume(registration.fixed_array, factor, device)
         fixed_level = fixed_level[::stride, ::stride, ::stride].contiguous()
 
         # Every sample's physical point: p = origin + D (spacing * index).
@@ -199,16 +260,24 @@ class _Level:
         direction = torch.tensor(f_direction, device=device, dtype=torch.float32)
         origin = torch.tensor(fixed.GetOrigin(), device=device, dtype=torch.float32)
         self.points = (grid * scale) @ direction.T + origin
+        del grid
 
+        # The fixed bin of every sample, one byte each: the one-hot rows the
+        # histogram needs are built a batch at a time from these.
         values = fixed_level.reshape(-1)
-        bins = ((values - registration.f_low) / registration.f_width).floor().clamp(0, BINS - 5).long() + 2
-        self.fixed_onehot = F.one_hot(bins, BINS).float()
+        self.bins = (((values - registration.f_low) / registration.f_width).floor()
+                     .clamp(0, BINS - 5) + 2).to(torch.uint8)
+        del fixed_level, values
 
         # Physical point -> continuous index of this level's moving volume.
         self.m_origin = torch.tensor(moving.GetOrigin(), device=device, dtype=torch.float32)
         self.m_inverse = torch.tensor(np.linalg.inv(m_direction @ np.diag(m_spacing * factor)),
                                       device=device, dtype=torch.float32)
         self.m_last = torch.tensor(self.moving.shape[::-1], device=device, dtype=torch.float32) - 1
+
+    def batches(self):
+        count = self.points.shape[0]
+        return [(start, min(start + BATCH_SAMPLES, count)) for start in range(0, count, BATCH_SAMPLES)]
 
 
 class _Registration:
@@ -217,31 +286,34 @@ class _Registration:
 
         self.device = device
         self.fixed, self.moving = fixed, moving
-        self.fixed_volume = torch.from_numpy(
-            sitk.GetArrayFromImage(fixed).astype(np.float32)).to(device)
-        self.moving_volume = torch.from_numpy(
-            sitk.GetArrayFromImage(moving).astype(np.float32)).to(device)
+        # Kept in host memory: a level is built from them slab by slab (see
+        # `_level_volume`), so neither full-size volume is ever on the card.
+        self.fixed_array = sitk.GetArrayFromImage(fixed).astype(np.float32)
+        self.moving_array = sitk.GetArrayFromImage(moving).astype(np.float32)
         self.centre = _geometric_centre(fixed)
         self.initial_translation = _geometric_centre(moving) - self.centre
         # Two bins of padding either side for the B-spline's support.
-        self.f_low, self.f_width = self._bin_layout(self.fixed_volume)
-        self.m_low, self.m_width = self._bin_layout(self.moving_volume)
+        self.f_low, self.f_width = self._bin_layout(self.fixed_array)
+        self.m_low, self.m_width = self._bin_layout(self.moving_array)
         self._centre = torch.tensor(self.centre, device=device, dtype=torch.float32)
         self._initial = torch.tensor(self.initial_translation, device=device, dtype=torch.float32)
 
     @staticmethod
-    def _bin_layout(volume):
-        low, high = volume.min(), volume.max()
-        return low, (high - low).clamp(min=1e-6) / (BINS - 4)
+    def _bin_layout(array):
+        low, high = float(array.min()), float(array.max())
+        return low, max(high - low, 1e-6) / (BINS - 4)
 
-    def _negative_mi(self, level: _Level, params):
+    def _batch_joint(self, level: _Level, params, start: int, end: int):
+        """The joint histogram of samples [start, end): fixed bin x moving bin."""
         import torch
+        import torch.nn.functional as F
 
         rotation = _euler_matrix(params[:3] / RADIUS)
-        mapped = (level.points - self._centre) @ rotation.T + self._centre + params[3:] + self._initial
+        points = level.points[start:end]
+        mapped = (points - self._centre) @ rotation.T + self._centre + params[3:] + self._initial
         index = (mapped - level.m_origin) @ level.m_inverse.T
         # Samples mapped outside the moving image take no part, as in elastix.
-        # Weighted out rather than filtered, so every iteration has one shape.
+        # Weighted out rather than filtered, so every batch has one shape.
         inside = ((index >= 0) & (index <= level.m_last)).all(dim=1).float()
         index = torch.minimum(index.clamp(min=0), level.m_last)
         moving_values = _trilinear(level.moving, index)
@@ -249,13 +321,38 @@ class _Registration:
         position = ((moving_values - self.m_low) / self.m_width + 2).clamp(1, BINS - 3)
         columns = torch.stack([position.detach().floor() + k for k in (-1, 0, 1, 2)], dim=1)
         weights = _bspline3(position[:, None] - columns) * inside[:, None]
-        moving_rows = torch.zeros(index.shape[0], BINS, device=self.device).scatter(
+        moving_rows = torch.zeros(end - start, BINS, device=self.device).scatter(
             1, columns.long(), weights)
-        joint = level.fixed_onehot.T @ moving_rows
+        fixed_rows = F.one_hot(level.bins[start:end].long(), BINS).float()
+        return fixed_rows.T @ moving_rows
+
+    @staticmethod
+    def _negative_mi(joint):
         joint = joint / joint.sum()
         marginal = joint.sum(1, keepdim=True) @ joint.sum(0, keepdim=True)
         present = joint > 0
         return -(joint[present] * (joint[present] / marginal[present]).log()).sum()
+
+    def _gradient(self, level: _Level, params) -> None:
+        """Set `params.grad` to the exact gradient of the negative MI.
+
+        The MI is a function of the whole histogram, which is a SUM over
+        batches. So: the histogram first, with no graph kept; then dMI/dJ, a
+        64x64 matrix; then each batch again with its graph, contributing
+        <dMI/dJ, J_batch> -- whose gradient summed over batches is the
+        gradient of the MI, by the chain rule, with one batch's graph alive at
+        a time.
+        """
+        import torch
+
+        with torch.no_grad():
+            joint = sum(self._batch_joint(level, params, start, end)
+                        for start, end in level.batches())
+        joint.requires_grad_(True)
+        self._negative_mi(joint).backward()
+        slope = joint.grad
+        for start, end in level.batches():
+            (slope * self._batch_joint(level, params, start, end)).sum().backward()
 
     def run(self) -> sitk.Euler3DTransform:
         import torch
@@ -269,7 +366,7 @@ class _Registration:
                 optimiser, iterations, eta_min=step / 20)
             for _ in range(iterations):
                 optimiser.zero_grad()
-                self._negative_mi(level, params).backward()
+                self._gradient(level, params)
                 optimiser.step()
                 schedule.step()
             del level
