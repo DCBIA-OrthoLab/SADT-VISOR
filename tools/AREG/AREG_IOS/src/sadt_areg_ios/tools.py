@@ -32,8 +32,10 @@ Four things worth knowing before changing anything here:
   answer and "deploy a tool" usually is not.
 """
 
+import json
 import logging
 import os
+import shutil
 
 from sadt_areg_common.errors import SupervisorRequired
 
@@ -142,7 +144,49 @@ def label_crowns(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("Crown_Seg", **parameters, **_span(span)))
+    return _as_input_tree(_returned(sup.run("Crown_Seg", **parameters, **_span(span))))
+
+
+def _as_input_tree(crown_dir: str) -> str:
+    """Crown_Seg's output laid out like its input, or `crown_dir` as it came.
+
+    Crown_Seg files a mesh that already carried labels under the input's own
+    tree, and one it segmented under shapeaxi's `<csv stem>_<suffix>/` -- two
+    trees, as its README says. AREG mirrors the tree it registers into its own
+    outputs, so every Fully-Automated result came back under
+    `crownseg_input_Seg/`, a folder named after Crown_Seg's scratch csv.
+
+    Rebuilt from the run report's `cases`, which maps each input (relative to
+    the folder it was given) to what it produced -- the contract ALI_IOS reads
+    too -- rather than from a folder name that is Crown_Seg's business. With no
+    report, or nothing in it to place, the output is used as it is.
+    """
+    try:
+        with open(os.path.join(crown_dir, "run_report.json"), encoding="utf-8") as handle:
+            cases = json.load(handle)["cases"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return crown_dir
+    # Every file Crown_Seg returned, by its path inside the returned folder,
+    # longest first: the report holds paths as Crown_Seg wrote them, so the
+    # most specific tail is the one that names the file.
+    returned = sorted(
+        (os.path.relpath(os.path.join(root, name), crown_dir)
+         for root, _dirs, names in os.walk(crown_dir) for name in names),
+        key=len, reverse=True,
+    )
+    tree = crown_dir.rstrip(os.sep) + "_tree"
+    placed = 0
+    for key, case in (cases.items() if isinstance(cases, dict) else ()):
+        for produced in (case or {}).get("produced") or []:
+            match = next((rel for rel in returned
+                          if str(produced).replace("\\", "/").endswith("/" + rel.replace(os.sep, "/"))), None)
+            if match is None:
+                continue
+            destination = os.path.join(tree, os.path.dirname(key), os.path.basename(match))
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.copy2(os.path.join(crown_dir, match), destination)
+            placed += 1
+    return tree if placed else crown_dir
 
 
 def predict_mucogingival(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
