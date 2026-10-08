@@ -1335,3 +1335,48 @@ class TestWarningsSayWhichMesh:
             mgl.build_patch(mesh, landmarks, height=2.0, where="subject 1 of 2, T1")
         assert any("subject 1 of 2, T1: the mesh carries no tooth labels" in r.getMessage()
                    for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Crown_Seg's two output trees come back as one, laid out like the input
+# ---------------------------------------------------------------------------
+
+def _crownseg_output(root, cases):
+    """What Crown_Seg returns: its meshes where it files them, and its report.
+
+    `cases` maps an input (relative to the folder it was given) to the path,
+    inside the returned folder, of what it produced.
+    """
+    report = {"cases": {}}
+    for key, produced in cases.items():
+        path = Path(root) / produced
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(key)
+        # Absolute and under Crown_Seg's own job directory, as it writes them.
+        report["cases"][key] = {"produced": [f"/jobs/crownseg/output/{produced}"]}
+    (Path(root) / "run_report.json").write_text(json.dumps(report))
+    return root
+
+
+def test_a_segmented_mesh_comes_back_where_its_input_was(tmp_path):
+    """A raw scan's meshes came back under `crownseg_input_Seg/`, shapeaxi's
+    folder, and AREG mirrored it into every Fully-Automated result."""
+    planted = _crownseg_output(tmp_path / "crowns", {
+        "A2_UpperT1.vtk": "crownseg_input_Seg/A2_UpperT1_Seg.vtk",      # segmented
+        "site/B1_UpperT1.vtk": "site/B1_UpperT1_Seg.vtk",               # already labelled
+    })
+    sup = FakeSup(tmp_path, {"Crown_Seg": lambda params: planted})
+
+    tree = Path(tools.label_crowns(sup, str(tmp_path / "meshes")))
+
+    found = sorted(str(p.relative_to(tree)) for p in tree.rglob("*.vtk"))
+    assert found == ["A2_UpperT1_Seg.vtk", os.path.join("site", "B1_UpperT1_Seg.vtk")]
+    assert (tree / "A2_UpperT1_Seg.vtk").read_text() == "A2_UpperT1.vtk"
+
+
+def test_without_a_report_crown_seg_s_output_is_used_as_it_came(tmp_path):
+    planted = tmp_path / "crowns"
+    (planted / "x").mkdir(parents=True)
+    (planted / "x" / "A2_UpperT1_Seg.vtk").write_text("")
+    sup = FakeSup(tmp_path, {"Crown_Seg": lambda params: planted})
+    assert Path(tools.label_crowns(sup, str(tmp_path / "meshes"))) == planted
