@@ -2,7 +2,7 @@
 """Republish every manifest file as ONE data release of this repository.
 
     python3 scripts/publish_data_release.py --dry-run
-    python3 scripts/publish_data_release.py --draft --only ROI.mrk.zip --only Gold_file.zip
+    python3 scripts/publish_data_release.py --draft --only TestFile024_ROI.zip
     python3 scripts/publish_data_release.py
 
 Each file is downloaded from the address the manifest lists, ANONYMOUSLY: no
@@ -12,15 +12,21 @@ local disk, so nothing that was not already distributed can end up in the
 release. The bytes uploaded are the bytes downloaded; their sha256 is computed
 on the way.
 
-The release holds each distinct file once. Two different files that share a
-name (four nnUNet bundles each ship a `checkpoint_final.pth`) are told apart by
-a prefix naming their original release; the manifest's `name` is unchanged, so
-every file still lands under DATA/ exactly where it did.
+The release holds each distinct file once, under the `release_name` its
+manifest entry gives it -- never derived here, so every name is reviewed in
+the manifest before it is published:
+
+  model.<tool>.<name>          a model, under the tool that owns it
+  TestFile<NNN>_<suffixes>     a test file, numbered once and for all; the
+                               suffixes say what it holds (see the manifest)
+
+The manifest's `name` is unchanged, so every file still lands under DATA/
+exactly where it did.
 
 Beside the files the release carries:
   SHA256SUMS   one line per file, `sha256sum -c` format
-  SOURCES.md   for each file: its original public address, the date it was
-               first published there, and the tools that use it
+  SOURCES.md   for each file: its original name and public address, the
+               date it was first published there, and the tools that use it
 
 and the run writes `data-manifest.yml` with every republished entry's `url`
 pointed at the new release and its `sha256` pinned. Review it, then commit it.
@@ -66,28 +72,24 @@ def _plan(manifest: dict, excluded_tools: set) -> list:
         for entry in fetch_data._entries(manifest, kind, None):
             if entry["tool"] in excluded_tools:
                 continue
+            where = f"{entry['tool']}/{kind}/{entry['name']}"
+            asset = entry.get("release_name")
+            if not asset:
+                raise SystemExit(f"{where}: no release_name in the manifest")
+            if "/" in asset:
+                raise SystemExit(f"{where}: release_name must be a bare file name")
             item = by_url.setdefault(entry["url"], {"url": entry["url"], "name": entry["name"],
-                                                    "tools": set(), "kinds": set()})
+                                                    "asset": asset, "tools": set(), "kinds": set()})
+            if item["asset"] != asset:
+                raise SystemExit(f"{where}: release_name {asset} differs from {item['asset']}, "
+                                 "given to another entry with the same url")
             item["tools"].add(entry["tool"])
             item["kinds"].add(kind)
-    items = list(by_url.values())
-    taken = collections.Counter(item["name"] for item in items)
-    for item in items:
-        item["asset"] = item["name"] if taken[item["name"]] == 1 else f"{_origin(item['url'])}_{item['name']}"
+    items = sorted(by_url.values(), key=lambda item: item["asset"])
     clashes = [name for name, n in collections.Counter(i["asset"] for i in items).items() if n > 1]
     if clashes:
-        raise SystemExit(f"two different files would share an asset name: {clashes}")
+        raise SystemExit(f"two different files share a release_name: {clashes}")
     return items
-
-
-def _origin(url: str) -> str:
-    """A short, stable name for where a file comes from: its release tag, or
-    the repository when the tag says nothing (`v1.0.0`, `TestFiles`)."""
-    match = _GITHUB_ASSET.match(url)
-    if not match:
-        return urllib.parse.urlparse(url).netloc.split(".")[0]
-    _owner, repo, tag, _asset = match.groups()
-    return repo if re.fullmatch(r"v?[\d.]+|TestFiles?|main", tag) else tag
 
 
 _RELEASES = {}
@@ -125,6 +127,23 @@ def _download(url: str, destination: str) -> tuple:
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
+
+
+def _notes(assets: list) -> str:
+    """The release description: models by tool, then test files with their users."""
+    size = lambda item: f"{item['size'] / 1e6:,.1f} MB"
+    lines = [f"Models and test files for the VISOR tools, {len(assets)} files. Every file was "
+             "already public: `SOURCES.md` gives its original name, address and date, and "
+             "`SHA256SUMS` verifies them (`sha256sum -c SHA256SUMS`).", "", "## Models", ""]
+    models = [a for a in assets if a["asset"].startswith("model.")]
+    for tool in sorted({a["asset"].split(".")[1] for a in models}):
+        lines.append(f"**{tool}**")
+        lines += [f"- `{a['asset']}` ({size(a)})" for a in models if a["asset"].split(".")[1] == tool]
+        lines.append("")
+    lines += ["## Test files", "", "| File | Size | Used by |", "|---|---|---|"]
+    lines += [f"| `{a['asset']}` | {size(a)} | {', '.join(sorted(a['tools']))} |"
+              for a in assets if not a["asset"].startswith("model.")]
+    return "\n".join(lines) + "\n"
 
 
 def _gh(*args, capture=False) -> str:
@@ -184,7 +203,7 @@ def main(argv=None) -> int:
     parser.add_argument("--exclude-tool", action="append", default=[],
                         help="Leave a tool out entirely (repeatable), e.g. one not ported yet.")
     parser.add_argument("--only", action="append",
-                        help="Republish only these source file names (repeatable): a trial run.")
+                        help="Republish only these release names (repeatable): a trial run.")
     parser.add_argument("--draft", action="store_true", help="Create the release as a draft.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the plan and check every source is public; download nothing.")
@@ -197,8 +216,8 @@ def main(argv=None) -> int:
         manifest_text = handle.read()
     items = _plan(fetch_data._parse_manifest(args.manifest), set(args.exclude_tool))
     if args.only:
-        items = [item for item in items if item["name"] in args.only]
-        missing = set(args.only) - {item["name"] for item in items}
+        items = [item for item in items if item["asset"] in args.only]
+        missing = set(args.only) - {item["asset"] for item in items}
         if missing:
             raise SystemExit(f"--only names no manifest file: {sorted(missing)}")
 
@@ -232,14 +251,15 @@ def main(argv=None) -> int:
         item["sha256"], item["size"] = _download(item["url"], path)
         print(f"  downloaded {item['asset']}  {item['size']} B  {item['sha256'][:12]}")
 
-    # Identical bytes behind two addresses are one asset.
-    by_sha = collections.OrderedDict()
+    # Identical bytes behind two addresses would be one file under two names:
+    # the manifest should give both entries the same url instead.
+    seen = {}
     for item in items:
-        keeper = by_sha.setdefault(item["sha256"], item)
-        if keeper is not item:
-            keeper["tools"] |= item["tools"]
-            item["asset"] = keeper["asset"]
-    assets = list(by_sha.values())
+        other = seen.setdefault(item["sha256"], item)
+        if other is not item:
+            raise SystemExit(f"{item['asset']} and {other['asset']} are the same bytes: "
+                             "point both manifest entries at one url and one release_name")
+    assets = items
 
     sums = os.path.join(workdir, "SHA256SUMS")
     with open(sums, "w", encoding="utf-8") as handle:
@@ -248,17 +268,16 @@ def main(argv=None) -> int:
     with open(sources, "w", encoding="utf-8") as handle:
         handle.write(f"# Sources of {tag}\n\nEvery file here was already public, and was "
                      "downloaded anonymously from the address below before being republished "
-                     "unchanged.\n\n| File | sha256 | Bytes | First published | Original address | Used by |\n"
-                     "|---|---|---|---|---|---|\n")
+                     "unchanged.\n\n| File | Original name | sha256 | Bytes | First published | Original address "
+                     "| Used by |\n|---|---|---|---|---|---|---|\n")
         for item in items:
-            handle.write(f"| `{item['asset']}` | `{item['sha256'][:16]}…` | {item['size']} | "
-                         f"{item['published']} | {item['url']} | {', '.join(sorted(item['tools']))} |\n")
+            handle.write(f"| `{item['asset']}` | `{item['name']}` | `{item['sha256'][:16]}…` | "
+                         f"{item['size']} | {item['published']} | {item['url']} | "
+                         f"{', '.join(sorted(item['tools']))} |\n")
 
     notes = os.path.join(workdir, "NOTES.md")
     with open(notes, "w", encoding="utf-8") as handle:
-        handle.write(f"Models and test files for the VISOR tools, {len(assets)} files.\n\n"
-                     "Every file was already public; `SOURCES.md` gives its original address and "
-                     "date. `SHA256SUMS` verifies them (`sha256sum -c SHA256SUMS`).\n")
+        handle.write(_notes(assets))
     # Every file handed to `create` itself: a separate `upload` looks the
     # release up by its tag, which a draft does not have yet, and failed.
     create = ["release", "create", tag, "-R", args.repo, "--title", tag, "--notes-file", notes,
@@ -266,8 +285,10 @@ def main(argv=None) -> int:
     _gh(*create)
     # Not "Latest": on the repository page that badge points at the tools.
     # Set on the draft too, so publishing it from the web page keeps it.
+    # Found by its title: a draft has no tag yet (GitHub lists it as
+    # `untagged-...` until it is published).
     release_id = _gh("api", f"repos/{args.repo}/releases", "--jq",
-                     f'.[] | select(.tag_name == "{tag}") | .id', capture=True).strip()
+                     f'.[] | select(.name == "{tag}") | .id', capture=True).split()[0]
     _gh("api", "-X", "PATCH", f"repos/{args.repo}/releases/{release_id}",
         "-f", "make_latest=false", "--silent")
 
