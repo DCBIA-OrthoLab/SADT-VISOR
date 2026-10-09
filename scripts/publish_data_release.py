@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Republish every manifest file as ONE release of the organisation's data repository.
+"""Republish every manifest file as ONE data release of this repository.
 
     python3 scripts/publish_data_release.py --dry-run
     python3 scripts/publish_data_release.py --draft --only ROI.mrk.zip --only Gold_file.zip
@@ -25,9 +25,11 @@ Beside the files the release carries:
 and the run writes `data-manifest.yml` with every republished entry's `url`
 pointed at the new release and its `sha256` pinned. Review it, then commit it.
 
-Tags are the publication date plus a counter, `2026.10.09-1`, so several
-releases can be cut on one day. Needs the GitHub CLI (`gh`), logged in with
-the right to create releases in --repo.
+Data releases live beside the tool releases of the same repository, told
+apart by their tag: `data-` then the publication date and a counter,
+`data-2026.10.09-1`, so several can be cut on one day. A data release is never
+marked "Latest": that badge belongs to the tools. Needs the GitHub CLI (`gh`),
+logged in with the right to create releases in --repo.
 """
 
 import argparse
@@ -48,6 +50,7 @@ import fetch_data  # noqa: E402
 
 _GITHUB_ASSET = re.compile(r"https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/]+)$")
 _HEADERS = {"User-Agent": "visor-data-publish/1.0"}
+TAG_PREFIX = "data-"
 
 
 def _anonymous(url: str):
@@ -131,7 +134,11 @@ def _gh(*args, capture=False) -> str:
 
 
 def _next_tag(repo: str, day: str) -> str:
-    """`<day>-<n>`, n one past the highest already used that day (drafts included)."""
+    """`data-<day>-<n>`, n one past the highest used that day (drafts included).
+
+    Only data tags count: a tool release cut the same day has its own series.
+    """
+    day = TAG_PREFIX + day
     # Through the API rather than `gh release list`, whose --json is missing
     # from the gh that distributions still ship.
     listed = _gh("api", "--paginate", f"repos/{repo}/releases", "--jq", ".[].tag_name",
@@ -172,7 +179,7 @@ def _rewrite_manifest(text: str, moved: dict) -> str:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--repo", default="DCBIA-OrthoLab/VISOR-data")
+    parser.add_argument("--repo", default="DCBIA-OrthoLab/SADT-VISOR")
     parser.add_argument("--manifest", default=fetch_data._DEFAULT_MANIFEST)
     parser.add_argument("--exclude-tool", action="append", default=[],
                         help="Leave a tool out entirely (repeatable), e.g. one not ported yet.")
@@ -257,6 +264,12 @@ def main(argv=None) -> int:
     create = ["release", "create", tag, "-R", args.repo, "--title", tag, "--notes-file", notes,
               *(["--draft"] if args.draft else []), *(a["path"] for a in assets), sums, sources]
     _gh(*create)
+    # Not "Latest": on the repository page that badge points at the tools.
+    # Set on the draft too, so publishing it from the web page keeps it.
+    release_id = _gh("api", f"repos/{args.repo}/releases", "--jq",
+                     f'.[] | select(.tag_name == "{tag}") | .id', capture=True).strip()
+    _gh("api", "-X", "PATCH", f"repos/{args.repo}/releases/{release_id}",
+        "-f", "make_latest=false", "--silent")
 
     base = f"https://github.com/{args.repo}/releases/download/{tag}"
     moved = {item["url"]: (f"{base}/{urllib.parse.quote(item['asset'])}", item["sha256"]) for item in items}
