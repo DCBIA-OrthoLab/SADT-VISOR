@@ -44,6 +44,21 @@ RUN set -eu; \
     done; \
     rm -rf /build-cache
 
+# Which release this is, readable two ways: as image labels, which a server's
+# update agent reads with `docker image inspect` without starting anything,
+# and as RELEASE.json beside the tools, which the server process can read
+# through the mount. A local build that passes nothing is "local".
+ARG RELEASE=local
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/DCBIA-OrthoLab/SADT-VISOR
+LABEL org.opencontainers.image.title="SADT-VISOR tools" \
+      org.opencontainers.image.version="${RELEASE}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.visor.library.root="${ROOT}"
+RUN printf '{"library": "SADT-VISOR", "release": "%s", "revision": "%s", "source": "%s", "built": "%s"}\n' \
+        "${RELEASE}" "${REVISION}" "${SOURCE}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${ROOT}/RELEASE.json"
+
 # The build stage IS the image. Copying ROOT into an empty image would save the
 # 150 MB Debian base, but costs a second full copy of the virtualenvs while it
 # builds; the server never runs anything from this image's own filesystem
