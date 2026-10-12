@@ -270,8 +270,8 @@ def test_the_default_bound_is_upstreams_ten_minutes(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     pipeline.run_greedy(["-d", "3"])
 
-    assert pipeline.CASE_TIMEOUT_SECONDS == 600
-    assert seen["timeout"] == 600
+    assert pipeline.CASE_TIMEOUT_SECONDS == 1800
+    assert seen["timeout"] == 1800
 
 
 def test_a_missing_interpreter_is_not_swallowed(monkeypatch):
@@ -370,7 +370,7 @@ def test_a_timeout_names_the_step_and_the_bound_and_no_path(monkeypatch):
     with pytest.raises(TimeoutError) as expired:
         pipeline.run_greedy(command)
 
-    assert str(expired.value) == "greedy registration did not finish within 600s"
+    assert str(expired.value) == "greedy registration did not finish within 1800s"
     assert expired.value.__cause__ is None and expired.value.__suppress_context__
 
 

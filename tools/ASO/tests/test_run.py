@@ -2290,3 +2290,37 @@ def test_the_frame_bundles_are_the_ones_the_manifest_stages_for_aso():
     }
     for bundle in catalogs.FRAME_BUNDLES.values():
         assert bundle in staged, bundle
+
+
+# ---------------------------------------------------------------------------
+# A Semi-Automated jaw without landmarks falls back to tooth centroids
+# ---------------------------------------------------------------------------
+
+def test_a_jaw_without_landmarks_aligns_on_a_triplet_not_the_landmark_selection(monkeypatch):
+    """Ticking the whole arch for crown landmarks used to fail every jaw that
+    came without landmarks: the centroid alignment needs 3 or 4 teeth."""
+    from sadt_aso import catalogs
+    from sadt_aso.ios import pipeline
+
+    received = {}
+
+    def fake_fully(available, reference_entry, teeth, *rest):
+        received["teeth"] = teeth
+        return np.eye(4)
+
+    monkeypatch.setattr(pipeline, "_fully_automated_matrix", fake_fully)
+    whole_arch = list(catalogs.UPPER_TEETH)
+    pipeline._matrix_for(
+        "Upper", {"surface": "u.vtk", "markups": None}, {"Upper": {"surface": "r.vtk"}},
+        catalogs.AUTOMATION_SEMI, {"Upper": whole_arch}, {"Upper": []}, None, {}, 1, 0,
+        pipeline.FileCache(),
+    )
+    assert received["teeth"] == [t for t in catalogs.DEFAULT_TEETH if t in catalogs.UPPER_TEETH]
+
+
+def test_a_fitting_selection_and_a_forced_one_are_used_as_given(monkeypatch):
+    from sadt_aso import catalogs
+    from sadt_aso.ios import pipeline
+
+    assert pipeline._centroid_teeth("Lower", ["LR6", "LR1", "LL6"], False) == ["LR6", "LR1", "LL6"]
+    assert pipeline._centroid_teeth("Lower", list(catalogs.LOWER_TEETH), True) == list(catalogs.LOWER_TEETH)
