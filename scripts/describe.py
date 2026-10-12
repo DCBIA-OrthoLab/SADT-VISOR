@@ -1069,6 +1069,10 @@ def describe_run(run, package=None):
     if injected_layout:
         described["injected_layout"] = injected_layout
 
+    paired = paired_for(inspect.getmodule(run), arguments)
+    if paired:
+        described["paired"] = paired
+
     if supervisor:
         # Published so the server can tell, before accepting a job, that this
         # tool needs something to be injected. A deployment whose runner cannot
@@ -1076,6 +1080,44 @@ def describe_run(run, package=None):
         # call fail halfway through.
         described["supervisor"] = True
     return described
+
+
+# Which path inputs hold the same patients, declared beside `run()`:
+# `PAIRED = {"axes": ["t1", "t2"]}`, with a `pairs(**{axis: [names]})` that
+# says which listed files go together. Published so a client splitting a
+# cohort into batches splits every axis by the SAME patients -- the server
+# relays the question to `pairs()` and knows nothing of how a tool pairs.
+PAIRED_NAME = "PAIRED"
+PAIRS_FUNCTION = "pairs"
+
+
+def paired_for(module, arguments):
+    """`{"axes": [...]}` from the tool's own `PAIRED`, checked, or None."""
+    declared = getattr(module, PAIRED_NAME, None)
+    if declared is None:
+        return None
+    if not isinstance(declared, dict) or set(declared) - {"axes"}:
+        raise SchemaError("{} must be {{'axes': [argument, ...]}}.".format(PAIRED_NAME))
+    axes = declared.get("axes")
+    if not isinstance(axes, (list, tuple)) or len(axes) < 2 or len(set(axes)) != len(axes):
+        raise SchemaError("{}['axes'] must name two or more distinct arguments.".format(PAIRED_NAME))
+    for axis in axes:
+        spec = arguments.get(axis)
+        if spec is None:
+            raise SchemaError("{}: run() has no argument '{}'.".format(PAIRED_NAME, axis))
+        if spec.get("type") != "path" or not spec.get("required"):
+            raise SchemaError(
+                "{}: '{}' must be a required path argument to be split.".format(PAIRED_NAME, axis))
+    pairs = getattr(module, PAIRS_FUNCTION, None)
+    if not inspect.isfunction(pairs):
+        raise SchemaError(
+            "{} is declared but the module defines no {}() to answer which files "
+            "go together.".format(PAIRED_NAME, PAIRS_FUNCTION))
+    missing = [axis for axis in axes if axis not in inspect.signature(pairs).parameters]
+    if missing:
+        raise SchemaError("{}() must take every axis; it lacks {}.".format(
+            PAIRS_FUNCTION, ", ".join(missing)))
+    return {"axes": list(axes)}
 
 
 def source_hash(src_dir):
