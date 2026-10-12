@@ -1,0 +1,6 @@
+# Built artifacts and history: the bundle builds its own virtualenvs.
+.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache

@@ -1,0 +1,133 @@
+name: tools release
+
+# Every push to `deploy` that changes a tool cuts a tools release:
+#
+#   1. the bundle image (docker/tools.Dockerfile) -- every tool's virtualenv
+#      and its Python, built at the fixed path a VISOR server mounts it at --
+#      pushed as ghcr.io/<owner>/sadt-visor-tools:tools-YYYY.MM.DD-N and :latest;
+#   2. a GitHub release of the same name, saying which image (by digest),
+#      which data release the manifest points at, and which tools changed.
+#
+# A push that touches no tool (docs, data manifest, CI) cuts nothing. The tag
+# counter only counts `tools-` tags, so data releases keep their own series.
+#
+# The image is ~25 GB unpacked, more than a hosted runner has free. The runner
+# is cleared of the toolchains this job never uses first, and the image is
+# pushed straight from BuildKit, never loaded into the local daemon.
+
+on:
+  push:
+    branches: [deploy]
+  workflow_dispatch:
+
+concurrency:
+  group: tools-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: What changed since the last tools release
+        id: changes
+        run: |
+          previous=$(git tag --list 'tools-*' --sort=-creatordate | head -1)
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          if [ -z "$previous" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "tools=(first release)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py docker/tools.Dockerfile .dockerignore)
+          if [ -z "$changed" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing a tool is built from changed since $previous: no release."
+            exit 0
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          tools=$(echo "$changed" | awk -F/ '$1=="tools"{print ($3 ~ /^(src|tests|pyproject.toml|uv.lock|README.md)$/ || $3=="") ? $2 : $2"/"$3}' | sort -u | tr '\n' ' ')
+          echo "tools=${tools:-shared code only}" >> "$GITHUB_OUTPUT"
+
+      - name: Name the release
+        if: steps.changes.outputs.build == 'true'
+        id: name
+        run: |
+          day=$(date -u +%Y.%m.%d)
+          used=$(git tag --list "tools-$day-*" | sed "s/^tools-$day-//" | sort -n | tail -1)
+          tag="tools-$day-$(( ${used:-0} + 1 ))"
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/sadt-visor-tools" >> "$GITHUB_OUTPUT"
+
+      - name: Make room for a 25 GB image
+        if: steps.changes.outputs.build == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          docker system prune -af >/dev/null
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.changes.outputs.build == 'true'
+
+      - uses: docker/login-action@v3
+        if: steps.changes.outputs.build == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the bundle
+        if: steps.changes.outputs.build == 'true'
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/tools.Dockerfile
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
+            ${{ steps.name.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Publish the release
+        if: steps.changes.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.name.outputs.tag }}
+          IMAGE: ${{ steps.name.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PREVIOUS: ${{ steps.changes.outputs.previous }}
+          TOOLS: ${{ steps.changes.outputs.tools }}
+        run: |
+          data=$(grep -oE 'releases/download/data-[0-9.]+-[0-9]+' scripts/data-manifest.yml | sort -u | sed 's#.*/##' | tr '\n' ' ')
+          {
+            echo "Every tool of this library, already installed, as one image a VISOR server mounts read-only."
+            echo
+            echo '```'
+            echo "$IMAGE:$TAG"
+            echo "$IMAGE@$DIGEST"
+            echo '```'
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Changed since ${PREVIOUS:-the start} | $TOOLS |"
+            echo "| Data release the manifest points at | ${data:-none} |"
+            echo "| Commit | $GITHUB_SHA |"
+            echo
+            echo "On a server: \`SADT_TOOLS_IMAGE=$IMAGE:$TAG\`, then recreate the container."
+            echo "To build it yourself instead: the source below, and \`uv sync --frozen --all-extras\` in each tool."
+          } > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+             --notes-file notes.md --generate-notes
