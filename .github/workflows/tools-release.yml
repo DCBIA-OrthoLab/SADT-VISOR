@@ -97,9 +97,10 @@ jobs:
           tags: |
             ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
             ${{ steps.name.outputs.image }}:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            RELEASE=${{ steps.name.outputs.tag }}
+            REVISION=${{ github.sha }}
+            SOURCE=https://github.com/${{ github.repository }}
 
       - name: Publish the release
         if: steps.changes.outputs.build == 'true'
