@@ -133,7 +133,13 @@ def binarise_mask(source: str, destination: str) -> None:
 # cohort legitimately takes hours. So one pathological pair could hold a
 # concurrency slot for ever. Greedy is therefore still run as a SUBPROCESS,
 # with its own interpreter: the package replaces the binary, not the boundary.
-CASE_TIMEOUT_SECONDS = 600
+#
+# Upstream's 600 s no longer fits the default. Measured on a clinical CBCT
+# pair with NCC and a rigid transform: 534 s with the server otherwise idle,
+# and over 600 s with three other runs alongside -- the default request failed
+# under ordinary load. 1800 s keeps the bound three times above the idle
+# figure, which still frees a slot from a pair that will not converge.
+CASE_TIMEOUT_SECONDS = 1800
 
 _CHILD = """
 import sys

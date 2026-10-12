@@ -197,7 +197,7 @@ def test_greedy_runs_in_a_child_process_with_a_timeout(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert pipeline.run_greedy(["-d", "3", "-a"]) == "ok"
-    assert seen["timeout"] == pipeline.CASE_TIMEOUT_SECONDS == 600
+    assert seen["timeout"] == pipeline.CASE_TIMEOUT_SECONDS == 1800
     assert seen["command"][0].endswith("python") or "python" in seen["command"][0]
     assert seen["command"][1] == "-c"
     assert seen["command"][-3:] == ["-d", "3", "-a"]
