@@ -445,11 +445,35 @@ def _matrix_for(
     forced = automation == catalogs.AUTOMATION_FULLY
     if forced or not available["markups"]:
         return _fully_automated_matrix(
-            available, reference_entry, selected_teeth[jaw], max_triplets, seed, cache
+            available, reference_entry, _centroid_teeth(jaw, selected_teeth[jaw], forced),
+            max_triplets, seed, cache,
         )
     return _semi_automated_matrix(
         available, reference_entry, landmark_keys[jaw], max_triplets, seed, cache
     )
+
+
+def _centroid_teeth(jaw: str, selected: list, forced: bool) -> list:
+    """The teeth the coarse alignment of a jaw without landmarks runs on.
+
+    A Fully-Automated request is validated to 3 or 4 teeth per jaw before any
+    mesh is read, so its selection is used as given. A Semi-Automated one is
+    not: its teeth only multiply landmark types, and a clinician who ticks the
+    whole arch to register on every crown landmark is right to. When such a
+    jaw turns out to carry no landmarks, it falls back to tooth centroids --
+    and handing those sixteen teeth to an alignment built on three failed the
+    jaw outright. The selection is kept when it fits; otherwise the jaw's
+    default triplet, the same one the Fully-Automated form starts from.
+    """
+    if forced or len(selected) in (3, 4):
+        return list(selected)
+    default = [name for name in catalogs.DEFAULT_TEETH if catalogs.split_by_jaw([name])[jaw]]
+    logger.info(
+        "%s jaw has no landmarks: aligning on its tooth centroids with %s "
+        "(the %d teeth selected suit landmarks, not the 3-or-4-tooth alignment)",
+        jaw, ", ".join(default), len(selected),
+    )
+    return default
 
 
 def _fully_automated_matrix(
