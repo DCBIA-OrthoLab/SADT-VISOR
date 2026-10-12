@@ -17,6 +17,21 @@
 
 ARG ROOT=/opt/visor/libraries/sadt-visor
 
+# ----------------------------------------------------------------------
+# Manifests only
+# ----------------------------------------------------------------------
+# Every pyproject.toml and uv.lock, at their paths, and nothing else. This
+# stage re-runs on any change to the repository, but its OUTPUT is content-
+# addressed: as long as no manifest changed, it is byte-identical, so the
+# dependency layer below is a cache hit -- and the layer a server already has.
+FROM busybox:1.36 AS manifests
+COPY . /ctx/
+RUN mkdir -p /manifests && cd /ctx && \
+    find . \( -name pyproject.toml -o -name uv.lock \) -not -path "*/.venv/*" | \
+    while read -r manifest; do \
+        mkdir -p "/manifests/$(dirname "$manifest")" && cp "$manifest" "/manifests/$manifest"; \
+    done
+
 FROM python:3.11-slim-bookworm
 ARG ROOT
 COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /usr/local/bin/uv
@@ -33,6 +48,31 @@ ENV UV_PYTHON_INSTALL_DIR=${ROOT}/python \
     UV_PYTHON_DOWNLOADS=automatic \
     UV_CACHE_DIR=/build-cache \
     UV_LINK_MODE=hardlink
+
+# ----------------------------------------------------------------------
+# Layer 1: every third-party dependency (~25 GB), from the lockfiles alone
+# ----------------------------------------------------------------------
+# Neither a tool's own code nor the shared packages beside it (AREG/common,
+# ALI/common, naming): those are what change from one release to the next,
+# and they go in the small layer below. A release that changes only code
+# therefore rebuilds nothing here, and a server pulling it downloads nothing
+# of this layer -- its digest is the one it already holds.
+COPY --from=manifests /manifests/ ${ROOT}/
+RUN set -eu; \
+    cd "${ROOT}"; \
+    for project in tools/*/pyproject.toml tools/*/*/pyproject.toml; do \
+        grep -q "^\[tool.sadt\]" "$project" || continue; \
+        tool=$(dirname "$project"); \
+        echo "==> dependencies of $tool"; \
+        ( cd "$tool" && uv sync --frozen --all-extras --no-dev --no-install-project --no-install-local ); \
+    done; \
+    rm -rf /build-cache
+
+# ----------------------------------------------------------------------
+# Layer 2: the code -- each tool and the shared packages it uses (a few MB)
+# ----------------------------------------------------------------------
+# The same sync, now with the sources present: everything above is already in
+# place, so it only installs the tool itself and its local packages.
 COPY . ${ROOT}/
 RUN set -eu; \
     cd "${ROOT}"; \

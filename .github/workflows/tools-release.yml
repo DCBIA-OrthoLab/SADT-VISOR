@@ -8,8 +8,15 @@ name: tools release
 #   2. a GitHub release of the same name, saying which image (by digest),
 #      which data release the manifest points at, and which tools changed.
 #
-# A push that touches no tool (docs, data manifest, CI) cuts nothing. The tag
-# counter only counts `tools-` tags, so data releases keep their own series.
+# A push that changes nothing a server runs -- docs, tests, the data manifest,
+# CI -- cuts nothing. The tag counter only counts `tools-` tags, so data
+# releases keep their own series.
+#
+# The image is two layers (docker/tools.Dockerfile): every third-party
+# dependency, built from the lockfiles alone, then the tools' own code. The
+# build cache is kept in the registry beside the image, so a release that
+# changes only code reuses the dependency layer instead of rebuilding it --
+# minutes instead of twenty -- and a server pulling it downloads only the code.
 #
 # The image is ~25 GB unpacked, more than a hosted runner has free. The runner
 # is cleared of the toolchains this job never uses first, and the image is
@@ -47,7 +54,9 @@ jobs:
             echo "tools=(first release)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py docker/tools.Dockerfile .dockerignore)
+          # What a server runs: documentation and tests change nothing in it.
+          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py docker/tools.Dockerfile .dockerignore \
+                    | grep -vE '(\.md$|(^|/)tests/)' || true)
           if [ -z "$changed" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
             echo "Nothing a tool is built from changed since $previous: no release."
@@ -67,6 +76,7 @@ jobs:
           owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$owner/sadt-visor-tools" >> "$GITHUB_OUTPUT"
+          echo "cache=ghcr.io/$owner/sadt-visor-tools:buildcache" >> "$GITHUB_OUTPUT"
 
       - name: Make room for a 25 GB image
         if: steps.changes.outputs.build == 'true'
@@ -97,6 +107,8 @@ jobs:
           tags: |
             ${{ steps.name.outputs.image }}:${{ steps.name.outputs.tag }}
             ${{ steps.name.outputs.image }}:latest
+          cache-from: type=registry,ref=${{ steps.name.outputs.cache }}
+          cache-to: type=registry,ref=${{ steps.name.outputs.cache }},mode=max
           build-args: |
             RELEASE=${{ steps.name.outputs.tag }}
             REVISION=${{ github.sha }}
