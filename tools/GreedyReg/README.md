@@ -57,6 +57,17 @@ patients 4 to 40, and the batch reported nothing about any of them -- including
 the two that had already succeeded. Failures are recorded per patient now, and
 a run where NOTHING registered raises rather than returning an empty success.
 
+### Each registration is bounded, at 1800 s
+
+Upstream ran greedy with `subprocess.run(..., timeout=600)`. The bound is kept
+-- greedy still runs as a child process, so one pair that will not converge
+frees its slot instead of holding it for ever -- but at 1800 s
+(`CASE_TIMEOUT_SECONDS`). Measured on a clinical CBCT pair with the default
+NCC metric and a rigid transform: 534 s on an otherwise idle server, and over
+600 s with three other runs alongside, so the default request failed under
+ordinary load. A timed-out pair is recorded like any failed one and the batch
+goes on.
+
 ### Not ported
 
 The `<filter-progress>` / `<filter-comment>` stdout protocol, which is how the
