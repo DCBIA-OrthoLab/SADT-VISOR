@@ -883,7 +883,7 @@ tools:
         size: 4683073408
       - name: model-q4_k_m.gguf
         dest: Ortho/model-q4_k_m.gguf
-        url: https://huggingface.co/DCBIA-OrthoLab/Meta-Llama-3.1-8B-Instruct-Ortho/resolve/main/model-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Llama-3.1-8B-Instruct-Ortho/resolve/main/model-q4_k_m.gguf
         size: 4920738880
     testfiles:
       # One of the synthetic TMJ consult notes the module ships in its own

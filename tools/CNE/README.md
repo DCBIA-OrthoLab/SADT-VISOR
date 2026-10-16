@@ -205,7 +205,7 @@ DCBIA-OrthoLab organization on Hugging Face: the TMJ weights
 (`TMJ/qwen-ft-q4_k_m.gguf`, 4.4 GB) from
 `DCBIA-OrthoLab/Qwen-2.5-7B-Instruct-TMJ`, and the Ortho weights
 (`Ortho/model-q4_k_m.gguf`, 4.9 GB) from
-`DCBIA-OrthoLab/Meta-Llama-3.1-8B-Instruct-Ortho`.
+`DCBIA-OrthoLab/Llama-3.1-8B-Instruct-Ortho`.
 
 A bundle folder holding exactly one `.gguf` resolves to it, recursively. One
 holding several is **refused by name**: which model vintage ran must never
