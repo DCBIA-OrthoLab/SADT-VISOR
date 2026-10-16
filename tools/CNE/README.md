@@ -200,12 +200,12 @@ cannot simply be swapped at a fixed version.
 ## Data
 
 `DATA/CNE/models/<bundle>/` -- one folder per fine-tune, each holding one
-`.gguf`. `scripts/data-manifest.yml` in `VISOR-serve` stages the TMJ weights
+`.gguf`. `scripts/data-manifest.yml` stages both bundles from the
+DCBIA-OrthoLab organization on Hugging Face: the TMJ weights
 (`TMJ/qwen-ft-q4_k_m.gguf`, 4.4 GB) from
-`dcbia/Qwen-2.5-7B-Instruct-TMJ`. The Ortho bundle
-(`dcbia/Meta-Llama-3.1-8B-Instruct-Ortho`) answers 404 today -- the repository is
-private, renamed or gone -- so it is not listed; `notes_type = "Ortho"` works as
-soon as a bundle for it is staged.
+`DCBIA-OrthoLab/Qwen-2.5-7B-Instruct-TMJ`, and the Ortho weights
+(`Ortho/model-q4_k_m.gguf`, 4.9 GB) from
+`DCBIA-OrthoLab/Meta-Llama-3.1-8B-Instruct-Ortho`.
 
 A bundle folder holding exactly one `.gguf` resolves to it, recursively. One
 holding several is **refused by name**: which model vintage ran must never

@@ -1210,7 +1210,7 @@ def test_a_missing_model_path_is_a_file_not_found_error(tmp_path):
 
 @pytest.mark.parametrize("name,hint", [
     ("TMJ/qwen-ft-q4_k_m.gguf", "TMJ"),
-    ("Ortho/model-q4_0.gguf", "Ortho"),
+    ("Ortho/model-q4_k_m.gguf", "Ortho"),
     ("models/generic.gguf", ""),
 ])
 def test_the_model_path_hints_at_the_note_type_it_was_trained_for(name, hint):

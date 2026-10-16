@@ -868,20 +868,23 @@ tools:
   # CNE -- clinical note engine. NOT PORTED YET.
   #
   # The only tool whose weights are NOT on GitHub: two quantized GGUF LLMs on
-  # Hugging Face, pulled by CNE.getModelPath(). Its test files are bundled in
-  # the client repo (CNE/Resources/testfiles), so there is nothing to fetch.
+  # Hugging Face, in the DCBIA-OrthoLab organization, pulled by
+  # CNE.getModelPath(). Its test files are bundled in the client repo
+  # (CNE/Resources/testfiles), so there is nothing to fetch.
   #
-  # The second model the client declares,
-  # dcbia/Meta-Llama-3.1-8B-Instruct-Ortho/model-q4_0.gguf ("Ortho"), answers
-  # 404 today -- the repo is private, renamed, or gone. Left out rather than
-  # listed as a URL that cannot work; restore it once it resolves.
+  # The Ortho repository only ever held model-q4_k_m.gguf; the
+  # model-q4_0.gguf the client used to ask for never existed.
   # =========================================================================
   CNE:
     models:
       - name: qwen-ft-q4_k_m.gguf
         dest: TMJ/qwen-ft-q4_k_m.gguf
-        url: https://huggingface.co/dcbia/Qwen-2.5-7B-Instruct-TMJ/resolve/main/qwen-ft-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Qwen-2.5-7B-Instruct-TMJ/resolve/main/qwen-ft-q4_k_m.gguf
         size: 4683073408
+      - name: model-q4_k_m.gguf
+        dest: Ortho/model-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Meta-Llama-3.1-8B-Instruct-Ortho/resolve/main/model-q4_k_m.gguf
+        size: 4920738880
     testfiles:
       # One of the synthetic TMJ consult notes the module ships in its own
       # repository -- not patient data, and the only note anywhere public.
