@@ -550,3 +550,15 @@ def test_a_supervisor_is_accepted_and_unused_in_registration_mode(tmp_path):
     sup = FakeSup(tmp_path)
     run_registration(tmp_path, sup=sup)
     assert sup.calls == []
+
+
+def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
+    """`keep_intermediate` is injected by the server from the tools this one
+    calls. Hidden, a clinician had no way to look at a step's working; named,
+    every step the chain runs says what it hands back."""
+    from sadt_areg_ioscbct.layout import LAYOUT
+
+    hints = LAYOUT["keep_intermediate"]
+    assert not hints.get("hidden")
+    assert hints["label"] == "Steps to keep"
+    assert set(hints["option_help"]) == {"ALI_CBCT", "ALI_IOS", "ASO", "Crown_Seg"}

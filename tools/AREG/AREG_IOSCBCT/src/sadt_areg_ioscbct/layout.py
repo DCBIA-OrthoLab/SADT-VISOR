@@ -40,14 +40,28 @@ _PREDICTED = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_SEMI,
 _ORIENTED = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_FULLY]}
 
 LAYOUT = {
-    # Injected by the server for every tool that calls another (see
-    # describe.INJECTED_ARGUMENTS), and unnamed it arrives with a generic label
-    # in a section of its own -- an "Intermediate results" box in a panel that
-    # never asked for one. Hidden rather than renamed: what this chain leaves
-    # behind on the way is not something a clinician is being offered yet, and
-    # a check box that promises files nobody has decided to return is worse
-    # than no check box.
-    "keep_intermediate": {"hidden": True},
+    # Injected by the server for any tool that calls another, so it is not in
+    # run()'s signature -- see describe.INJECTED_ARGUMENTS. The options are the
+    # steps themselves; only the wording is this tool's to give, and it is
+    # worth giving: "intermediate results" says nothing to a clinician, while
+    # the name of a step plus what it hands back is what makes a chain
+    # inspectable. ASO, ALI_IOS and VFACE already offer it, and AREG was the
+    # odd one out. The server only collects the output of the calls THIS tool
+    # makes, so ticking `ASO` returns ASO's own result and not the landmarks
+    # ASO predicted on the way.
+    "keep_intermediate": {
+        "label": "Steps to keep",
+        "option_help": {
+            "ALI_CBCT": "The landmarks placed on the CBCT, before this tool "
+                        "registers on them.",
+            "ALI_IOS": "The landmarks placed on the intraoral scans, which the "
+                       "mucogingival patch is built from.",
+            "ASO": "The scans once both timepoints sit in a common orientation, "
+                   "before the registration is run on them.",
+            "Crown_Seg": "The per-tooth labelled meshes, which this tool "
+                         "otherwise only uses to name the teeth.",
+        },
+    },
 
     # Injected by the server too, from the checkpoints this chain offers, and
     # it lands in a "Quality control" section of its own. Not offered yet:

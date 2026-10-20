@@ -714,3 +714,15 @@ class TestSpans:
         tools.segment_masks(sup, str(tmp_path), "/models", ["CBMASK"])
 
         assert sup.spans == [("AMASSS", None)]
+
+
+def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
+    """`keep_intermediate` is injected by the server from the tools this one
+    calls. Hidden, a clinician had no way to look at a step's working; named,
+    every step the chain runs says what it hands back."""
+    from sadt_areg_cbct.layout import LAYOUT
+
+    hints = LAYOUT["keep_intermediate"]
+    assert not hints.get("hidden")
+    assert hints["label"] == "Steps to keep"
+    assert set(hints["option_help"]) == {"AMASSS", "ASO"}
