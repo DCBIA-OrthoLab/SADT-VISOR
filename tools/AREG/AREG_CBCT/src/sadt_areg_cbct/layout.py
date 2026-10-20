@@ -42,14 +42,25 @@ _ORIENTED = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_ORIENT
 _SEMI = {"automation": [catalogs.AUTOMATION_AUTO, catalogs.AUTOMATION_SEMI]}
 
 LAYOUT = {
-    # Injected by the server for every tool that calls another (see
-    # describe.INJECTED_ARGUMENTS), and unnamed it arrives with a generic label
-    # in a section of its own -- an "Intermediate results" box in a panel that
-    # never asked for one. Hidden rather than renamed: what this chain leaves
-    # behind on the way is not something a clinician is being offered yet, and
-    # a check box that promises files nobody has decided to return is worse
-    # than no check box.
-    "keep_intermediate": {"hidden": True},
+    # Injected by the server for any tool that calls another, so it is not in
+    # run()'s signature -- see describe.INJECTED_ARGUMENTS. The options are the
+    # steps themselves; only the wording is this tool's to give, and it is
+    # worth giving: "intermediate results" says nothing to a clinician, while
+    # the name of a step plus what it hands back is what makes a chain
+    # inspectable. ASO, ALI_IOS and VFACE already offer it, and AREG was the
+    # odd one out. The server only collects the output of the calls THIS tool
+    # makes, so ticking `ASO` returns ASO's own result and not the landmarks
+    # ASO predicted on the way.
+    "keep_intermediate": {
+        "label": "Steps to keep",
+        "option_help": {
+            "AMASSS": "The bone masks each region's registration is confined to "
+                      "-- what to look at when a registration lands on the "
+                      "wrong anatomy.",
+            "ASO": "The scans once both timepoints sit in a common orientation, "
+                   "before the registration is run on them.",
+        },
+    },
 
     # Injected by the server too, from the checkpoints this chain offers, and
     # it lands in a "Quality control" section of its own. Not offered yet:

@@ -1380,3 +1380,15 @@ def test_without_a_report_crown_seg_s_output_is_used_as_it_came(tmp_path):
     (planted / "x" / "A2_UpperT1_Seg.vtk").write_text("")
     sup = FakeSup(tmp_path, {"Crown_Seg": lambda params: planted})
     assert Path(tools.label_crowns(sup, str(tmp_path / "meshes"))) == planted
+
+
+def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
+    """`keep_intermediate` is injected by the server from the tools this one
+    calls. Hidden, a clinician had no way to look at a step's working; named,
+    every step the chain runs says what it hands back."""
+    from sadt_areg_ios.layout import LAYOUT
+
+    hints = LAYOUT["keep_intermediate"]
+    assert not hints.get("hidden")
+    assert hints["label"] == "Steps to keep"
+    assert set(hints["option_help"]) == {"ALI_IOS", "ASO", "Crown_Seg"}
