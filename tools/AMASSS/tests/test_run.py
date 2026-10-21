@@ -254,10 +254,27 @@ def test_split_scan_extension(filename, expected):
         # A legitimate scan whose name merely contains MASK is NOT an output:
         # the original CLI's blunt `'MASK' not in f` filter dropped it.
         ("MASKED_patient.nii.gz", False),
+        # The Slicer module's output, under a prediction id other than ours.
+        ("patient01_T1_Or_CBMASK-Seg_Pred.nii.gz", True),
+        ("patient01_T1_Or_MAXMASK-Seg_seg.nii.gz", True),
+        ("patient01_MAND-Seg.nii.gz", True),
+        ("patient01_T1_Or.nii.gz", False),
     ],
 )
 def test_is_previous_output(filename, expected):
     assert pipeline.is_previous_output(filename, "Pred") is expected
+
+
+def test_masks_kept_beside_a_scan_are_not_discovered_as_scans(tmp_path):
+    # The layout of a semi-automated AREG case, segmented under AREG's own id.
+    scan = tmp_path / "patient01_T1_Or.nii.gz"
+    scan.write_bytes(b"")
+    masks = tmp_path / "patient01_T1_Or_SegOut"
+    masks.mkdir()
+    for code in ("CBMASK", "MANDMASK", "MAXMASK"):
+        (masks / f"patient01_T1_Or_{code}-Seg_Pred.nii.gz").write_bytes(b"")
+
+    assert pipeline.discover_scans(str(tmp_path), "seg") == [str(scan)]
 
 
 def test_discover_scans_excludes_previous_outputs(tmp_path):
