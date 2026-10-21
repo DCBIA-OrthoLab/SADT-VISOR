@@ -726,3 +726,21 @@ def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
     assert not hints.get("hidden")
     assert hints["label"] == "Steps to keep"
     assert set(hints["option_help"]) == {"AMASSS", "ASO"}
+
+
+def test_both_timepoints_keep_their_ticked_anatomy_in_the_report(tmp_path):
+    """The T2 is segmented for the ticked anatomy too, so its files land in the
+    same folder and the second collection adds to the first instead of
+    replacing it."""
+    t1_dir, t2_dir = tmp_path / "t1_seg", tmp_path / "t2_seg"
+    _seg_out(t1_dir, "P1_T1", ["MAND"])
+    _seg_out(t2_dir, "P1_T2", ["MAND"])
+    output = tmp_path / "out"
+    output.mkdir()
+    report = {}
+
+    dispatch._collect_segmentations(str(t1_dir), ["MAND"], str(output), report)
+    dispatch._collect_segmentations(str(t2_dir), ["MAND"], str(output), report)
+
+    got = sorted(pathlib.Path(p).name for p in report["segmentations"])
+    assert got == ["P1_T1_Seg_MAND.nii.gz", "P1_T2_Seg_MAND.nii.gz"]

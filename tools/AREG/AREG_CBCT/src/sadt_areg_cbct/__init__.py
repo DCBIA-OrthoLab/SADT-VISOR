@@ -132,7 +132,8 @@ def run(
         segmentations: Anatomy to segment and return beside the registration,
             for the modes that segment. Independent of `regions`: ticking the
             skin does not register on it, and registering on the mandible does
-            not return a mandible you can open. None by default -- a
+            not return a mandible you can open. Returned for both timepoints,
+            which costs a second segmentation pass over the T2. None by default -- a
             registration run returns a registration.
         segmentation_model: A mask model bundle to use instead of AMASSS's
             own, for the modes that segment. Left empty -- which is what a
