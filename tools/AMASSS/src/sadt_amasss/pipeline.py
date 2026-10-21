@@ -123,6 +123,12 @@ def is_previous_output(filename: str, prediction_id: str) -> bool:
     for code in STRUCTURE_CODES:
         if base.endswith(f"_{code}"):
             return True
+        # The Slicer module's naming, `<scan>_CBMASK-Seg_Pred`: masks a
+        # clinician keeps beside their scans. Read as scans, each became a
+        # subject of its own, and AREG then found several masks for one patient
+        # and registered none.
+        if re.search(rf"_{code}-Seg(_[^_]+)?$", base):
+            return True
     return bool(re.search(r"_Seg(Out)?$", base))
 
 
