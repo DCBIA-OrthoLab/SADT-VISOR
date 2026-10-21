@@ -215,7 +215,7 @@ def _collect_segmentations(amasss_dir, codes, output_dir, report) -> None:
             shutil.copy2(os.path.join(root, name), os.path.join(target_dir, name))
             collected.append(os.path.join(SEGMENTATION_DIRNAME,
                                           os.path.basename(root), name))
-    report["segmentations"] = sorted(collected)
+    report["segmentations"] = sorted(report.get("segmentations", []) + collected)
 
 
 # Where the oriented T1 lands in the caller's output, with ASO's landmarks and
@@ -365,13 +365,29 @@ def _run_cbct(
         wanted = [catalogs.SEGMENTATION_CODES[name]
                   for name in _selected(segmentations, catalogs.SEGMENTATION_CHOICES)]
         structures = masks + [code for code in wanted if code not in masks]
+        # The T2 is segmented too, but only for what was ticked: the
+        # registration never reads a T2 mask, so without a ticked structure
+        # the second pass would cost a run for nothing. It takes the second
+        # half of the segmentation's share of the bar.
+        t2_pass = bool(wanted)
+        t1_span = segment_span
+        if t2_pass:
+            middle = (segment_span[0] + segment_span[1]) / 2
+            t1_span, t2_span = (segment_span[0], middle), (middle, segment_span[1])
         progress.emit(segment_span[0], "segmenting the T1 scans with AMASSS")
         amasss_dir = tools.segment_masks(
-            sup, t1_root, segmentation_model, structures, span=segment_span
+            sup, t1_root, segmentation_model, structures, span=t1_span
         )
         mask_roots.append(amasss_dir)
         report["segmented_t1"] = sorted(structures)
         _collect_segmentations(amasss_dir, wanted, output_dir, report)
+        if t2_pass:
+            progress.emit(t2_span[0], "segmenting the T2 scans with AMASSS")
+            t2_amasss_dir = tools.segment_masks(
+                sup, t2_root, segmentation_model, wanted, span=t2_span
+            )
+            report["segmented_t2"] = sorted(wanted)
+            _collect_segmentations(t2_amasss_dir, wanted, output_dir, report)
 
     # Step 3 -- pair the timepoints, then register once per region.
     register_start, register_end = register_span

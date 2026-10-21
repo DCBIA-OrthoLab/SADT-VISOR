@@ -211,7 +211,7 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures, span=Non
     model and AMASSS resolves it from its own data folder; AREG naming it meant
     keeping a copy under DATA/AREG/.
     """
-    logger.info("AREG: asking 'AMASSS' for T1 masks (%s)", ", ".join(mask_structures))
+    logger.info("AREG: asking 'AMASSS' for masks (%s)", ", ".join(mask_structures))
     weights = {"model": model_path} if model_path else {}
     return _returned(sup.run(
         "AMASSS",

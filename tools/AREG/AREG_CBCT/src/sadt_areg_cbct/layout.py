@@ -56,9 +56,11 @@ LAYOUT = {
         "option_help": {
             "AMASSS": "The bone masks each region's registration is confined to "
                       "-- what to look at when a registration lands on the "
-                      "wrong anatomy.",
-            "ASO": "The scans once both timepoints sit in a common orientation, "
-                   "before the registration is run on them.",
+                      "wrong anatomy. The ticked segmentations of the T2 "
+                      "are in it too.",
+            "ASO": "The T1 scans once oriented onto the chosen frame, before the "
+                   "registration is run on them. The T2 is not oriented: it is "
+                   "registered into the oriented T1's frame.",
         },
     },
 
