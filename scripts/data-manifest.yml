@@ -865,12 +865,12 @@ tools:
         extract: true
 
   # =========================================================================
-  # CNE -- clinical note engine. NOT PORTED YET.
+  # CNE -- clinical note engine. LIVE on the server.
   #
   # The only tool whose weights are NOT on GitHub: two quantized GGUF LLMs on
-  # Hugging Face, in the DCBIA-OrthoLab organization, pulled by
-  # CNE.getModelPath(). Its test files are bundled in the client repo
-  # (CNE/Resources/testfiles), so there is nothing to fetch.
+  # Hugging Face, in the DCBIA-OrthoLab organization, which the former client
+  # module downloaded itself (CNE.getModelPath()). Each lands in a folder named
+  # after its note type, which is what the tool reads when no model is named.
   #
   # The Ortho repository only ever held model-q4_k_m.gguf; the
   # model-q4_0.gguf the client used to ask for never existed.

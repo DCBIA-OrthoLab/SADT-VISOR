@@ -27,8 +27,8 @@ For each note found under `notes`:
 |---|---|
 | `notes` | one note, or a folder of them. Searched recursively. |
 | `notes_type` | `TMJ` or `Ortho`. Selects the system prompt and the context window together. |
-| `model` | the hosted GGUF bundle, picked by name from `DATA/CNE/models/`. |
 | `output_dir` | filled in by the server: the job's own output folder. |
+| `model` | the hosted GGUF bundle, picked by name from `DATA/CNE/models/`. Left empty, the bundle named after `notes_type`. |
 | `max_tokens` | the longest answer per note (default 2048). |
 | `temperature` | default `0.0`, so the same note extracts to the same answer twice. |
 | `context_tokens` | `0` means the note type's default (TMJ 6144, Ortho 2048). |
@@ -38,6 +38,15 @@ For each note found under `notes`:
 `model` is a `Path` argument called `model`, which is what makes the server
 publish it as a **name a client picks from what this server hosts** -- never a
 file a clinician can upload, and never a download at run time.
+
+It is optional. Left empty -- "(automatic)" in a panel -- the run uses
+`DATA/CNE/models/<notes_type>/`, the bundle fine-tuned for that note type. That
+is how upstream's panel worked (it asked for the note type alone), and it keeps
+the Ortho weights from being paired with the TMJ prompt by a slip of the model
+dropdown. No such bundle staged is the deployment's to fix and answers 503.
+
+`notes` publishes the extensions its readers read (`ACCEPTS`), so a client's
+file dialog offers notes rather than scans.
 
 ## Provenance
 
@@ -216,7 +225,7 @@ depend on sort order.
 ```bash
 cd tools/CNE
 uv sync --all-groups
-uv run pytest                                   # 122 tests, no weights, no GPU
+uv run pytest                                   # 165 tests, no weights, no GPU
 uv run pytest -m models -o addopts=             # needs CNE_MODEL=<bundle>
 .venv/bin/python -m pyflakes src tests
 .venv/bin/python ../../scripts/describe.py .    # the schema the server publishes

@@ -16,6 +16,7 @@ from .extraction import (
     build_messages,
     complete,
     context_for,
+    default_model,
     load_model,
     model_type_hint,
     parse_extraction,
@@ -42,19 +43,29 @@ OUTPUT_PREFIX = "Extraction_"
 
 REPORT_NAME = "CNE_report.json"
 
+# What `notes` can be, published so a client's file dialog offers notes and
+# not scans. A folder still travels as a .zip, which the server accepts for any
+# path argument on its own.
+ACCEPTS = {"notes": NOTE_EXTENSIONS}
+
 __all__ = ["run"]
 
 
 def run(
     notes: Path,
     notes_type: Literal["TMJ", "Ortho"],
-    model: Path,
     output_dir: Path,
+    # After `output_dir` and optional, which is what lets a panel show
+    # "(automatic)": the note type already says which fine-tune is meant, so
+    # the panel the clinician used before this port asked for the type alone.
+    model: Path = "",
     max_tokens: int = 2048,
     temperature: float = 0.0,
     context_tokens: int = 0,
     seed: int = 0,
     device: Literal["cpu", "cuda"] = "cpu",
+    *,
+    data_root=None,
 ) -> Path:
     """Extract structured findings from free-text clinical notes with a local LLM.
 
@@ -64,13 +75,15 @@ def run(
             matched case-insensitively, so notes filed per patient and a
             `NOTE.PDF` off a Windows share are both found.
         notes_type: Which fine-tune is being run, "TMJ" or "Ortho". It selects
-            the system prompt and the context window together, and it must match
-            the model picked below -- they are two different models.
-        model: The quantised GGUF model, named from what this server hosts. A
-            hosted bundle folder holding exactly one .gguf resolves to it; one
-            holding several is refused rather than resolved by sort order.
+            the system prompt, the context window and, unless a model is named
+            below, the model itself -- they are two different models.
         output_dir: Where the extractions are written. Nothing is written
             outside it, and it may not be the notes folder itself.
+        model: The quantised GGUF model, named from what this server hosts.
+            Left empty, the bundle named after the note type is used, which is
+            the one fine-tuned for it. A hosted bundle folder holding exactly
+            one .gguf resolves to it; one holding several is refused rather
+            than resolved by sort order.
         max_tokens: The longest answer the model may give per note. An answer
             cut off at this limit is reported as a failure and never written:
             truncated JSON parses as nothing, and upstream wrote the fragment as
@@ -130,7 +143,7 @@ def run(
     root = notes.parent if notes.is_file() else notes
     destinations = plan_outputs(found, root, output_dir)
 
-    model_file = resolve_model_file(model)
+    model_file = resolve_model_file(model or default_model(notes_type, data_root))
     warnings = []
     hint = model_type_hint(model_file)
     if hint and hint != notes_type:
