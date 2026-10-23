@@ -18,7 +18,7 @@ LAYOUT = {
     "model": {"section": INPUT, "label": "Model"},
     "max_tokens": {"section": GENERATION, "label": "Longest answer (tokens)"},
     "temperature": {"section": GENERATION, "label": "Temperature"},
-    "context_tokens": {"section": GENERATION, "label": "Context window (tokens)"},
+    "context_tokens": {"section": GENERATION, "label": "Context window (tokens, 0 = auto)"},
     "seed": {"section": GENERATION, "label": "Seed"},
     "device": {"section": GENERATION, "label": "Device"},
 }

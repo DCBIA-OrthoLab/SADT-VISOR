@@ -130,6 +130,35 @@ def resolve_model_file(model) -> Path:
     return candidates[0]
 
 
+# The DATA folder this tool's weights live in. Written rather than derived, as
+# CLIC's is: which folder holds which bundle is a deployment fact.
+DATA_NAME = "CNE"
+
+
+def default_model(notes_type: str, data_root) -> Path:
+    """The bundle a run uses when the caller names none: the note type's own.
+
+    `scripts/data-manifest.yml` stages each fine-tune in a folder named after
+    its note type (`DATA/CNE/models/TMJ/`, `DATA/CNE/models/Ortho/`), so the
+    type alone picks the matching weights -- which is how upstream's panel
+    worked, and what keeps the Ortho model from ever being paired with the TMJ
+    prompt by a slip of the model dropdown.
+    """
+    if data_root is None:
+        raise ValueError(
+            "No 'model' given and no data root to look in. Name the model, or "
+            "run this through a server that hosts one."
+        )
+    bundle = Path(data_root) / DATA_NAME / "models" / notes_type
+    if not bundle.is_dir():
+        # The deployment's to fix, not the caller's: 503, not 422.
+        raise ToolUnavailableError(
+            f"No {notes_type} model is staged on this server. Stage it with "
+            f"`setup-models.sh --tool CNE`, or name another model."
+        )
+    return bundle
+
+
 def model_type_hint(model_file) -> str:
     """"TMJ", "Ortho" or "" -- what the model's own path says it is for.
 
