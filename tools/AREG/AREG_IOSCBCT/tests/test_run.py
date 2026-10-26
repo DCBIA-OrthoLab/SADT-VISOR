@@ -562,3 +562,47 @@ def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
     assert not hints.get("hidden")
     assert hints["label"] == "Steps to keep"
     assert set(hints["option_help"]) == {"ALI_CBCT", "ALI_IOS", "ASO", "Crown_Seg"}
+
+
+# ---------------------------------------------------------------------------
+# A registration written but not to be trusted
+# ---------------------------------------------------------------------------
+
+def test_an_arch_left_far_from_its_landmarks_is_written_but_flagged(tmp_path, monkeypatch, caplog):
+    """A batch reported "ok" for arches the ICP had left 45 mm from their
+    landmarks: the surface fit scored well because it had slid along the
+    occlusal surface. Still written -- a reader may want to see it -- but
+    marked, counted, and said in the closing line."""
+    real = pipeline.register_one
+
+    def drifted(*args, **kwargs):
+        matrix, detail = real(*args, **kwargs)
+        detail["icp"] = dict(detail.get("icp") or {}, landmark_rms_after_mm=47.5)
+        return matrix, detail
+
+    monkeypatch.setattr(dispatch.pipeline, "register_one", drifted)
+    cohort(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        run_registration(tmp_path)
+    report = json.loads((tmp_path / "out" / "AREG_report.json").read_text())
+
+    patient = report["patients"]["1"]
+    assert patient["status"] == "review"
+    for mesh in patient["meshes"].values():
+        assert mesh["status"] == "review"
+        assert "47.5 mm" in mesh["review"]
+        assert os.path.isfile(tmp_path / "out" / mesh["output"])
+    assert report["meshes_to_review"] == len(patient["meshes"])
+    assert report["meshes_failed"] == 0
+    assert any("to review" in r.getMessage() and r.levelno == logging.WARNING
+               for r in caplog.records)
+
+
+def test_an_arch_close_to_its_landmarks_stays_ok(tmp_path):
+    cohort(tmp_path)
+    run_registration(tmp_path)
+    report = json.loads((tmp_path / "out" / "AREG_report.json").read_text())
+
+    assert report["patients"]["1"]["status"] == "ok"
+    assert report["meshes_to_review"] == 0
+    assert all("review" not in mesh for mesh in report["patients"]["1"]["meshes"].values())

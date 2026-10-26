@@ -68,6 +68,49 @@ def _image_from_mask(mask, reference):
     return image
 
 
+def _apply_direction(polydata, reference):
+    """Carry the surface into the scan's physical frame when its axes are not
+    the identity.
+
+    `vtkImageData` is given the scan's origin and spacing only, so the contour
+    comes out as if the direction were the identity. For a scan stored with an
+    axis flipped -- direction diag(1, -1, 1) is common -- that is a surface
+    mirrored about the origin, nowhere near the scan it was segmented from.
+    The direction is applied about the origin, p' = origin + D (p - origin);
+    a reflection also turns the triangles inside out, so their winding is
+    reversed to keep the normals pointing outwards.
+    """
+    import numpy as np
+    import vtk
+
+    direction = np.array(reference.GetDirection(), dtype=float).reshape(3, 3)
+    if np.allclose(direction, np.eye(3)):
+        return polydata
+    origin = np.array(reference.GetOrigin(), dtype=float)
+
+    matrix = vtk.vtkMatrix4x4()
+    for row in range(3):
+        for column in range(3):
+            matrix.SetElement(row, column, float(direction[row, column]))
+        matrix.SetElement(row, 3, float(origin[row] - direction[row] @ origin))
+    transform = vtk.vtkTransform()
+    transform.SetMatrix(matrix)
+    moved = vtk.vtkTransformPolyDataFilter()
+    moved.SetTransform(transform)
+    moved.SetInputData(polydata)
+    moved.Update()
+    polydata = moved.GetOutput()
+
+    if np.linalg.det(direction) < 0:
+        reverse = vtk.vtkReverseSense()
+        reverse.SetInputData(polydata)
+        reverse.ReverseCellsOn()
+        reverse.ReverseNormalsOn()
+        reverse.Update()
+        polydata = reverse.GetOutput()
+    return polydata
+
+
 def _mesh_from_mask(mask, reference, smoothing: int, color_rgb,
                     decimation: int = 0):
     """Build a colored surface for one binary mask.
@@ -116,6 +159,8 @@ def _mesh_from_mask(mask, reference, smoothing: int, color_rgb,
         decimator.SetFeatureAngle(60)
         decimator.Update()
         polydata = decimator.GetOutput()
+
+    polydata = _apply_direction(polydata, reference)
 
     # One flat colour for every cell, built in numpy and handed over once
     # rather than a Python-level SetTuple per cell. Same bytes either way; the

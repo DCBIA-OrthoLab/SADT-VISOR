@@ -66,15 +66,14 @@ class Environment:
         for scale_key, path in images_per_scale.items():
             image = sitk.ReadImage(path)
             array = sitk.GetArrayFromImage(image)
-            origin = image.GetOrigin()
             self.data[scale_key] = {
                 "path": path,
                 "image": self._transform(array).to(dtype=torch.int16),
                 "spacing": np.array(image.GetSpacing()),
-                # SimpleITK reports the origin in (x, y, z) while the array is
-                # indexed (z, y, x); reversed once here so every coordinate
-                # below is in array order.
-                "origin": np.array([origin[2], origin[1], origin[0]]),
+                # Kept whole, in SimpleITK's (x, y, z) order: physical_position
+                # needs the direction as well as the origin.
+                "origin": np.array(image.GetOrigin()),
+                "direction": np.array(image.GetDirection()).reshape(3, 3),
                 "size": np.array(np.shape(array)),
             }
 
@@ -108,11 +107,14 @@ class Environment:
     def physical_position(self, scale_key: str, position):
         """A voxel position at `scale_key`, in the scanner's LPS millimetres.
 
-        The inverse of the (x, y, z) -> (z, y, x) flip `load_images` applied,
-        so the value returned is in the order a markups file expects.
+        `position` is in array order (z, y, x); the value returned is (x, y, z),
+        the order a markups file expects. The full index-to-physical mapping,
+        origin + direction @ (spacing * index): the original computed
+        `(position - abs(origin / spacing)) * spacing`, which is right only for
+        an identity direction AND an all-negative origin. A scan stored with
+        its Y axis flipped -- direction diag(1, -1, 1), origin y positive --
+        came out mirrored front to back, every landmark in the air.
         """
         reference = self.data[scale_key]
-        spacing = reference["spacing"]
-        physical_origin = abs(reference["origin"] / spacing)
-        coordinates = (np.asarray(position) - physical_origin) * spacing
-        return np.array([coordinates[2], coordinates[1], coordinates[0]])
+        index = np.asarray(position, dtype=float)[::-1]
+        return reference["origin"] + reference["direction"] @ (reference["spacing"] * index)
