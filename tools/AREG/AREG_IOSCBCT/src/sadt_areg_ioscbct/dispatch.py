@@ -174,6 +174,22 @@ def _arch(mesh_path: str):
     return None
 
 
+def _needs_review(detail: dict) -> str:
+    """Why a written registration should not be trusted as is, or "".
+
+    The ICP grades itself on the surface only, and on a smooth occlusal
+    surface a fit that slid along the arch scores as well as the right one.
+    The landmarks are the independent check: still further apart after the
+    ICP than the pre-alignment would ever accept, the arch is not where its
+    landmarks say it is, whatever the surface fit reports.
+    """
+    after = (detail.get("icp") or {}).get("landmark_rms_after_mm")
+    if after is None or after <= geometry.MAX_LANDMARK_RESIDUAL_MM:
+        return ""
+    return (f"the landmarks are still {after:.1f} mm from their CBCT counterparts "
+            f"after the ICP (more than {geometry.MAX_LANDMARK_RESIDUAL_MM:.0f} mm)")
+
+
 def _most_common(failures: list) -> tuple:
     """`(first exception of the commonest kind, how many share it)`.
 
@@ -332,6 +348,7 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
 
     sole_patient = len(paired) == 1
     failures = []
+    to_review = 0
     total_meshes = sum(len(data["ios"]) for data in paired.values())
     for index, (patient, data) in enumerate(paired.items(), start=1):
         # Per patient, not per mesh: the inner loop is one or two arches, and
@@ -376,8 +393,15 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
                     # rewrites EVERY occurrence, so a mesh whose own stem carries
                     # `.vtk` produced a mangled matrix name beside a correct mesh.
                     np.save(os.path.splitext(destination)[0] + "_matrix.npy", matrix)
+                review = _needs_review(detail)
+                if review:
+                    logger.warning("%s: written, but to be checked before use: %s",
+                                   here, review)
+                    to_review += 1
                 entry["meshes"][name] = dict(
-                    detail, status="ok", output=os.path.relpath(destination, output_dir)
+                    detail, status="review" if review else "ok",
+                    output=os.path.relpath(destination, output_dir),
+                    **({"review": review} if review else {}),
                 )
             except Exception as exc:  # noqa: BLE001 - one mesh must not cost the batch
                 # Position, class and message: the report naming the mesh is
@@ -388,12 +412,14 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
                 logger.debug("Registration traceback", exc_info=True)
                 failures.append(exc)
                 entry["meshes"][name] = {"status": "failed", "error": str(exc)}
-        registered = [m for m in entry["meshes"].values() if m["status"] == "ok"]
-        entry["status"] = "ok" if registered else "failed"
+        statuses = [m["status"] for m in entry["meshes"].values()]
+        entry["status"] = ("ok" if "ok" in statuses
+                           else "review" if "review" in statuses else "failed")
         report["patients"][patient] = entry
 
     report["meshes_registered"] = total_meshes - len(failures)
     report["meshes_failed"] = len(failures)
+    report["meshes_to_review"] = to_review
     if failures and len(failures) == total_meshes:
         first, count = _most_common(failures)
         # Self-contained: the report is deleted with a failed job, so pointing
@@ -579,11 +605,19 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
         json.dump(report, handle, indent=2)
     failed = report.get("meshes_failed", 0)
     total = report.get("meshes_registered", 0) + failed
+    to_review = report.get("meshes_to_review", 0)
+    unpaired = len(report.get("unpaired", {}))
     # WARNING when partial: a batch that registered 30 of 40 arches finishes
-    # "successfully", and this line is where the other ten show.
+    # "successfully", and this line is where the other ten show -- along with
+    # the arches written but far from their landmarks, and the patients never
+    # registered at all because one modality was missing. "4 of 4 registered"
+    # once summed up a batch of six patients of which two were paired, both
+    # wrong.
     logger.log(
-        logging.WARNING if failed else logging.INFO,
-        "AREG_IOSCBCT: %d of %d mesh(es) registered, %d failed, over %d patient(s) "
-        "in %.1fs", total - failed, total, failed, len(report["patients"]),
-        report["duration_seconds"])
+        logging.WARNING if failed or to_review or unpaired else logging.INFO,
+        "AREG_IOSCBCT: %d of %d mesh(es) registered, %d failed, %d to review, over "
+        "%d patient(s) in %.1fs%s", total - failed, total, failed, to_review,
+        len(report["patients"]), report["duration_seconds"],
+        f"; {unpaired} patient(s) not registered, one modality missing"
+        if unpaired else "")
     return output_dir
