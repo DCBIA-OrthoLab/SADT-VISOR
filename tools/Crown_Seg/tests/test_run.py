@@ -385,42 +385,6 @@ def test_real_model_labels_a_real_mesh(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# the shapeaxi 2.0.x workaround
-# ---------------------------------------------------------------------------
-
-class _FakeSaxiNets:
-    """shapeaxi 2.0.x: `dental_model_seg` reads DentalModelSeg off this module,
-    and it is not there."""
-
-
-class _FakeSaxiNetsFixed:
-    DentalModelSeg = object()
-
-
-def test_the_workaround_restores_the_name_shapeaxi_looks_for(monkeypatch):
-    import sys
-    import types
-
-    moved = types.ModuleType("shapeaxi.saxi_nets_lightning")
-    moved.DentalModelSeg = object()
-    monkeypatch.setitem(sys.modules, "shapeaxi.saxi_nets_lightning", moved)
-    monkeypatch.setitem(sys.modules, "shapeaxi", types.ModuleType("shapeaxi"))
-
-    broken = _FakeSaxiNets()
-    assert pipeline._restore_moved_class(broken) is True
-    assert broken.DentalModelSeg is moved.DentalModelSeg
-
-
-def test_the_workaround_is_a_no_op_once_upstream_puts_the_name_back():
-    """The guard is what makes this delete itself rather than linger."""
-    fixed = _FakeSaxiNetsFixed()
-    before = fixed.DentalModelSeg
-
-    assert pipeline._restore_moved_class(fixed) is False
-    assert fixed.DentalModelSeg is before
-
-
-# ---------------------------------------------------------------------------
 # The checkpoint, when nobody names one
 # ---------------------------------------------------------------------------
 

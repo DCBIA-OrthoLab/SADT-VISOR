@@ -109,52 +109,6 @@ _INSTALL_HINT = (
 )
 
 
-def _restore_moved_class(saxi_nets) -> bool:
-    """Work around an upstream bug: shapeaxi 2.0.x cannot find its own class.
-
-    `DentalModelSeg` moved from `shapeaxi.saxi_nets` to
-    `shapeaxi.saxi_nets_lightning`, but `shapeaxi/dental_model_seg.py` -- the
-    module behind shapeaxi's own `dentalmodelseg` console script, and the only
-    supported way in -- still reads it off `saxi_nets`. Every 2.0.x release
-    (2.0.0, 2.0.1, 2.0.2) has this; 1.x referenced the right module. So
-    `dental_model_seg.main()` raises AttributeError before touching a mesh, and
-    the pre-port tool fails in exactly the same way on the deployed image.
-
-    Two lines rather than reimplementing `main()`: this keeps the entry point
-    shapeaxi supports, and the `hasattr` guard makes the workaround vanish by
-    itself the day upstream puts the name back. Report it at
-    DCBIA-OrthoLab/ShapeAXI; delete this function once a release carries the fix.
-    """
-    if hasattr(saxi_nets, "DentalModelSeg"):
-        return False
-
-    from shapeaxi import saxi_nets_lightning
-
-    target = getattr(saxi_nets_lightning, "DentalModelSeg", None)
-    if target is None:
-        raise ToolUnavailableError(
-            "This shapeaxi exposes DentalModelSeg in neither saxi_nets nor "
-            "saxi_nets_lightning; the pinned version is 2.0.2."
-        )
-    saxi_nets.DentalModelSeg = target
-    logger.warning(
-        "shapeaxi %s does not expose DentalModelSeg where its own "
-        "dental_model_seg module looks for it; pointing it at "
-        "saxi_nets_lightning (see _restore_moved_class)",
-        _shapeaxi_version(),
-    )
-    return True
-
-
-def _shapeaxi_version() -> str:
-    from importlib.metadata import PackageNotFoundError, version
-
-    try:
-        return version("shapeaxi")
-    except PackageNotFoundError:  # pragma: no cover - installed by definition here
-        return "unknown"
-
-
 def _import_dental_model_seg():
     """Import shapeaxi's segmentation module, lazily.
 
@@ -164,13 +118,12 @@ def _import_dental_model_seg():
     segmentation fails, naming what is missing.
     """
     try:
-        from shapeaxi import dental_model_seg, saxi_nets
+        from shapeaxi import dental_model_seg
     except ImportError as exc:
         raise ToolUnavailableError(
             "{} (missing: {})".format(_INSTALL_HINT, exc.name or "shapeaxi")
         ) from exc
 
-    _restore_moved_class(saxi_nets)
     return dental_model_seg
 
 
