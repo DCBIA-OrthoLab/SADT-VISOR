@@ -2060,7 +2060,7 @@ requires-dist = [
     { name = "numpy", specifier = "==2.3.2" },
     { name = "ocnn", marker = "extra == 'segmentation'", specifier = "==2.2.1" },
     { name = "pytorch3d", marker = "extra == 'segmentation'", specifier = "==0.7.9+pt2110cu128", index = "https://imagemindanalytics.github.io/pytorch3d-wheels/simple/" },
-    { name = "shapeaxi", marker = "extra == 'segmentation'", specifier = ">=2.0.2" },
+    { name = "shapeaxi", marker = "extra == 'segmentation'", specifier = ">=2.0.3" },
     { name = "simpleitk", marker = "extra == 'segmentation'" },
     { name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "extra == 'segmentation'", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu128" },
@@ -2178,7 +2178,7 @@ wheels = [
 
 [[package]]
 name = "shapeaxi"
-version = "2.0.2"
+version = "2.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "diffusers" },
@@ -2210,9 +2210,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "vtk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/41/7d/3c74c10362946d021304ad24061bb2ed6696659a2c52eb2d97113de45cce/shapeaxi-2.0.2.tar.gz", hash = "sha256:131d1873476a2a9eb86482050f09fd28faebe241d0618cc4e71de0aa9a0d1081", size = 10734062, upload-time = "2026-05-25T21:39:09.293Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/25/66/682bb455896b78b139bcdf7323138e5344d3b93f631fbd4d810aaaa73847/shapeaxi-2.0.3.tar.gz", hash = "sha256:c4d14b88a9141eb39bf6db9db1db8f9700febbbaecc9e941d092ac1830af867a", size = 10734223, upload-time = "2026-08-27T20:48:06.388Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/44/0d/9ccd3bcb0410d7ad28b434c13ba29a819a7f23b55868d0670d146d45184f/shapeaxi-2.0.2-py3-none-any.whl", hash = "sha256:848a891daebeeb9e4406ebd5647d7c75820369a5d754ea4390b78ac32dee4e0d", size = 166263, upload-time = "2026-05-25T21:39:07.52Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/1b/15bef080da2b845d70cfb9ff3677b9a740c2d98ad7b15ede70492d99224a/shapeaxi-2.0.3-py3-none-any.whl", hash = "sha256:71a6dd70ac8fee9f406a90286839545ecbe4e759e6b2dbd187d57b1522f41562", size = 166328, upload-time = "2026-08-27T20:48:04.426Z" },
 ]
 
 [[package]]

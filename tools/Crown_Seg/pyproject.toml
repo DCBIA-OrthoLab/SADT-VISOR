@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 # The engine, matching upstream SlicerAutomatedDentalTools' shared env:
-# shapeaxi >= 2.0.2, ocnn == 2.2.1, SimpleITK. It stays an extra so a plain
+# shapeaxi >= 2.0.2 (2.0.3 here, see below), ocnn == 2.2.1, SimpleITK. It stays an extra so a plain
 # `uv sync` can still import the package and publish its schema without
 # pulling the GPU stack; `uv sync --extra segmentation` builds the real thing.
 # What makes this directory a tool. A directory holding a pyproject.toml
@@ -41,7 +41,10 @@ name = "Crown_Seg"
 
 [project.optional-dependencies]
 segmentation = [
-    "shapeaxi>=2.0.2",
+    # 2.0.3 and no earlier: every 2.0.x before it had `dental_model_seg` read
+    # DentalModelSeg off `saxi_nets`, where the class no longer is, and the
+    # tool had to put it back by hand. 2.0.3 changes those two lines only.
+    "shapeaxi>=2.0.3",
     "ocnn==2.2.1",
     "SimpleITK",
     "pytorch3d==0.7.9+pt2110cu128",

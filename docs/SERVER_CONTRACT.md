@@ -431,13 +431,12 @@ piece of this list outstanding.
 
 ## 7. Two things to know before you start
 
-- **CrownSeg does not currently run, and did not before the migration.**
-  `shapeaxi.dental_model_seg` reads `DentalModelSeg` off `shapeaxi.saxi_nets`,
-  but in the whole 2.0.x line the class lives in `shapeaxi.saxi_nets_lightning`.
-  The pre-port tool fails the same way on the deployed image. This repository
-  carries a two-line workaround (`_restore_moved_class`) guarded so it vanishes
-  when upstream fixes it. Anything downstream of crown segmentation -- ALI's IOS
-  half, the IOS modes of ASO/AREG/FlexReg -- has been broken on the current image.
+- **CrownSeg needs shapeaxi 2.0.3 or later.** From 2.0.0 to 2.0.2,
+  `shapeaxi.dental_model_seg` read `DentalModelSeg` off `shapeaxi.saxi_nets`
+  while the class lived in `shapeaxi.saxi_nets_lightning`, so the tool failed
+  before touching a mesh, the pre-port one included. This repository carried a
+  workaround for it until 2.0.3 fixed the lookup upstream; the pin now asks for
+  that release and the workaround is gone.
 - **Disk.** Each torch venv is 7.2-7.7 GB at cu128. Deduplication across them is
   not automatic and depends on `UV_CACHE_DIR` sitting on the same filesystem as
   the venvs; see the repository README.
