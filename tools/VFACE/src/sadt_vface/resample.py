@@ -70,10 +70,14 @@ def resample_image(image, spacing=DEFAULT_SPACING, centre: bool = True):
 
     if centre:
         # The physical box the output covers, against the one the input did.
-        # Half the difference moves the origin so the two share a centre.
+        # Half the difference moves the origin so the two share a centre --
+        # along the image's own axes: a scan stored with Y flipped has its
+        # rows running towards -y, and shifting along +y moved the box away
+        # from the anatomy by the whole difference.
         output_extent = np.array(size, dtype=float) * np.array(output_spacing)
         input_extent = np.array(size, dtype=float) * np.array(image.GetSpacing(), dtype=float)
-        origin = origin - (output_extent - input_extent) / 2.0
+        direction = np.array(image.GetDirection(), dtype=float).reshape(3, 3)
+        origin = origin - direction @ ((output_extent - input_extent) / 2.0)
 
     resampler = sitk.ResampleImageFilter()
     resampler.SetInterpolator(sitk.sitkLinear)

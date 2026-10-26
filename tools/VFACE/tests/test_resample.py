@@ -223,3 +223,23 @@ def test_each_scan_is_announced_before_it_is_resampled(tmp_path):
                              on_progress=lambda done, total, message: seen.append(
                                  (done, total, message)))
     assert seen == [(0, 2, "resampling scan 1 of 2"), (1, 2, "resampling scan 2 of 2")]
+
+
+def test_a_scan_with_a_flipped_axis_keeps_its_centre_too():
+    """The origin was shifted along +x, +y, +z whatever the direction. On a
+    scan stored with Y flipped that moved the box away from the anatomy
+    instead of around it."""
+    import SimpleITK as sitk
+
+    image = sitk.Image(40, 50, 30, sitk.sitkInt16)
+    image.SetSpacing((0.5, 0.5, 0.5))
+    image.SetDirection((1, 0, 0, 0, -1, 0, 0, 0, 1))
+    image.SetOrigin((-10.0, 12.5, -7.5))
+
+    after = resample.resample_image(image, spacing=(0.3, 0.3, 0.3), centre=True)
+
+    def centre(volume):
+        middle = (np.array(volume.GetSize(), dtype=float) - 1) / 2.0
+        return np.array(volume.TransformContinuousIndexToPhysicalPoint(middle.tolist()))
+
+    assert centre(after) == pytest.approx(centre(image), abs=0.2)
