@@ -1594,3 +1594,69 @@ def test_a_half_copied_landmark_is_logged_with_its_count(tmp_path, caplog):
         cbct_engine.discover_weights(str(tmp_path / "bundle"))
     assert any(line.startswith("1 landmark(s) in the bundle lack a checkpoint at every scale")
                and line.endswith(": Ba") for line in _messages(caplog, "WARNING"))
+
+
+# ---------------------------------------------------------------------------
+# Scans whose axes are not the identity
+# ---------------------------------------------------------------------------
+
+def _flipped_scan():
+    """A small volume stored with its Y axis flipped, origin y positive -- the
+    layout some scanners export, and the one that came out mirrored."""
+    rng = np.random.default_rng(0)
+    array = rng.integers(-1000, 2000, size=(12, 14, 16)).astype(np.int16)
+    image = sitk.GetImageFromArray(array)
+    image.SetSpacing((0.5, 0.5, 0.5))
+    image.SetDirection((1, 0, 0, 0, -1, 0, 0, 0, 1))
+    image.SetOrigin((-4.0, 3.5, -2.0))
+    return image
+
+
+@pytest.mark.parametrize("flipped", [False, True])
+def test_a_voxel_maps_to_the_point_simpleitk_gives_it(tmp_path, flipped):
+    """`physical_position` computed `(index - abs(origin / spacing)) * spacing`:
+    right only with an identity direction and an all-negative origin. On a
+    Y-flipped scan every landmark came out mirrored front to back, in the air,
+    and ASO then rejected them as outliers."""
+    pytest.importorskip("monai")
+    pytest.importorskip("torch")
+    from sadt_ali_cbct.environment import Environment
+
+    image = _flipped_scan()
+    if not flipped:
+        image.SetDirection((1, 0, 0, 0, 1, 0, 0, 0, 1))
+        image.SetOrigin((-4.0, -3.5, -2.0))
+    path = str(tmp_path / "scan.nii.gz")
+    sitk.WriteImage(image, path)
+
+    environment = Environment("patient", padding=[2, 2, 2], device="cpu")
+    environment.load_images({"0": path})
+
+    index_xyz = (3.0, 5.0, 7.0)
+    array_order = index_xyz[::-1]
+    np.testing.assert_allclose(
+        environment.physical_position("0", array_order),
+        image.TransformContinuousIndexToPhysicalPoint(index_xyz),
+    )
+
+
+def test_the_corrected_scan_is_in_the_axis_order_the_agents_were_trained_on(tmp_path):
+    """The agents read the voxel array. A Y-flipped scan showed them a head
+    mirrored front to back, and they wandered off it. The corrected copy is
+    reoriented without resampling: same intensity at every physical point."""
+    image = _flipped_scan()
+    source = str(tmp_path / "scan.nii.gz")
+    sitk.WriteImage(image, source)
+
+    from sadt_ali_cbct import preprocess
+
+    written = sitk.ReadImage(preprocess.correct_histogram(source, str(tmp_path / "corrected.nii.gz")))
+
+    np.testing.assert_allclose(written.GetDirection(), np.eye(3).ravel())
+    clamped = sitk.GetArrayFromImage(written)
+    original = sitk.GetArrayFromImage(image)
+    low, high = clamped.min(), clamped.max()
+    for index in [(0, 0, 0), (3, 5, 7), (15, 13, 11)]:
+        point = image.TransformIndexToPhysicalPoint(index)
+        moved = written.TransformPhysicalPointToIndex(point)
+        assert clamped[moved[::-1]] == np.clip(original[index[::-1]], low, high)
