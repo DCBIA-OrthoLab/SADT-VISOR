@@ -1854,3 +1854,50 @@ def test_after_preload_loading_a_model_has_nothing_left_to_import():
     )
     assert result.returncode == 0, result.stderr[-2000:]
     assert result.stdout.strip() == "", f"imported after preload:\n{result.stdout}"
+
+
+def test_a_scan_with_a_flipped_axis_gives_its_surface_in_place():
+    """The contour was built from origin and spacing alone. A CBCT stored with
+    direction diag(1, -1, 1) -- origin y positive, rows running front to back
+    the other way -- came out mirrored about the origin, nowhere near the
+    scan. The same physical box, stored both ways, must give the same surface
+    with its normals still pointing out of it."""
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    volume = np.zeros((20, 20, 20), dtype=np.uint8)
+    volume[4:9, 12:16, 3:7] = 1  # off-centre, so a mirror cannot pass
+
+    identity = sitk.GetImageFromArray(volume)
+    identity.SetSpacing((0.5, 0.5, 0.5))
+    identity.SetOrigin((-5.0, -5.0, -5.0))
+
+    flipped_volume = volume[:, ::-1, :].copy()
+    flipped = sitk.GetImageFromArray(flipped_volume)
+    flipped.SetSpacing((0.5, 0.5, 0.5))
+    flipped.SetDirection((1, 0, 0, 0, -1, 0, 0, 0, 1))
+    flipped.SetOrigin((-5.0, -5.0 + 19 * 0.5, -5.0))
+
+    def surface(mask, reference):
+        mesh = vtk_export._mesh_from_mask(mask, reference, 0, (1, 2, 3))
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(mesh)
+        normals.ComputeCellNormalsOn()
+        normals.ComputePointNormalsOff()
+        normals.AutoOrientNormalsOff()
+        normals.ConsistencyOff()
+        normals.SplittingOff()
+        normals.Update()
+        out = normals.GetOutput()
+        points = vtk_to_numpy(out.GetPoints().GetData())
+        centre = points.mean(axis=0)
+        cell_normals = vtk_to_numpy(out.GetCellData().GetNormals())
+        cells = vtk_to_numpy(out.GetPolys().GetData()).reshape(-1, 4)[:, 1:]
+        outward = np.einsum("ij,ij->i", points[cells].mean(axis=1) - centre, cell_normals)
+        return np.sort(points.round(4), axis=0), np.median(np.sign(outward))
+
+    expected_points, expected_sign = surface(volume, identity)
+    points, sign = surface(flipped_volume, flipped)
+
+    np.testing.assert_allclose(points, expected_points, atol=1e-4)
+    assert sign == expected_sign
