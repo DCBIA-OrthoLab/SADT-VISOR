@@ -457,9 +457,12 @@ def test_every_layout_condition_names_a_mode_this_tool_has():
         if not condition:
             continue
         assert set(condition) <= set(inspect.signature(run).parameters), argument
-        wanted = condition["automation"]
-        for mode in (wanted if isinstance(wanted, list) else [wanted]):
-            assert mode in offered, (argument, mode)
+        # Every condition's values, and not only automation's: a misspelt
+        # layout hides a field just as surely as a misspelt mode.
+        values = {"automation": offered, "input_layout": set(catalogs.LAYOUT_CHOICES)}
+        for name, wanted in condition.items():
+            for value in (wanted if isinstance(wanted, list) else [wanted]):
+                assert value in values[name], (argument, name, value)
 
 
 def test_the_landmark_folders_are_hidden_in_the_modes_that_overwrite_them():

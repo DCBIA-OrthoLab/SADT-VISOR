@@ -117,6 +117,13 @@ DOC_ARGUMENTS = "Args:"
 # an option the signature does not publish, which is what makes that hold.
 LAYOUT_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
                "hidden",
+               # {other argument: value(s)}: the argument is required whenever
+               # those hold. For an input that is needed in one layout of the
+               # request and absent from another -- AREG's T1 and T2, required
+               # with one folder per type and unused with one per patient -- so
+               # the panel neither marks it optional nor lets Apply go without
+               # it. The tool still refuses what is missing; this is the panel.
+               "required_when",
                # A vec2's two axes, low end first (or high end first to mirror
                # the axis). Declared here with the other layout keys because a
                # tool writes them in the same place, but they are NOT
@@ -938,6 +945,7 @@ def layout_for(package, arguments):
         if name in arguments:
             _check_groups(where, hints, arguments[name])
         _check_visible_when(where, hints, arguments)
+        _check_visible_when(where, hints, arguments, key="required_when")
     return declared
 
 
@@ -966,17 +974,21 @@ def _check_groups(where, hints, argument):
             )
 
 
-def _check_visible_when(where, hints, arguments):
-    """A condition must name a real argument, and a value it can actually take."""
-    conditions = hints.get("visible_when")
+def _check_visible_when(where, hints, arguments, key="visible_when"):
+    """A condition must name a real argument, and a value it can actually take.
+
+    `key` is the hint holding the condition: `visible_when`, or `required_when`,
+    which is written the same way and goes wrong the same way.
+    """
+    conditions = hints.get(key)
     if conditions is None:
         return
     if not isinstance(conditions, dict):
-        raise SchemaError("{}: 'visible_when' must be a dict of argument -> value.".format(where))
+        raise SchemaError("{}: '{}' must be a dict of argument -> value.".format(where, key))
     for other, expected in conditions.items():
         if other not in arguments:
             raise SchemaError(
-                "{}: 'visible_when' names '{}', which run() does not take.".format(where, other)
+                "{}: '{}' names '{}', which run() does not take.".format(where, key, other)
             )
         offered = arguments[other].get("choices")
         if not offered:
@@ -985,9 +997,9 @@ def _check_visible_when(where, hints, arguments):
         missing = [value for value in wanted if value not in offered]
         if missing:
             raise SchemaError(
-                "{}: 'visible_when' expects '{}' to be {}, which it never is. It "
+                "{}: '{}' expects '{}' to be {}, which it never is. It "
                 "offers: {}.".format(
-                    where, other, ", ".join(str(m) for m in missing), ", ".join(offered)
+                    where, key, other, ", ".join(str(m) for m in missing), ", ".join(offered)
                 )
             )
 
@@ -1105,9 +1117,13 @@ def paired_for(module, arguments):
         spec = arguments.get(axis)
         if spec is None:
             raise SchemaError("{}: run() has no argument '{}'.".format(PAIRED_NAME, axis))
-        if spec.get("type") != "path" or not spec.get("required"):
+        # A path, but not necessarily a required one: AREG's `t1`/`t2` are
+        # optional since the same cohort may arrive as one folder per patient
+        # instead, and a run in that layout fills neither. A client splits the
+        # axes a request fills.
+        if spec.get("type") != "path":
             raise SchemaError(
-                "{}: '{}' must be a required path argument to be split.".format(PAIRED_NAME, axis))
+                "{}: '{}' must be a path argument to be split.".format(PAIRED_NAME, axis))
     pairs = getattr(module, PAIRS_FUNCTION, None)
     if not inspect.isfunction(pairs):
         raise SchemaError(
