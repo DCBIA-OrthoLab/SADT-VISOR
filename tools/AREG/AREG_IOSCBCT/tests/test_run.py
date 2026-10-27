@@ -586,7 +586,7 @@ def test_an_arch_left_far_from_its_landmarks_is_written_but_flagged(tmp_path, mo
         run_registration(tmp_path)
     report = json.loads((tmp_path / "out" / "AREG_report.json").read_text())
 
-    patient = report["patients"]["1"]
+    patient = report["patients"]["P001"]
     assert patient["status"] == "review"
     for mesh in patient["meshes"].values():
         assert mesh["status"] == "review"
@@ -603,6 +603,6 @@ def test_an_arch_close_to_its_landmarks_stays_ok(tmp_path):
     run_registration(tmp_path)
     report = json.loads((tmp_path / "out" / "AREG_report.json").read_text())
 
-    assert report["patients"]["1"]["status"] == "ok"
+    assert report["patients"]["P001"]["status"] == "ok"
     assert report["meshes_to_review"] == 0
-    assert all("review" not in mesh for mesh in report["patients"]["1"]["meshes"].values())
+    assert all("review" not in mesh for mesh in report["patients"]["P001"]["meshes"].values())

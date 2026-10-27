@@ -80,7 +80,10 @@ def run(
             digits of the patient identifier, the two modalities being named by
             different conventions.
         output_dir: Where the registered meshes, their 4x4 matrices and
-            `AREG_report.json` are written. Nothing is written outside it.
+            `AREG_report.json` are written, one folder per patient named as
+            its files name it (`case_042`). When the CBCT was oriented first,
+            the oriented scan the meshes are registered onto and its `.tfm`
+            are written beside them. Nothing is written outside it.
         automation: Registration takes both landmark sets and predicts nothing --
             no other tool is called and no GPU is needed. Semi-Automated labels
             the crowns and predicts both sets. Fully-Automated orients the CBCT

@@ -17,7 +17,9 @@ import os
 
 import pytest
 
-from conftest import FakeSup, cohort, read_report, write_markups, write_mesh, UPPER_LABELS, moved
+from conftest import (
+    FakeSup, cohort, read_report, write_markups, write_mesh, write_volume, UPPER_LABELS, moved,
+)
 from sadt_areg_ioscbct import dispatch, tools
 from sadt_areg_common import catalogs
 from sadt_areg_common.errors import SupervisorRequired, ToolInputError
@@ -269,7 +271,7 @@ def test_semi_automated_labels_the_crowns_and_predicts_both_landmark_sets(tmp_pa
     dispatch.main(**arguments)
 
     assert [name for name, _params in sup.calls] == ["Crown_Seg", "ALI_IOS", "ALI_CBCT"]
-    assert read_report(tmp_path / "out")["patients"]["1"]["status"] == "ok"
+    assert read_report(tmp_path / "out")["patients"]["P001"]["status"] == "ok"
 
 
 def test_semi_automated_does_not_orient_anything(tmp_path):
@@ -327,6 +329,38 @@ def test_fully_automated_asks_aso_for_its_frame_and_no_bundle(tmp_path):
     assert "reference" not in params
 
 
+def test_fully_automated_hands_back_the_cbct_the_meshes_were_registered_onto(tmp_path):
+    """The meshes are in the frame of ASO's oriented scan. Without it beside
+    them they were opened over the original CBCT, off by ASO's whole rotation,
+    and the only copy had gone with the job's work directory."""
+    oriented = tmp_path / "oriented"
+    write_volume(oriented / "P_0001_T2_Or.nii.gz")
+    (oriented / "P_0001_T2_Or_transform.tfm").write_text("#Insight Transform File V1.0\n")
+    _sup, arguments = semi_automated(
+        tmp_path,
+        automation=catalogs.AUTOMATION_FULLY,
+        outputs={"ASO": lambda params: oriented},
+    )
+    dispatch.main(**arguments)
+
+    folder = tmp_path / "out" / "P001"
+    assert (folder / "P_0001_T2_Or.nii.gz").is_file()
+    assert (folder / "P_0001_T2_Or_transform.tfm").is_file()
+    patient = read_report(tmp_path / "out")["patients"]["P001"]
+    assert patient["oriented_cbct"] == os.path.join("P001", "P_0001_T2_Or.nii.gz")
+    assert patient["cbct_transform"] == os.path.join("P001", "P_0001_T2_Or_transform.tfm")
+
+
+def test_a_cbct_the_caller_sent_is_not_sent_back(tmp_path):
+    """Semi-Automated registers onto the caller's own scan: copying it back
+    would only double the archive."""
+    _sup, arguments = semi_automated(tmp_path)
+    dispatch.main(**arguments)
+
+    assert not (tmp_path / "out" / "P001" / "P_0001_T2.nii.gz").exists()
+    assert "oriented_cbct" not in read_report(tmp_path / "out")["patients"]["P001"]
+
+
 def test_a_sibling_tool_failing_takes_the_run_with_it(tmp_path):
     """Nothing downstream can be salvaged: there are no landmarks to register
     on, and inventing some would be a confident wrong answer."""
@@ -374,7 +408,7 @@ def test_the_predicted_landmarks_really_reach_the_registration(tmp_path):
 
     import numpy as np
 
-    matrix = np.load(str(tmp_path / "out" / "1" / "P001_T2_U_Reg_matrix.npy"))
+    matrix = np.load(str(tmp_path / "out" / "P001" / "P001_T2_U_Reg_matrix.npy"))
     assert matrix[0, 3] == pytest.approx(7.0, abs=1e-5)
 
 

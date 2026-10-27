@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 
-from sadt_areg_common import catalogs
+from sadt_areg_common import catalogs, pairing
 from sadt_areg_common.errors import ToolInputError
 
 from . import geometry, pipeline, progress, tools, where
@@ -294,9 +294,36 @@ def _spans(automation: str, predict_ios: bool, predict_cbct: bool) -> dict:
     return spans
 
 
+def _carry_cbct(cbct_path: str, folder: str, output_dir: str) -> dict:
+    """Copy the CBCT the meshes were registered onto into the patient's folder.
+
+    In the Fully-Automated mode that is ASO's oriented scan, not the caller's:
+    every arch is written in its frame, and it lived only in the job's work
+    directory. Opened over the original scan, the meshes were off by the whole
+    rotation ASO applied, with nothing in the results to put them back on. Its
+    transform (original scan to oriented one, ASO's `<scan>_transform.tfm`)
+    comes too, for a reader who wants the meshes on the original scan instead.
+
+    Returns the report fields naming what was copied, relative to `output_dir`.
+    """
+    os.makedirs(folder, exist_ok=True)
+    copied = {}
+    stem = pairing.split_scan_extension(os.path.basename(cbct_path))[0]
+    transform = os.path.join(os.path.dirname(cbct_path), f"{stem}_transform.tfm")
+    for field, source in (("oriented_cbct", cbct_path), ("cbct_transform", transform)):
+        if not os.path.isfile(source):
+            logger.warning("No %s to copy beside the registered meshes", field.replace("_", " "))
+            continue
+        destination = os.path.join(folder, os.path.basename(source))
+        shutil.copy2(source, destination)
+        copied[field] = os.path.relpath(destination, output_dir)
+    return copied
+
+
 def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_dir: str,
              output_dir: str, suffix: str, report: dict, max_dist: float,
-             progress_span: tuple = (0.0, 1.0), produced_by: dict = None) -> None:
+             progress_span: tuple = (0.0, 1.0), produced_by: dict = None,
+             carry_cbct: bool = False) -> None:
     """The registration proper, once every landmark exists.
 
     `progress_span` is the slice of the run's progress bar this phase fills.
@@ -311,6 +338,9 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
     source the message names, and its class -- an empty folder the caller sent
     is theirs to fix (ToolInputError), one a tool returned is a fault on this
     side (RuntimeError).
+
+    `carry_cbct` copies each patient's CBCT, and the transform beside it, into
+    that patient's folder: see `_carry_cbct`.
     """
     produced_by = produced_by or {}
 
@@ -357,6 +387,7 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
         progress.report(index, len(paired), "patient",
                         start=progress_span[0], end=progress_span[1])
         position = f"patient {index}/{len(paired)}"
+        folder = os.path.join(output_dir, data["name"])
         entry = {"cbct": os.path.basename(data["cbct"]), "meshes": {}}
         # Narrowed to this patient BEFORE the jaw is looked at: see _for_patient.
         own_ios = _for_patient(ios_landmarks, patient, sole_patient)
@@ -386,7 +417,7 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
                         mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
                     )
                     destination = os.path.join(
-                        output_dir, patient, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
+                        folder, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
                     )
                     _write_mesh(mesh.transform(matrix, inplace=False), destination)
                     # splitext, not `destination.replace(".vtk", ...)`: str.replace
@@ -415,7 +446,11 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
         statuses = [m["status"] for m in entry["meshes"].values()]
         entry["status"] = ("ok" if "ok" in statuses
                            else "review" if "review" in statuses else "failed")
-        report["patients"][patient] = entry
+        if carry_cbct and entry["status"] != "failed":
+            entry.update(_carry_cbct(data["cbct"], folder, output_dir))
+        # Under the name the files carry, never the matching key: see
+        # pipeline.patient_name.
+        report["patients"][data["name"]] = entry
 
     report["meshes_registered"] = total_meshes - len(failures)
     report["meshes_failed"] = len(failures)
@@ -596,6 +631,10 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
             # Registration mode, which makes none of them.
             progress_span=spans["register"],
             produced_by=produced_by,
+            # The meshes are registered onto the CBCT ASO oriented, a volume
+            # the caller never had: without it beside them, they sit nowhere
+            # near the scan the caller opens them over.
+            carry_cbct=produced_by.get("cbct") == "ASO",
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

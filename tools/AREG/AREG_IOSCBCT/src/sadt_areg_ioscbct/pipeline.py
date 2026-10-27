@@ -13,6 +13,7 @@ only a patient to match across two naming conventions.
 import json
 import logging
 import os
+import re
 
 import numpy as np
 
@@ -53,10 +54,37 @@ def patient_key(filename: str) -> str:
     return digits.lstrip("0") or digits or stem
 
 
+_WORD = re.compile(r"[A-Za-z0-9]+")
+
+
+def patient_name(filename: str) -> str:
+    """The patient as the file's own name spells it: `case_042`, not `42`.
+
+    `patient_key` is what MATCHES the two modalities, and it has to be crude to
+    do it; it is no name to show anyone. A folder called `42` beside a scan
+    called `case_042_T1_CBCT.nii.gz` broke the one thing a reader relies on to
+    find a patient again. This keeps the name up to the end of its first word
+    holding a digit -- the patient's number -- skipping a timepoint word, so
+    `case_042_T1_L.stl` gives `case_042` and `P_0001_T2.nii.gz` gives `P_0001`.
+    A name with no digit at all is kept whole.
+    """
+    stem = pairing.split_scan_extension(os.path.basename(filename))[0]
+    for word in _WORD.finditer(stem):
+        if word.group().lower() in ("t0", "t1", "t2"):
+            continue
+        if any(c.isdigit() for c in word.group()):
+            return stem[: word.end()]
+    return stem
+
+
 def discover(ios_dir: str, cbct_dir: str, ios_source: str = "'ios'",
              cbct_source: str = "'cbct'", ios_error=ToolInputError,
              cbct_error=ToolInputError) -> tuple:
-    """`({patient: {"ios": [paths], "cbct": path}}, {patient: why})`.
+    """`({key: {"ios": [paths], "cbct": path, "name": name}}, {name: why})`.
+
+    Keyed by `patient_key`, which is what the landmark files are matched on;
+    `name` is `patient_name` of the patient's first intraoral mesh -- the files
+    the output folder holds -- or of its CBCT when it has none.
 
     `ios_source` and `cbct_source` name where each folder came from in the
     refusal -- the caller's argument, or the tool that produced it -- and
@@ -96,10 +124,12 @@ def discover(ios_dir: str, cbct_dir: str, ios_source: str = "'ios'",
 
     paired, unpaired = {}, {}
     for key in sorted(set(ios) | set(cbct)):
+        name = patient_name(min(ios[key]) if key in ios else cbct[key])
         if key in ios and key in cbct:
-            paired[key] = {"ios": sorted(ios[key]), "cbct": cbct[key]}
+            paired[key] = {"ios": sorted(ios[key]), "cbct": cbct[key], "name": name}
         else:
-            unpaired[key] = "no CBCT" if key in ios else "no intraoral scan"
+            unpaired[name] = "no CBCT" if key in ios else "no intraoral scan"
+    _distinct_names(paired)
 
     if not paired:
         # Counts, never the keys: a key is built from the caller's file names,
@@ -121,6 +151,21 @@ def discover(ios_dir: str, cbct_dir: str, ios_source: str = "'ios'",
             without_cbct, len(unpaired) - without_cbct,
         )
     return paired, unpaired
+
+
+def _distinct_names(paired: dict) -> None:
+    """Two patients never share a folder.
+
+    The key reads every digit of a name and the name stops at the first word
+    holding one, so `case_042_scan2` and `case_042_scan3` are two keys and one
+    name. The second then takes its key too, rather than writing its arches
+    over the first patient's.
+    """
+    seen = set()
+    for key, data in paired.items():
+        if data["name"] in seen:
+            data["name"] = f"{data['name']}_{key}"
+        seen.add(data["name"])
 
 
 def read_landmarks(path: str) -> dict:

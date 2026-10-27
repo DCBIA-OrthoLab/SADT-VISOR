@@ -30,8 +30,8 @@ def test_a_run_writes_the_mesh_its_matrix_and_the_report(tmp_path):
     run_registration(tmp_path)
     assert tree_of(tmp_path / "out") == sorted([
         "AREG_report.json",
-        os.path.join("1", "P001_T2_U_Reg.vtk"),
-        os.path.join("1", "P001_T2_U_Reg_matrix.npy"),
+        os.path.join("P001", "P001_T2_U_Reg.vtk"),
+        os.path.join("P001", "P001_T2_U_Reg_matrix.npy"),
     ])
 
 
@@ -43,8 +43,8 @@ def test_the_written_mesh_is_the_input_moved_by_the_written_matrix(tmp_path):
     run_registration(tmp_path)
 
     before = read_mesh_points(tmp_path / "ios" / "P001_T2_U.vtk")
-    after = read_mesh_points(tmp_path / "out" / "1" / "P001_T2_U_Reg.vtk")
-    matrix = np.load(str(tmp_path / "out" / "1" / "P001_T2_U_Reg_matrix.npy"))
+    after = read_mesh_points(tmp_path / "out" / "P001" / "P001_T2_U_Reg.vtk")
+    matrix = np.load(str(tmp_path / "out" / "P001" / "P001_T2_U_Reg_matrix.npy"))
 
     assert geometry.apply(before, matrix) == pytest.approx(after, abs=1e-4)
 
@@ -55,7 +55,7 @@ def test_the_matrix_is_the_one_the_landmarks_asked_for(tmp_path):
     cohort(tmp_path)
     run_registration(tmp_path)
 
-    matrix = np.load(str(tmp_path / "out" / "1" / "P001_T2_U_Reg_matrix.npy"))
+    matrix = np.load(str(tmp_path / "out" / "P001" / "P001_T2_U_Reg_matrix.npy"))
     assert matrix[:3, :3] == pytest.approx(np.eye(3), abs=1e-6)
     assert matrix[:3, 3] == pytest.approx([3.0, -2.0, 1.0], abs=1e-6)
 
@@ -65,10 +65,10 @@ def test_each_patient_gets_a_folder_of_its_own(tmp_path):
     run_registration(tmp_path)
     assert tree_of(tmp_path / "out") == sorted([
         "AREG_report.json",
-        os.path.join("1", "P001_T2_U_Reg.vtk"),
-        os.path.join("1", "P001_T2_U_Reg_matrix.npy"),
-        os.path.join("2", "P002_T2_U_Reg.vtk"),
-        os.path.join("2", "P002_T2_U_Reg_matrix.npy"),
+        os.path.join("P001", "P001_T2_U_Reg.vtk"),
+        os.path.join("P001", "P001_T2_U_Reg_matrix.npy"),
+        os.path.join("P002", "P002_T2_U_Reg.vtk"),
+        os.path.join("P002", "P002_T2_U_Reg_matrix.npy"),
     ])
 
 
@@ -78,7 +78,7 @@ def test_both_arches_of_one_patient_are_registered_separately(tmp_path):
     run_registration(tmp_path)
 
     report = read_report(tmp_path / "out")
-    assert set(report["patients"]["1"]["meshes"]) == {"P001_T2_U.vtk", "P001_T2_L.vtk"}
+    assert set(report["patients"]["P001"]["meshes"]) == {"P001_T2_U.vtk", "P001_T2_L.vtk"}
 
 
 def test_the_suffix_reaches_every_name_it_writes(tmp_path):
@@ -86,8 +86,8 @@ def test_the_suffix_reaches_every_name_it_writes(tmp_path):
     run_registration(tmp_path, output_suffix="Study7")
     assert tree_of(tmp_path / "out") == sorted([
         "AREG_report.json",
-        os.path.join("1", "P001_T2_U_Study7.vtk"),
-        os.path.join("1", "P001_T2_U_Study7_matrix.npy"),
+        os.path.join("P001", "P001_T2_U_Study7.vtk"),
+        os.path.join("P001", "P001_T2_U_Study7_matrix.npy"),
     ])
 
 
@@ -96,7 +96,7 @@ def test_a_blank_suffix_falls_back_to_reg(tmp_path, given):
     cohort(tmp_path)
     run_registration(tmp_path, output_suffix=given)
     assert read_report(tmp_path / "out")["output_suffix"] == "Reg"
-    assert os.path.join("1", "P001_T2_U_Reg.vtk") in tree_of(tmp_path / "out")
+    assert os.path.join("P001", "P001_T2_U_Reg.vtk") in tree_of(tmp_path / "out")
 
 
 @pytest.mark.parametrize("given", ["../escape", "a/b", os.sep + "abs"])
@@ -117,7 +117,7 @@ def test_a_mesh_whose_own_stem_carries_vtk_still_names_its_matrix_correctly(tmp_
         str(tmp_path / "ios" / "P001_T2_U.vtk"), str(tmp_path / "ios" / "P001_T2_U.vtk.vtk")
     )
     run_registration(tmp_path)
-    assert os.path.join("1", "P001_T2_U.vtk_Reg_matrix.npy") in tree_of(tmp_path / "out")
+    assert os.path.join("P001", "P001_T2_U.vtk_Reg_matrix.npy") in tree_of(tmp_path / "out")
 
 
 def test_the_output_directory_is_created_when_it_does_not_exist(tmp_path):
@@ -184,14 +184,14 @@ def test_the_report_says_what_ran_and_on_what(tmp_path):
     assert report["output_suffix"] == "Reg"
     assert isinstance(report["duration_seconds"], float)
 
-    patient = report["patients"]["1"]
+    patient = report["patients"]["P001"]
     assert patient["status"] == "ok"
     assert patient["cbct"] == "P_0001_T2.nii.gz"
     mesh = patient["meshes"]["P001_T2_U.vtk"]
     assert mesh["status"] == "ok"
     assert mesh["landmarks_used"] == sorted(UPPER_LABELS)
     assert mesh["landmarks_dropped"] == []
-    assert mesh["output"] == os.path.join("1", "P001_T2_U_Reg.vtk")
+    assert mesh["output"] == os.path.join("P001", "P001_T2_U_Reg.vtk")
 
 
 def test_the_report_carries_no_server_side_path(tmp_path):
@@ -211,7 +211,7 @@ def test_a_landmark_only_one_side_names_is_reported_as_dropped(tmp_path):
     write_markups(tmp_path / "cbct_lm" / "P_0001_T2_lm_Pred.mrk.json", extended)
 
     run_registration(tmp_path)
-    mesh = read_report(tmp_path / "out")["patients"]["1"]["meshes"]["P001_T2_U.vtk"]
+    mesh = read_report(tmp_path / "out")["patients"]["P001"]["meshes"]["P001_T2_U.vtk"]
     assert mesh["landmarks_dropped"] == ["EXTRA"]
 
 
@@ -220,7 +220,7 @@ def test_a_patient_with_only_one_modality_is_named_in_the_report(tmp_path):
     write_mesh(tmp_path / "ios" / "P009_T2_U.vtk")
 
     run_registration(tmp_path)
-    assert read_report(tmp_path / "out")["unpaired"] == {"9": "no CBCT"}
+    assert read_report(tmp_path / "out")["unpaired"] == {"P009": "no CBCT"}
 
 
 def test_the_icp_refines_on_the_cbct_the_run_was_given(tmp_path):
@@ -242,7 +242,7 @@ def test_the_icp_refines_on_the_cbct_the_run_was_given(tmp_path):
                              box=((3.0, -2.0, 1.0), (23.0, 12.0, 11.0)))
 
     run_registration(tmp_path)
-    icp = read_report(tmp_path / "out")["patients"]["1"]["meshes"][
+    icp = read_report(tmp_path / "out")["patients"]["P001"]["meshes"][
         "P001_T2_U.vtk"]["icp"]
     assert icp is not None
     assert icp["pairs"] >= 3 and icp["fitness"] > 0
@@ -260,7 +260,7 @@ def test_a_cbct_no_reader_can_open_falls_back_to_the_landmarks_and_says_so(tmp_p
     cohort(tmp_path)
 
     run_registration(tmp_path)
-    patient = read_report(tmp_path / "out")["patients"]["1"]
+    patient = read_report(tmp_path / "out")["patients"]["P001"]
     assert patient["meshes"]["P001_T2_U.vtk"]["icp"] is None
     assert "could not be contoured" in patient["cbct_surface_error"]
     assert str(tmp_path) not in patient["cbct_surface_error"]
@@ -283,11 +283,11 @@ def test_one_mesh_failing_does_not_cost_the_batch(tmp_path):
     run_registration(tmp_path)
     report = read_report(tmp_path / "out")
 
-    assert report["patients"]["1"]["status"] == "ok"
-    failed = report["patients"]["2"]
+    assert report["patients"]["P001"]["status"] == "ok"
+    failed = report["patients"]["P002"]
     assert failed["status"] == "failed"
     assert "share only 1 landmark(s)" in failed["meshes"]["P002_T2_U.vtk"]["error"]
-    assert os.path.join("1", "P001_T2_U_Reg.vtk") in tree_of(tmp_path / "out")
+    assert os.path.join("P001", "P001_T2_U_Reg.vtk") in tree_of(tmp_path / "out")
 
 
 def test_a_batch_where_nothing_registered_raises_with_the_cause_in_it(tmp_path):
@@ -328,7 +328,7 @@ def test_a_mesh_with_no_landmarks_of_its_own_names_the_patient_and_the_side(tmp_
     os.remove(str(tmp_path / "ios_lm" / "P002_T2_U_lm_Pred.mrk.json"))
 
     run_registration(tmp_path)
-    failed = read_report(tmp_path / "out")["patients"]["2"]["meshes"]["P002_T2_U.vtk"]
+    failed = read_report(tmp_path / "out")["patients"]["P002"]["meshes"]["P002_T2_U.vtk"]
     assert failed["status"] == "failed"
     assert "this patient" in failed["error"]
     assert "the intraoral" in failed["error"]
@@ -355,8 +355,8 @@ def test_an_unreadable_landmark_file_is_skipped_with_its_position(tmp_path, capl
     with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
         run_registration(tmp_path)
     report = read_report(tmp_path / "out")
-    assert report["patients"]["1"]["status"] == "ok"
-    assert report["patients"]["2"]["status"] == "failed"
+    assert report["patients"]["P001"]["status"] == "ok"
+    assert report["patients"]["P002"]["status"] == "failed"
     unreadable = [r.getMessage() for r in caplog.records if "landmark file 2 of 2" in r.getMessage()]
     assert len(unreadable) == 1
     assert unreadable[0].startswith(
@@ -391,7 +391,7 @@ def test_each_patient_is_registered_on_its_own_landmarks(tmp_path):
     )
 
     run_registration(tmp_path)
-    second = np.load(str(tmp_path / "out" / "2" / "P002_T2_U_Reg_matrix.npy"))
+    second = np.load(str(tmp_path / "out" / "P002" / "P002_T2_U_Reg_matrix.npy"))
     assert second[:3, 3] == pytest.approx([100.0, 100.0, 100.0], abs=1e-5)
 
 
@@ -410,8 +410,8 @@ def test_a_patients_two_arches_do_not_borrow_each_others_points(tmp_path):
     os.remove(str(tmp_path / "cbct_lm" / "P_0001_T2_lm_Pred.mrk.json"))
 
     run_registration(tmp_path)
-    upper = np.load(str(tmp_path / "out" / "1" / "P001_T2_U_Reg_matrix.npy"))
-    lower = np.load(str(tmp_path / "out" / "1" / "P001_T2_L_Reg_matrix.npy"))
+    upper = np.load(str(tmp_path / "out" / "P001" / "P001_T2_U_Reg_matrix.npy"))
+    lower = np.load(str(tmp_path / "out" / "P001" / "P001_T2_L_Reg_matrix.npy"))
     assert upper[:3, 3] == pytest.approx([3.0, -2.0, 1.0], abs=1e-5)
     assert lower[:3, 3] == pytest.approx([50.0, 0.0, 0.0], abs=1e-5)
 
@@ -427,7 +427,7 @@ def test_one_cbct_landmark_file_serves_both_arches(tmp_path):
     )
 
     run_registration(tmp_path)
-    report = read_report(tmp_path / "out")["patients"]["1"]["meshes"]
+    report = read_report(tmp_path / "out")["patients"]["P001"]["meshes"]
     assert report["P001_T2_U.vtk"]["landmarks_used"] == sorted(UPPER_LABELS)
     assert report["P001_T2_L.vtk"]["landmarks_used"] == sorted(LOWER_LABELS)
 
