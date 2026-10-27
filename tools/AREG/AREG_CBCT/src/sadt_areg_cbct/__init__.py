@@ -15,8 +15,11 @@ come from other tools reached through the supervisor; see the CBCT half of
 `tools.py`. `AREG_CBCT -> ASO -> ALI_CBCT` is the deepest chain in the family.
 """
 
+import shutil
 from pathlib import Path
 from typing import Literal
+
+from sadt_areg_common import catalogs, pairing, patient_folders
 
 from .dispatch import main
 
@@ -54,10 +57,28 @@ def pairs(t1: list, t2: list) -> dict:
 # need to be scoped per mode. Until then the engine's own panel filters
 # nothing, and `pairing.is_scan_file` is what actually decides.
 
+_ROLE = patient_folders.by_timepoint(pairing.is_scan_file, skip=catalogs.MASK_TOKENS)
+
+
+def _filed_as(patient: str, role: str, relative: str, index: int) -> str:
+    """`<patient>_T1.nii.gz`: the name the pairing reads as that patient's T1."""
+    name = relative.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"{patient}_{role.upper()}{patient_folders.extension_of(name)}"
+
+
 def run(
-    t1: Path,
-    t2: Path,
-    output_dir: Path,
+    # First, because it decides which of the next three the panel asks for.
+    # Spelled out because `Literal` takes literals only; a test asserts it
+    # against `catalogs.LAYOUT_CHOICES`.
+    input_layout: Literal["One folder per type", "One folder per patient"] = "One folder per type",
+    # Not required any more, and not because they are optional: which of
+    # `t1`/`t2` or `patients` is needed depends on `input_layout`, and a field
+    # the panel marks required in the layout that does not read it would
+    # refuse to apply. `patient_folders.resolve` refuses what is missing.
+    t1: Path = "",
+    t2: Path = "",
+    patients: Path = "",
+    output_dir: Path = "",
     # "From the data" is the default and names no mode: `dispatch.derive_automation`
     # reads it off what the request supplies -- masks are Semi-Automated, none is
     # Fully-Automated, and the frame named in `orientation` below chooses the
@@ -113,6 +134,12 @@ def run(
     """Register a follow-up CBCT onto its baseline, so the two can be compared.
 
     Args:
+        input_layout: How the files are organised: one folder for each type
+            of file (T1 and T2, or intraoral scans and CBCT) holding every
+            patient, or one folder for each patient holding all of that
+            patient's files. Rest the pointer on each option for an example.
+        patients: The folder of patient folders, in the one-folder-per-patient
+            layout. Each patient's folder name names its results.
         t1: The baseline scans -- one volume or a folder of them, searched
             recursively. A DICOM series is converted when `dicom_input` is set.
         t2: The follow-up scans, paired to T1 by patient key.
@@ -165,21 +192,29 @@ def run(
     """
     # itk-elastix and SimpleITK are imported inside the engine: CI imports this
     # module on every PR to publish the schema, and that must not cost them.
-    return main(
-        t1=t1,
-        t2=t2,
-        output_dir=output_dir,
-        automation=automation,
-        cbct_regions=regions,
-        t1_masks=t1_masks,
-        segmentations=segmentations,
-        segmentation_model=segmentation_model,
-        segmentation_label=segmentation_label,
-        cbct_reference=reference,
-        landmark_model=landmark_model,
-        dicom_input=dicom_input,
-        orientation=orientation,
-        output_suffix=output_suffix,
-        num_workers=num_workers,
-        sup=sup,
+    folders, scratch = patient_folders.resolve(
+        input_layout, patients, {"t1": t1, "t2": t2}, output_dir, _ROLE, _filed_as,
     )
+    try:
+        result = main(
+            t1=folders["t1"],
+            t2=folders["t2"],
+            output_dir=output_dir,
+            automation=automation,
+            cbct_regions=regions,
+            t1_masks=t1_masks,
+            segmentations=segmentations,
+            segmentation_model=segmentation_model,
+            segmentation_label=segmentation_label,
+            cbct_reference=reference,
+            landmark_model=landmark_model,
+            dicom_input=dicom_input,
+            orientation=orientation,
+            output_suffix=output_suffix,
+            num_workers=num_workers,
+            sup=sup,
+        )
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+    return result

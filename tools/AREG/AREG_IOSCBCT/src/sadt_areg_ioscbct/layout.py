@@ -3,6 +3,15 @@
 from sadt_areg_common import catalogs
 
 _INPUTS = "Inputs"
+
+# Which of the two input shapes the panel asks for. The per-type fields and the
+# folder of patients are never shown together: a reader who filled both would
+# not know which one the run read. Each is REQUIRED in its own layout, which
+# the signature cannot say -- both are optional there, since either may be
+# the one not sent.
+_BY_TYPE = {"input_layout": [catalogs.LAYOUT_BY_TYPE]}
+_BY_PATIENT = {"input_layout": [catalogs.LAYOUT_BY_PATIENT]}
+
 # "Advanced", not "Landmarks", and the name does two things at once.
 #
 # It is what the section IS: landmarks a caller already has are the escape hatch
@@ -69,8 +78,24 @@ LAYOUT = {
     # end, and a ticked step pauses the run and opens what it produced in VISU.
     "stop_after": {"label": "Stop after"},
 
-    "ios": {"section": _INPUTS, "label": "Intraoral scans"},
-    "cbct": {"section": _INPUTS, "label": "CBCT volumes"},
+    # Segments, not a drop-down: two layouts of equal standing, both on screen,
+    # and the client puts it above the inputs it switches between.
+    "input_layout": {
+        "section": _INPUTS, "label": "Data organisation", "ui": "segmented",
+        "option_help": dict(catalogs.LAYOUT_HELP),
+    },
+    "patients": {
+        "section": _INPUTS, "label": "Patient folders", "visible_when": _BY_PATIENT,
+        "required_when": _BY_PATIENT,
+    },
+    "ios": {
+        "section": _INPUTS, "label": "Intraoral scans",
+        "visible_when": _BY_TYPE, "required_when": _BY_TYPE,
+    },
+    "cbct": {
+        "section": _INPUTS, "label": "CBCT volumes",
+        "visible_when": _BY_TYPE, "required_when": _BY_TYPE,
+    },
     # NOT "Mode". The facade publishes its own `mode` -- the modality -- and
     # labels it "Mode" too, so a panel reached through AREG shows two dropdowns
     # side by side under the same word: one saying CBCT, the next saying

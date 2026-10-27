@@ -84,6 +84,38 @@ def test_the_compound_extension_is_split_as_one_unit():
 
 
 # ---------------------------------------------------------------------------
+# patient_name
+# ---------------------------------------------------------------------------
+
+def test_the_patient_name_keeps_the_files_own_spelling():
+    """A folder called `42` beside `case_042_...` files was no name to find a
+    patient by: the name keeps its prefix and its zeros."""
+    assert pipeline.patient_name("case_042_T1_L.stl") == "case_042"
+    assert pipeline.patient_name("case_042_T1_CBCT.nii.gz") == "case_042"
+    assert pipeline.patient_name("P_0001_T2.nii.gz") == "P_0001"
+    assert pipeline.patient_name("P001_T2_U_Seg.vtk") == "P001"
+
+
+def test_a_leading_timepoint_is_not_taken_for_the_patient():
+    assert pipeline.patient_name("T1_case_042_U.vtk") == "T1_case_042"
+
+
+def test_a_name_with_no_digit_is_kept_whole():
+    assert pipeline.patient_name("upper_scan.vtk") == "upper_scan"
+
+
+def test_two_patients_never_share_a_folder(tmp_path):
+    """Two keys, one name: the second keeps its key so it cannot overwrite."""
+    write_mesh(tmp_path / "ios" / "case_042_scan2_U.vtk")
+    write_mesh(tmp_path / "ios" / "case_042_scan3_U.vtk")
+    write_volume(tmp_path / "cbct" / "case_042_scan2.nii.gz")
+    write_volume(tmp_path / "cbct" / "case_042_scan3.nii.gz")
+
+    paired, _unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert sorted(data["name"] for data in paired.values()) == ["case_042", "case_042_423"]
+
+
+# ---------------------------------------------------------------------------
 # discover
 # ---------------------------------------------------------------------------
 
@@ -92,7 +124,7 @@ def test_a_patient_present_in_both_modalities_is_paired(tmp_path):
     volume = write_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz")
 
     paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
-    assert paired == {"1": {"ios": [mesh], "cbct": volume}}
+    assert paired == {"1": {"ios": [mesh], "cbct": volume, "name": "P001"}}
     assert unpaired == {}
 
 
@@ -119,7 +151,7 @@ def test_a_patient_with_only_one_modality_is_reported_not_dropped(tmp_path):
 
     paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     assert set(paired) == {"1"}
-    assert unpaired == {"2": "no CBCT", "3": "no intraoral scan"}
+    assert unpaired == {"P002": "no CBCT", "P_0003": "no intraoral scan"}
 
 
 def test_no_pair_at_all_gives_both_counts_and_no_key(tmp_path):

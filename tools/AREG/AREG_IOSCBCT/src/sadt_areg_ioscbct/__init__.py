@@ -17,7 +17,10 @@ AREG and ALI splits removed. What is left here is geometry.
 from pathlib import Path
 from typing import Literal
 
-from sadt_areg_common import pairing
+import shutil
+
+from sadt_areg_common import pairing, patient_folders
+from sadt_areg_common.errors import ToolInputError
 
 from . import pipeline
 from .dispatch import main
@@ -39,10 +42,56 @@ ACCEPTS = {
 }
 
 
+def _role(patient: str, relative: str):
+    """"ios" for a mesh, "cbct" for a volume, None for anything else.
+
+    By the file's type alone: the two modalities are never the same kind of
+    file, so a patient folder needs no `IOS/` and `CBCT/` sub-folders -- though
+    it may have them.
+    """
+    name = relative.replace("\\", "/").rsplit("/", 1)[-1]
+    if name.lower().endswith(pipeline.SURFACE_EXTENSIONS):
+        return "ios"
+    if pairing.is_scan_file(name):
+        return "cbct"
+    return None
+
+
+def _filed_as(patient: str, role: str, relative: str, index: int) -> str:
+    """`<patient>_U.stl`, `<patient>_CBCT.nii.gz`: the names the pairing reads.
+
+    The patient's folder name comes first, so `pipeline.patient_name` gives it
+    back as the output folder; the jaw stays, since that is how each arch finds
+    its landmarks. Patients are matched on the DIGITS of their names, so a
+    folder name needs one.
+    """
+    if not any(c.isdigit() for c in patient):
+        raise ToolInputError(
+            "A patient folder's name carries no number. Patients are matched on "
+            "the digits of their names: name each folder with its patient's "
+            "number (e.g. patient001)."
+        )
+    name = relative.replace("\\", "/").rsplit("/", 1)[-1]
+    extension = patient_folders.extension_of(name)
+    if role == "cbct":
+        return f"{patient}_CBCT{extension}"
+    jaw = patient_folders.jaw_of(name)
+    return f"{patient}_{jaw or f'IOS{index}'}{extension}"
+
+
 def run(
-    ios: Path,
-    cbct: Path,
-    output_dir: Path,
+    # First, because it decides which of the next three the panel asks for.
+    # Spelled out because `Literal` takes literals only; a test asserts it
+    # against `catalogs.LAYOUT_CHOICES`.
+    input_layout: Literal["One folder per type", "One folder per patient"] = "One folder per type",
+    # Not required any more, and not because they are optional: which of
+    # `ios`/`cbct` or `patients` is needed depends on `input_layout`, and a
+    # field the panel marks required in the layout that does not read it would
+    # refuse to apply. `patient_folders.resolve` refuses what is missing.
+    ios: Path = "",
+    cbct: Path = "",
+    patients: Path = "",
+    output_dir: Path = "",
     # "From the data" is the default and names no mode: `dispatch.derive_automation`
     # reads it off the request -- both landmark sets supplied is Registration,
     # which predicts nothing. Whether to orient the CBCT first is `orient_cbct_first`
@@ -73,6 +122,13 @@ def run(
     """Register an intraoral scan onto a CBCT of the same patient.
 
     Args:
+        input_layout: How the files are organised: one folder for each type
+            of file (T1 and T2, or intraoral scans and CBCT) holding every
+            patient, or one folder for each patient holding all of that
+            patient's files. Rest the pointer on each option for an example.
+        patients: The folder of patient folders, in the one-folder-per-patient
+            layout. Each patient's folder name, with its number, names its
+            results.
         ios: The intraoral surfaces (.vtk/.stl), one folder, searched
             recursively. Upper and lower arches are registered separately and
             matched to their landmarks by the jaw token in the name.
@@ -80,7 +136,10 @@ def run(
             digits of the patient identifier, the two modalities being named by
             different conventions.
         output_dir: Where the registered meshes, their 4x4 matrices and
-            `AREG_report.json` are written. Nothing is written outside it.
+            `AREG_report.json` are written, one folder per patient named as
+            its files name it (`case_042`). When the CBCT was oriented first,
+            the oriented scan the meshes are registered onto and its `.tfm`
+            are written beside them. Nothing is written outside it.
         automation: Registration takes both landmark sets and predicts nothing --
             no other tool is called and no GPU is needed. Semi-Automated labels
             the crowns and predicts both sets. Fully-Automated orients the CBCT
@@ -108,12 +167,20 @@ def run(
         The output directory.
     """
     output_dir = Path(output_dir)
-    main(
-        ios=ios, cbct=cbct, output_dir=output_dir, automation=automation,
-        ios_landmarks=ios_landmarks, cbct_landmarks=cbct_landmarks,
-        cbct_reference=cbct_reference, landmark_model=landmark_model,
-        ios_landmark_model=ios_landmark_model, crown_model=crown_model,
-        max_dist=max_dist, output_suffix=output_suffix,
-        orient_cbct_first=orient_cbct_first, sup=sup,
+    folders, scratch = patient_folders.resolve(
+        input_layout, patients, {"ios": ios, "cbct": cbct}, output_dir, _role, _filed_as,
     )
+    try:
+        main(
+            ios=folders["ios"], cbct=folders["cbct"], output_dir=output_dir,
+            automation=automation,
+            ios_landmarks=ios_landmarks, cbct_landmarks=cbct_landmarks,
+            cbct_reference=cbct_reference, landmark_model=landmark_model,
+            ios_landmark_model=ios_landmark_model, crown_model=crown_model,
+            max_dist=max_dist, output_suffix=output_suffix,
+            orient_cbct_first=orient_cbct_first, sup=sup,
+        )
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
     return output_dir

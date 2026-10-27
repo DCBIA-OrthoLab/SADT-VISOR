@@ -279,3 +279,62 @@ PATCH_CHOICES = {PATCH_PALATE: True, PATCH_MGL: False}
 
 # The jaw each patch registers.
 PATCH_JAW = {PATCH_PALATE: JAW_UPPER, PATCH_MGL: JAW_LOWER}
+
+
+# ---------------------------------------------------------------------------
+# Input layout
+# ---------------------------------------------------------------------------
+# How the caller's files are organised. A cohort kept as one folder per type
+# (`T1/` and `T2/`, or `IOS/` and `CBCT/`) is the layout every engine reads;
+# one kept as one folder per patient (`<patient>/T1/`, `<patient>/CBCT/`, or
+# the files side by side) is sorted into it first, by `patient_folders`.
+
+LAYOUT_BY_TYPE = "One folder per type"
+LAYOUT_BY_PATIENT = "One folder per patient"
+
+LAYOUT_CHOICES = {LAYOUT_BY_TYPE: True, LAYOUT_BY_PATIENT: False}
+
+# What each layout looks like on disk, shown when the pointer rests on that
+# option. One text for the three engines: the facade publishes one help per
+# option whatever the mode, so each tree shows both the T1/T2 and the IOS/CBCT
+# shape. Plain text, line breaks kept.
+LAYOUT_HELP = {
+    LAYOUT_BY_TYPE: (
+        "One folder for each type of file, every patient inside it.\n"
+        "Patients are matched across the two folders by their file names.\n"
+        "\n"
+        "CBCT or IOS registration (T1 and T2):\n"
+        "    T1/\n"
+        "        patient001_T1.nii.gz\n"
+        "        patient002_T1.nii.gz\n"
+        "    T2/\n"
+        "        patient001_T2.nii.gz\n"
+        "        patient002_T2.nii.gz\n"
+        "\n"
+        "IOS to CBCT:\n"
+        "    IOS/\n"
+        "        patient001_U.stl\n"
+        "        patient001_L.stl\n"
+        "    CBCT/\n"
+        "        patient001_CBCT.nii.gz"
+    ),
+    LAYOUT_BY_PATIENT: (
+        "One folder for each patient, holding all of that patient's files.\n"
+        "The folder's name is the patient's name, and names the results.\n"
+        "\n"
+        "CBCT or IOS registration (T1 and T2):\n"
+        "    patients/\n"
+        "        patient001/\n"
+        "            T1/  scan.nii.gz\n"
+        "            T2/  scan.nii.gz\n"
+        "        patient002/\n"
+        "            patient002_T1.nii.gz\n"
+        "            patient002_T2.nii.gz\n"
+        "\n"
+        "IOS to CBCT (sub-folders optional):\n"
+        "    patients/\n"
+        "        patient001/\n"
+        "            IOS/   upper.stl  lower.stl\n"
+        "            CBCT/  scan.nii.gz"
+    ),
+}
