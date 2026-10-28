@@ -170,12 +170,12 @@ ORIENTATION_NONE = "Leave as scanned"
 ORIENTATION_FRANKFURT = "Frankfurt horizontal"
 ORIENTATION_OCCLUSAL = "Occlusal plane"
 
-# Nothing by default: orienting costs an ASO chain and a landmark prediction per
-# patient, and a registration that nobody asked to reorient should come back in
-# the frame it arrived in.
+# Frankfurt horizontal by default, the frame the lab measures in. It costs an ASO
+# chain and a landmark prediction per patient; "Leave as scanned" is one click
+# away for a cohort that should come back in the frame it arrived in.
 ORIENTATION_CHOICES = {
-    ORIENTATION_NONE: True,
-    ORIENTATION_FRANKFURT: False,
+    ORIENTATION_NONE: False,
+    ORIENTATION_FRANKFURT: True,
     ORIENTATION_OCCLUSAL: False,
 }
 

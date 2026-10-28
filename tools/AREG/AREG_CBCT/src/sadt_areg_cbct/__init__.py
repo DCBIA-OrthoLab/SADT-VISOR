@@ -114,7 +114,8 @@ def run(
     dicom_input: bool = False,
     # WHICH FRAME the scans come back in, and the one thing about the automated
     # path that no folder can answer. Naming a frame is what asks for the T1 to
-    # be oriented first; "Leave as scanned" is the default and asks for nothing.
+    # be oriented first. Frankfurt horizontal is the default, so a cohort comes
+    # back in the frame the lab measures in; "Leave as scanned" asks for nothing.
     #
     # Two frames rather than a yes/no, because the two published bundles carry
     # disjoint landmark sets and mean different things -- Frankfurt horizontal
@@ -125,7 +126,7 @@ def run(
     # to segment and nothing to orient for.
     orientation: Literal[
         "Leave as scanned", "Frankfurt horizontal", "Occlusal plane"
-    ] = "Leave as scanned",
+    ] = "Frankfurt horizontal",
     output_suffix: str = "Reg",
     # The same argument as the other two engines', so the AREG facade shows
     # one "Extra outputs" box whose options follow the mode. Nothing ticked by
@@ -185,8 +186,8 @@ def run(
             interchangeable: Frankfurt horizontal is defined by
             Ba, S, N, RPo, LPo, ROr and LOr, the occlusal plane by
             ANS, IF, PNS, UL6O, UR1O and UR6O, so the measurement made
-            afterwards does not say the same thing. Read only when no masks are
-            supplied.
+            afterwards does not say the same thing. Frankfurt horizontal by
+            default. Read only when no masks are supplied.
         output_suffix: Added to each output name, e.g. `scan_Reg.nii.gz`.
         outputs: What to hand back beside each registered T2, in the T1's
             space so it opens on top of it. T1 scan: the T1 it was registered
