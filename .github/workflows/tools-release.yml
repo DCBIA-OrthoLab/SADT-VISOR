@@ -55,7 +55,10 @@ jobs:
             exit 0
           fi
           # What a server runs: documentation and tests change nothing in it.
-          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py docker/tools.Dockerfile .dockerignore \
+          # The data manifest and its engine count too: the server's update
+          # agent reads them from this image, so a manifest change released
+          # without an image never reached a deployment.
+          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py scripts/data-manifest.yml scripts/fetch_data.py docker/tools.Dockerfile .dockerignore \
                     | grep -vE '(\.md$|(^|/)tests/)' || true)
           if [ -z "$changed" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
