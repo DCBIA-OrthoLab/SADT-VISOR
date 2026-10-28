@@ -26,14 +26,27 @@ Three behaviours are deliberately different from the original:
 
 import logging
 import os
+import shutil
 
 import numpy as np
 import SimpleITK as sitk
 
-from sadt_areg_common import catalogs, pairing
+from sadt_areg_common import catalogs, pairing, scene
 from . import elastix, gpu_rigid
 
 logger = logging.getLogger(__name__)
+
+
+def oriented_landmarks(oriented_scan: str) -> str:
+    """Where ASO put the landmarks it oriented `oriented_scan` on.
+
+    ASO writes `<patient>_<suffix>.nii.gz` and `<patient>_lm_<suffix>.mrk.json`
+    side by side; the suffix is read off the scan rather than assumed `Or`.
+    """
+    stem, _extension = pairing.split_scan_extension(os.path.basename(oriented_scan))
+    patient, _, suffix = stem.rpartition("_")
+    name = f"{patient}_lm_{suffix}.mrk.json" if patient else f"{stem}_lm.mrk.json"
+    return os.path.join(os.path.dirname(oriented_scan), name)
 
 
 def register_patient(
@@ -45,11 +58,21 @@ def register_patient(
     relative_key: str,
     suffix: str,
     segmentation_label: int = None,
+    outputs=(),
+    oriented_t1: str = None,
 ) -> dict:
     """Register one T2 onto one T1 and write the results. Returns a report entry.
 
     Raises `elastix.RegistrationError` when this patient cannot be registered;
     the caller records that and moves on to the next.
+
+    `outputs` are the `catalogs.OUTPUT_*` ticked. T1 scan puts the T1 the T2
+    was registered onto in the scene. `oriented_t1` is that T1's copy under
+    `T1_Oriented/` when ASO oriented it first: the scene then points at that
+    copy and at ASO's landmarks beside it rather than writing the heaviest file
+    of the run a second time. Otherwise the T1 is copied beside the result.
+    Whatever is ticked, `<patient>_<region>_<suffix>_scene.json` lists the
+    files of this registration, all in the T1's space.
     """
     fixed = _read(t1_path, "T1 scan")
     mask = _read(mask_path, "mask", cause="mask")
@@ -89,6 +112,21 @@ def register_patient(
     transform_output = os.path.join(destination, f"{patient}_{region}_{suffix}_transform.tfm")
     sitk.WriteTransform(transform, transform_output)
 
+    in_scene = []
+    if catalogs.OUTPUT_T1_SCAN in (outputs or ()):
+        if oriented_t1:
+            in_scene.append((oriented_t1, "reference"))
+            landmarks = oriented_landmarks(oriented_t1)
+            if os.path.isfile(landmarks):
+                in_scene.append((landmarks, "reference landmarks"))
+        else:
+            reference = os.path.join(destination, os.path.basename(t1_path))
+            shutil.copy2(t1_path, reference)
+            in_scene.append((reference, "reference"))
+    in_scene += [(scan_output, "registered"), (transform_output, "registration")]
+    scene_output = scene.write(destination, "the T1", in_scene,
+                               name=f"{patient}_{region}_{suffix}_{scene.SCENE_NAME}")
+
     entry = {
         "status": "ok",
         "region": catalogs.region_name(region),
@@ -99,7 +137,8 @@ def register_patient(
         "transform_maps": "T1 space -> T2 space (what sitk.ResampleImageFilter consumes)",
         "engine": engine,
         "outputs": sorted(
-            os.path.relpath(path, output_dir) for path in (scan_output, transform_output)
+            os.path.relpath(path, output_dir)
+            for path in [path for path, _role in in_scene] + [scene_output]
         ),
     }
     if note:

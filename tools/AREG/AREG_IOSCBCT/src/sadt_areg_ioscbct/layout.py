@@ -59,7 +59,7 @@ LAYOUT = {
     # makes, so ticking `ASO` returns ASO's own result and not the landmarks
     # ASO predicted on the way.
     "keep_intermediate": {
-        "label": "Steps to keep",
+        "label": "Raw intermediate files",
         "option_help": {
             "ALI_CBCT": "The landmarks placed on the CBCT, before this tool "
                         "registers on them.",
@@ -76,7 +76,25 @@ LAYOUT = {
     # it lands in a "Quality control" section of its own. Offered like ASO's:
     # nothing is ticked by default, so a run nobody asked to stop runs to the
     # end, and a ticked step pauses the run and opens what it produced in VISU.
-    "stop_after": {"label": "Stop after"},
+    # Said per pause, because two of them are ALI_CBCT and looked alike: the
+    # one inside ASO shows the points ASO orients on, not the ones this tool
+    # registers on. Opening the wrong one to check the registration showed
+    # landmarks the registration never reads.
+    "stop_after": {
+        "label": "Stop after",
+        "option_help": {
+            "ASO/ALI_CBCT": "The landmarks ASO places on the CBCT to orient it. "
+                            "Not the ones the registration uses.",
+            "ASO": "The CBCT once oriented, before any landmark the registration "
+                   "uses is placed on it.",
+            "Crown_Seg": "The intraoral scans with each tooth labelled.",
+            "ALI_IOS/Crown_Seg": "The teeth labelled for the intraoral landmark "
+                                 "prediction.",
+            "ALI_IOS": "The intraoral landmarks the registration matches.",
+            "ALI_CBCT": "The CBCT landmarks the registration matches: the last "
+                        "pause before the meshes are registered.",
+        },
+    },
 
     # Segments, not a drop-down: two layouts of equal standing, both on screen,
     # and the client puts it above the inputs it switches between.
@@ -178,4 +196,7 @@ LAYOUT = {
     # match the opposing one.
     "max_dist": {"section": _OUTPUTS, "label": "ICP match distance (mm)", "hidden": True},
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
+    "outputs": catalogs.outputs_layout(
+        _OUTPUTS, catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_CBCT_SCAN,
+        catalogs.OUTPUT_TRANSFORMS),
 }

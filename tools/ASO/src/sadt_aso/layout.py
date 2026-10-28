@@ -36,7 +36,7 @@ LAYOUT = {
     # run()'s signature -- see describe.INJECTED_ARGUMENTS. The options are the
     # steps themselves; only the wording is this tool's to give.
     "keep_intermediate": {
-        "label": "Steps to keep",
+        "label": "Raw intermediate files",
         "option_help": {
             "ALI_CBCT": "The landmarks the prediction placed, before this tool "
                         "oriented them -- what to look at when an orientation "

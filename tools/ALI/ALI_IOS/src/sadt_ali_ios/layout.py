@@ -29,7 +29,7 @@ LAYOUT = {
     # Injected by the server for any tool that calls another, so it is not in
     # run()'s signature -- see describe.INJECTED_ARGUMENTS.
     "keep_intermediate": {
-        "label": "Steps to keep",
+        "label": "Raw intermediate files",
         "option_help": {
             "Crown_Seg": "The per-tooth labelled meshes, which this tool "
                          "otherwise only uses to place the landmarks.",

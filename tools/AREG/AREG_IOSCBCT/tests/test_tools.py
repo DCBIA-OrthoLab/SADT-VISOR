@@ -13,6 +13,7 @@ breaks. `test_schema_seam.py` checks those names against the real schemas.
 """
 
 import logging
+import json
 import os
 
 import pytest
@@ -349,6 +350,26 @@ def test_fully_automated_hands_back_the_cbct_the_meshes_were_registered_onto(tmp
     patient = read_report(tmp_path / "out")["patients"]["P001"]
     assert patient["oriented_cbct"] == os.path.join("P001", "P_0001_T2_Or.nii.gz")
     assert patient["cbct_transform"] == os.path.join("P001", "P_0001_T2_Or_transform.tfm")
+
+
+def test_the_same_space_scene_is_built_on_the_oriented_cbct(tmp_path):
+    """Fully-Automated registers onto ASO's scan, so that is the scene's CBCT."""
+    oriented = tmp_path / "oriented"
+    write_volume(oriented / "P_0001_T2_Or.nii.gz")
+    (oriented / "P_0001_T2_Or_transform.tfm").write_text("#Insight Transform File V1.0\n")
+    _sup, arguments = semi_automated(
+        tmp_path,
+        automation=catalogs.AUTOMATION_FULLY,
+        outputs={"ASO": lambda params: oriented},
+    )
+    dispatch.main(**arguments, outputs=[catalogs.OUTPUT_LANDMARKS])
+
+    scene = json.loads((tmp_path / "out" / "P001" / "scene.json").read_text())
+    roles = {entry["role"]: entry["path"] for entry in scene["files"]}
+    assert scene["space"] == "the oriented CBCT"
+    assert roles["reference"] == "P_0001_T2_Or.nii.gz"
+    assert roles["orientation"] == "P_0001_T2_Or_transform.tfm"
+    assert "moved landmarks" in roles
 
 
 def test_a_cbct_the_caller_sent_is_not_sent_back(tmp_path):

@@ -277,6 +277,7 @@ def _run_cbct(
     t1_root, t2_root, t1_masks_path, automation, regions, segmentation_model,
     segmentation_label, orientation_reference, dicom_input, output_dir, work_dir,
     suffix, report, sup=None, landmark_model=None, segmentations=None, num_workers=0,
+    outputs=(),
     orientation_frame="",
 ) -> None:
     # Imported here rather than at module level: the CBCT engine pulls in
@@ -326,6 +327,7 @@ def _run_cbct(
         segment=automation != catalogs.AUTOMATION_SEMI,
     )
 
+    oriented_root = None
     # Step 1 -- orient the T1 scans, when the mode asks for it. The T2 is NOT
     # oriented: it is about to be resampled into the T1's frame anyway, and
     # orienting it first would be one more interpolation of the same data.
@@ -348,6 +350,7 @@ def _run_cbct(
                            "cannot be paired or registered", returned, sent)
         report["oriented_t1"] = True
         _collect_oriented(oriented, output_dir, report)
+        oriented_root = oriented
         t1_root = oriented
 
     # Step 2 -- the masks the registration is confined to.
@@ -461,6 +464,8 @@ def _run_cbct(
                 "relative_key": key,
                 "suffix": suffix,
                 "segmentation_label": segmentation_label or None,
+                "outputs": tuple(outputs or ()),
+                "oriented_t1": _oriented_copy(entry["t1"], oriented_root, output_dir),
             }))
 
     width = _registration_width(sup, len(jobs), num_workers)
@@ -502,6 +507,15 @@ def _run_cbct(
 
     _roll_up_regions(report["patients"])
     return failures
+
+
+def _oriented_copy(t1_path, oriented_root, output_dir):
+    """`t1_path`'s copy under `T1_Oriented/`, which `_collect_oriented` made
+    before any registration ran; None when the T1 was not oriented."""
+    if not oriented_root:
+        return None
+    copy = os.path.join(output_dir, ORIENTED_DIRNAME, os.path.relpath(t1_path, oriented_root))
+    return copy if os.path.isfile(copy) else None
 
 
 def _failure(kind: str, reason: str, caller: bool, exc: BaseException = None) -> dict:
@@ -698,6 +712,7 @@ def register(
     sup=None,
     segmentations=None,
     num_workers=0,
+    outputs=(),
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
@@ -751,6 +766,7 @@ def register(
         landmark_model=landmark_model,
         segmentations=segmentations,
         num_workers=num_workers,
+        outputs=outputs,
     )
 
     # Extracted inputs, converted DICOM, the oriented copies and whatever the
@@ -782,6 +798,7 @@ def main(
     output_dir=None,
     sup=None,
     num_workers=0,
+    outputs=(),
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -836,6 +853,7 @@ def main(
         sup=sup,
         segmentations=segmentations,
         num_workers=num_workers,
+        outputs=outputs,
     )
 
     return run.output_dir

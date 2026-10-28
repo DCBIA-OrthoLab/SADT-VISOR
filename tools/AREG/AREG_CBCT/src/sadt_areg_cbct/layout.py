@@ -61,7 +61,7 @@ LAYOUT = {
     # makes, so ticking `ASO` returns ASO's own result and not the landmarks
     # ASO predicted on the way.
     "keep_intermediate": {
-        "label": "Steps to keep",
+        "label": "Raw intermediate files",
         "option_help": {
             "AMASSS": "The bone masks each region's registration is confined to "
                       "-- what to look at when a registration lands on the "
@@ -234,4 +234,5 @@ LAYOUT = {
     },
 
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
+    "outputs": catalogs.outputs_layout(_OUTPUTS, catalogs.OUTPUT_T1_SCAN),
 }

@@ -726,8 +726,9 @@ class TestIOSRun:
         assert entry["status"] == "ok"
         assert entry["jaws"] == ["Lower", "Upper"]
         assert entry["registered_jaw"] == "Upper"
-        # Four meshes plus one transform.
-        assert len(entry["outputs"]) == 5
+        # Four meshes, one transform and the scene that lists them.
+        assert len(entry["outputs"]) == 6
+        assert any(name.endswith("_scene.json") for name in entry["outputs"])
         assert any(name.endswith("_transform.tfm") for name in entry["outputs"])
 
     def test_the_mgl_run_writes_the_mandibles_only(self, tmp_path):
@@ -748,8 +749,35 @@ class TestIOSRun:
         )
         assert entry["registered_on"] == "Bottom_MGL"
         assert entry["jaws"] == ["Lower"]
-        assert len(entry["outputs"]) == 3  # two meshes plus the transform
+        assert len(entry["outputs"]) == 4  # two meshes, the transform, the scene
         assert all("Upper" not in name for name in entry["outputs"])
+
+
+class TestScene:
+    def test_every_file_of_a_subject_is_in_its_scene(self, tmp_path):
+        """All in the T1's space: the T1 meshes as they are, the T2 ones moved."""
+        import json
+
+        TestIOSRun._cohort(tmp_path)
+        matched = ios_pipeline.pair(
+            str(tmp_path / "T1"), str(tmp_path / "T2"), "Reg",
+            registered_jaw=catalogs.JAW_UPPER, carry_other=True,
+        )
+        ios_pipeline.register_patient(
+            jaws=matched.matched["P1"], painter=_StubPainter("Butterfly"),
+            registered_jaw=catalogs.JAW_UPPER, output_dir=str(tmp_path / "out"),
+            relative_key="P1", suffix="Reg",
+        )
+        scene = json.loads((tmp_path / "out" / "P1_Reg_scene.json").read_text())
+        assert scene["space"] == "the T1"
+        roles = sorted((entry["path"], entry["role"]) for entry in scene["files"])
+        assert roles == [
+            ("P1_Reg_transform.tfm", "registration"),
+            ("P1_T1_Lower_Reg.vtk", "reference"),
+            ("P1_T1_Upper_Reg.vtk", "reference"),
+            ("P1_T2_Lower_Reg.vtk", "registered"),
+            ("P1_T2_Upper_Reg.vtk", "registered"),
+        ]
 
 
 # Moved from AREG_IOSCBCT's suite: this package is the one that makes
@@ -1390,5 +1418,5 @@ def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
 
     hints = LAYOUT["keep_intermediate"]
     assert not hints.get("hidden")
-    assert hints["label"] == "Steps to keep"
+    assert hints["label"] == "Raw intermediate files"
     assert set(hints["option_help"]) == {"ALI_IOS", "ASO", "Crown_Seg"}

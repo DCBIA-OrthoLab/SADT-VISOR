@@ -32,6 +32,7 @@ def test_a_run_writes_the_mesh_its_matrix_and_the_report(tmp_path):
         "AREG_report.json",
         os.path.join("P001", "P001_T2_U_Reg.vtk"),
         os.path.join("P001", "P001_T2_U_Reg_matrix.npy"),
+        os.path.join("P001", "scene.json"),
     ])
 
 
@@ -67,8 +68,10 @@ def test_each_patient_gets_a_folder_of_its_own(tmp_path):
         "AREG_report.json",
         os.path.join("P001", "P001_T2_U_Reg.vtk"),
         os.path.join("P001", "P001_T2_U_Reg_matrix.npy"),
+        os.path.join("P001", "scene.json"),
         os.path.join("P002", "P002_T2_U_Reg.vtk"),
         os.path.join("P002", "P002_T2_U_Reg_matrix.npy"),
+        os.path.join("P002", "scene.json"),
     ])
 
 
@@ -88,6 +91,7 @@ def test_the_suffix_reaches_every_name_it_writes(tmp_path):
         "AREG_report.json",
         os.path.join("P001", "P001_T2_U_Study7.vtk"),
         os.path.join("P001", "P001_T2_U_Study7_matrix.npy"),
+        os.path.join("P001", "scene.json"),
     ])
 
 

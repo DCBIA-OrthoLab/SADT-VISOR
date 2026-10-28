@@ -102,6 +102,24 @@ Three behaviours worth knowing before reading a result:
   a region that moved between timepoints produces a confident, wrong answer.
 - **Each region is a separate registration** with its own output folder.
 - **`modality` is never inferred from the file extension.**
+- **What comes back is asked as `outputs` ("Extra outputs"), not as steps.**
+  Whatever is ticked is written in the space of the result, so it opens on top
+  of it. IOS to CBCT offers Moved landmarks (the CBCT landmarks the registration used,
+  and each mesh's own moved by its matrix), CBCT scan (the CBCT the meshes were
+  registered onto: ASO's oriented scan in the Fully-Automated mode, the
+  caller's otherwise) and Transform (.tfm) (each matrix as a `.tfm`, written as
+  AREG_IOS writes its own: the inverse, for resampling). CBCT offers T1 scan (the
+  T1 the T2 was registered onto: when it was oriented first, the scene points
+  at the copy already under `T1_Oriented/` and at ASO's landmarks beside it,
+  rather than writing the volume a second time). IOS writes everything in the T1's space
+  already and offers nothing more.
+- **Every registration says which of its files make one scene.** `scene.json`
+  (one per patient folder) or `<patient>_..._scene.json` (where patients share a
+  folder) lists them, each with its kind and role, paths relative to the
+  folder: `sadt_areg_common/scene.py`. A viewer reads it instead of guessing
+  from file names. The raw output of each step the chain ran is a different
+  thing, in that step's own space: "Raw intermediate files", under Quality
+  control.
 
 ## Versions
 

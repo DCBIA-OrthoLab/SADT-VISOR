@@ -338,3 +338,44 @@ LAYOUT_HELP = {
         "            CBCT/  scan.nii.gz"
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# What a run hands back beyond its result, asked as `outputs`
+# ---------------------------------------------------------------------------
+
+# One argument with the same name in every engine, so the AREG facade merges
+# it into one box whose options follow the mode. Every option names a kind of
+# file, never a step: whatever is ticked is written in the space of the
+# result, so it opens on top of it. Each label says the file a reader gets,
+# and the scan is named after what it is in that mode: a facade shows the
+# options of the mode chosen, so the two never sit side by side.
+OUTPUT_LANDMARKS = "Moved landmarks"
+OUTPUT_CBCT_SCAN = "CBCT scan"
+OUTPUT_T1_SCAN = "T1 scan (oriented when orientation is on)"
+OUTPUT_TRANSFORMS = "Transform (.tfm)"
+
+OUTPUT_LABEL = "Extra outputs"
+# Drawn under the label, always visible: the one thing a reader needs before
+# ticking anything is what comes back anyway, and where the rest lands.
+OUTPUT_NOTE = ("Saved beside the result, in the same 3D space. The result "
+               "and its scene.json are always written.")
+
+OUTPUT_HELP = {
+    OUTPUT_LANDMARKS: "Each scan's landmarks moved with it onto the result, "
+                      "and a copy of the CBCT's, so they all sit on it.",
+    OUTPUT_CBCT_SCAN: "The CBCT the meshes were registered onto, copied beside "
+                      "them (the oriented one when the chain oriented it first).",
+    OUTPUT_T1_SCAN: "The T1 the T2 was registered onto. Oriented, it is the "
+                    "copy already under T1_Oriented/, with ASO's landmarks; "
+                    "otherwise it is copied beside the result.",
+    OUTPUT_TRANSFORMS: "Each registration as a .tfm that 3D Slicer opens.",
+}
+
+
+def outputs_layout(section, *options) -> dict:
+    """The `outputs` layout entry of an engine offering `options`."""
+    return {
+        "section": section, "label": OUTPUT_LABEL, "note": OUTPUT_NOTE,
+        "option_help": {option: OUTPUT_HELP[option] for option in options},
+    }
