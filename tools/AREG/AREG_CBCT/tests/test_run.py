@@ -199,6 +199,7 @@ class TestSemiAutomatedCBCT:
         assert produced == [
             "AREG_report.json",
             os.path.join("CB", "P1_CB_Reg.nii.gz"),
+            os.path.join("CB", "P1_CB_Reg_scene.json"),
             os.path.join("CB", "P1_CB_Reg_transform.tfm"),
         ]
 
@@ -724,7 +725,7 @@ def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
 
     hints = LAYOUT["keep_intermediate"]
     assert not hints.get("hidden")
-    assert hints["label"] == "Steps to keep"
+    assert hints["label"] == "Raw intermediate files"
     assert set(hints["option_help"]) == {"AMASSS", "ASO"}
 
 

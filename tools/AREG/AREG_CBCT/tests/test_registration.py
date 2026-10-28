@@ -16,6 +16,7 @@ import SimpleITK as sitk
 
 from conftest import FakeSup, cohort, displaced, full_mask, phantom, tree_of, write
 from sadt_areg_cbct import dispatch
+from sadt_areg_cbct import pipeline as cbct_pipeline
 from sadt_areg_common import catalogs, pairing
 from sadt_areg_common.errors import ToolInputError
 
@@ -44,7 +45,29 @@ def test_a_run_writes_a_registered_scan_a_transform_and_a_report(semi_run):
         "AREG_report.json",
         os.path.join("CB", "P1_CB_Reg.nii.gz"),
         os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("CB", "P1_CB_Reg_scene.json"),
     ])
+
+
+def test_the_scene_lists_the_registration_in_the_t1_space(semi_run):
+    run, _root = semi_run
+    with open(os.path.join(run.output_dir, "CB", "P1_CB_Reg_scene.json")) as handle:
+        scene = json.load(handle)
+    assert scene == {"version": 1, "space": "the T1", "files": [
+        {"path": "P1_CB_Reg.nii.gz", "kind": "volume", "role": "registered"},
+        {"path": "P1_CB_Reg_transform.tfm", "kind": "transform", "role": "registration"},
+    ]}
+
+
+def test_scans_copies_the_t1_beside_the_registered_t2(tmp_path):
+    cohort(tmp_path, size=32)
+    run = semi(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
+    folder = os.path.join(run.output_dir, "CB")
+    with open(os.path.join(folder, "P1_CB_Reg_scene.json")) as handle:
+        files = json.load(handle)["files"]
+    reference = [entry["path"] for entry in files if entry["role"] == "reference"]
+    assert len(reference) == 1 and os.path.isfile(os.path.join(folder, reference[0]))
+    assert reference[0] in os.listdir(os.path.join(str(tmp_path), "T1"))
 
 
 def test_each_region_is_a_registration_of_its_own(tmp_path):
@@ -58,8 +81,10 @@ def test_each_region_is_a_registration_of_its_own(tmp_path):
         "AREG_report.json",
         os.path.join("CB", "P1_CB_Reg.nii.gz"),
         os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("CB", "P1_CB_Reg_scene.json"),
         os.path.join("MAND", "P1_MAND_Reg.nii.gz"),
         os.path.join("MAND", "P1_MAND_Reg_transform.tfm"),
+        os.path.join("MAND", "P1_MAND_Reg_scene.json"),
     ])
     assert set(run.patients["P1"]["regions"]) == {"CB", "MAND"}
 
@@ -81,8 +106,10 @@ def test_a_batch_keeps_the_tree_its_scans_arrived_in(tmp_path):
         "AREG_report.json",
         os.path.join("CB", "siteA", "P1_CB_Reg.nii.gz"),
         os.path.join("CB", "siteA", "P1_CB_Reg_transform.tfm"),
+        os.path.join("CB", "siteA", "P1_CB_Reg_scene.json"),
         os.path.join("CB", "siteB", "P1_CB_Reg.nii.gz"),
         os.path.join("CB", "siteB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("CB", "siteB", "P1_CB_Reg_scene.json"),
     ])
 
 
@@ -93,6 +120,7 @@ def test_the_suffix_reaches_both_names_it_writes(tmp_path):
         "AREG_report.json",
         os.path.join("CB", "P1_CB_Study7.nii.gz"),
         os.path.join("CB", "P1_CB_Study7_transform.tfm"),
+        os.path.join("CB", "P1_CB_Study7_scene.json"),
     ])
 
 
@@ -148,7 +176,7 @@ def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
     assert registered.GetPixelID() == sitk.sitkInt16
 
 
-def _oriented_run(tmp_path, sups=None):
+def _oriented_run(tmp_path, sups=None, outputs=()):
     """An Oriented + Fully-Automated run, ASO and AMASSS planted, elastix real.
 
     The T1 comes back from 'ASO' centred on the origin, as the real one does; the
@@ -187,6 +215,7 @@ def _oriented_run(tmp_path, sups=None):
         orientation=catalogs.ORIENTATION_FRANKFURT,
         output_dir=str(tmp_path / "out"),
         sup=sup,
+        outputs=list(outputs),
     )
     return run, fixed
 
@@ -277,6 +306,42 @@ def test_an_oriented_run_returns_the_t1_the_t2_was_registered_onto(tmp_path):
     assert os.path.join(dispatch.ORIENTED_DIRNAME, "P1_T1_Or.nii.gz") in report["oriented"]
 
 
+def test_an_oriented_t1_is_listed_where_it_already_is_not_copied_again(tmp_path):
+    """The scene points at the copy under T1_Oriented/ and at ASO's landmarks
+    beside it: a second copy of the heaviest file of the run says nothing the
+    first does not."""
+    run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
+    folder = os.path.join(run.output_dir, "CB")
+    assert sorted(os.listdir(folder)) == [
+        "P1_CB_Reg.nii.gz", "P1_CB_Reg_scene.json", "P1_CB_Reg_transform.tfm"]
+
+    with open(os.path.join(folder, "P1_CB_Reg_scene.json")) as handle:
+        files = json.load(handle)["files"]
+    assert files[:2] == [
+        {"path": "../T1_Oriented/P1_T1_Or.nii.gz", "kind": "volume", "role": "reference"},
+        {"path": "../T1_Oriented/P1_T1_lm_Or.mrk.json", "kind": "markups",
+         "role": "reference landmarks"},
+    ]
+    for entry in files:
+        assert os.path.isfile(os.path.join(folder, *entry["path"].split("/")))
+
+
+def test_an_oriented_run_lists_no_t1_unless_asked(tmp_path):
+    run, _fixed = _oriented_run(tmp_path)
+    with open(os.path.join(run.output_dir, "CB", "P1_CB_Reg_scene.json")) as handle:
+        roles = [entry["role"] for entry in json.load(handle)["files"]]
+    assert roles == ["registered", "registration"]
+
+
+@pytest.mark.parametrize("scan, landmarks", [
+    ("P1_T1_Or.nii.gz", "P1_T1_lm_Or.mrk.json"),
+    ("P1_Oriented.nrrd", "P1_lm_Oriented.mrk.json"),
+])
+def test_aso_landmarks_are_found_by_its_own_naming(scan, landmarks):
+    found = cbct_pipeline.oriented_landmarks(os.path.join("T1_Oriented", scan))
+    assert found == os.path.join("T1_Oriented", landmarks)
+
+
 def test_a_t2_far_from_the_oriented_t1_comes_back_whole_and_on_it(tmp_path):
     """Resampled on the T2's grid as it stood, a T2 whose box does not surround
     the oriented T1's overlapped it on a corner, and the rest came back empty --
@@ -342,6 +407,7 @@ def test_the_report_lists_what_the_run_produced_relative_to_the_output(semi_run)
     assert entry["outputs"] == sorted([
         os.path.join("CB", "P1_CB_Reg.nii.gz"),
         os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("CB", "P1_CB_Reg_scene.json"),
     ])
     with open(os.path.join(run.output_dir, dispatch.REPORT_NAME), encoding="utf-8") as handle:
         assert root not in handle.read()

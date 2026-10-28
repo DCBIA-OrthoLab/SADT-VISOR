@@ -28,7 +28,7 @@ reported rather than guessed.
 import logging
 import os
 
-from sadt_areg_common import catalogs, pairing
+from sadt_areg_common import catalogs, pairing, scene
 from sadt_areg_common.errors import ToolInputError
 
 from . import landmarks as landmark_files
@@ -226,9 +226,12 @@ def register_patient(
     destination = os.path.join(output_dir, relative_dir)
     os.makedirs(destination, exist_ok=True)
 
-    written = [
-        _write(t1_surface, registered["t1"], destination, suffix),
-        _write(surfaces.transform_surface(t2_surface, matrix), registered["t2"], destination, suffix),
+    # (path, role) for this subject's scene: every file below is in the T1's
+    # space, the T1 meshes as they are and the T2 ones moved onto them.
+    in_scene = [
+        (_write(t1_surface, registered["t1"], destination, suffix), "reference"),
+        (_write(surfaces.transform_surface(t2_surface, matrix), registered["t2"], destination, suffix),
+         "registered"),
     ]
 
     for jaw, files in jaws.items():
@@ -238,24 +241,31 @@ def register_patient(
         # point of registering on a region that does not move is that the whole
         # model follows it, so the occlusion the two arches were captured in is
         # preserved.
-        written.append(_write(surfaces.read_surface(files["t1"]), files["t1"], destination, suffix))
-        written.append(
+        in_scene.append(
+            (_write(surfaces.read_surface(files["t1"]), files["t1"], destination, suffix), "reference"))
+        in_scene.append((
             _write(
                 surfaces.transform_surface(surfaces.read_surface(files["t2"]), matrix),
                 files["t2"],
                 destination,
                 suffix,
-            )
-        )
+            ),
+            "registered",
+        ))
 
     prior = (prior_transforms or {}).get(relative_key)
-    written.append(
+    in_scene.append((
         icp.write_transform(
             matrix,
             os.path.join(destination, f"{patient}_{suffix}_transform.tfm"),
             prior_path=prior,
-        )
-    )
+        ),
+        "registration",
+    ))
+    written = [path for path, _role in in_scene]
+    # Named after the subject: several share `destination`.
+    written.append(scene.write(destination, "the T1", in_scene,
+                               name=f"{patient}_{suffix}_{scene.SCENE_NAME}"))
 
     entry = {
         "status": "ok",

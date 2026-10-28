@@ -48,7 +48,7 @@ LAYOUT = {
     # makes, so ticking `ASO` returns ASO's own result and not the landmarks
     # ASO predicted on the way.
     "keep_intermediate": {
-        "label": "Steps to keep",
+        "label": "Raw intermediate files",
         "option_help": {
             "ALI_IOS": "The landmarks placed on the intraoral scans, which the "
                        "mucogingival patch is built from.",

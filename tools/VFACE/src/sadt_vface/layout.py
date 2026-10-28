@@ -42,7 +42,7 @@ LAYOUT = {
     # one cell that carries it carries none of the working. These are the
     # points where the working can still be looked at.
     "keep_intermediate": {
-        "label": "Steps to keep",
+        "label": "Raw intermediate files",
         # Named in the order `dispatch._run` runs them, which is not the order
         # the server lists them in -- the schema's `calls` arrives sorted. A
         # reader comparing the two should not read the difference as a claim

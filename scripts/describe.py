@@ -151,6 +151,9 @@ LAYOUT_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label
                # label alone tells a clinician nothing, and the argument's own
                # description covers all of them at once.
                "option_help",
+               # One short line under the label, always visible: what is
+               # written whatever is ticked, where the rest lands.
+               "note",
                # How few options a multichoice may be left with; absent means
                # none is a meaningful answer.
                "min_selected")

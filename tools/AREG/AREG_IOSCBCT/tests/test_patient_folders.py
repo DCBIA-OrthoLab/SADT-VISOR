@@ -47,6 +47,7 @@ def test_a_patient_folder_registers_into_a_folder_of_its_name(tmp_path, subfolde
         "AREG_report.json",
         os.path.join("P001", "P001_U_Reg.vtk"),
         os.path.join("P001", "P001_U_Reg_matrix.npy"),
+        os.path.join("P001", "scene.json"),
     ])
     assert read_report(tmp_path / "out")["patients"]["P001"]["status"] == "ok"
 
