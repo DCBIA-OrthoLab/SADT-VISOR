@@ -164,6 +164,9 @@ WITH_ALSO_DROP = [
     # AutoMatrix: the transform vocabulary the shared table does not know.
     (("transform", "matrix", "warp", "reg", "cb", "mand", "max", "md", "mx"),
      "C_0001_CB_Reg_transform.tfm", "C_0001"),
+    # What AREG CBCT writes now, with the T2 named in it.
+    (("transform", "matrix", "warp", "reg", "cb", "mand", "max", "md", "mx"),
+     "C_0001_T2_CB_Reg_transform.tfm", "C_0001"),
     (("transform", "matrix", "warp", "reg", "cb", "mand", "max", "md", "mx"),
      "P1_MAND_MAX_CB_reg_matrix_warp_transform.tfm", "P1"),
     (("transform",), "A1_T1_transform.mat", "A1"),
