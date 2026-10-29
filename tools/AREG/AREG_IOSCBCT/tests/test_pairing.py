@@ -124,7 +124,9 @@ def test_a_patient_present_in_both_modalities_is_paired(tmp_path):
     volume = write_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz")
 
     paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
-    assert paired == {"1": {"ios": [mesh], "cbct": volume, "name": "P001"}}
+    assert paired == {"1": {"ios": [mesh], "cbct": volume, "name": "P001",
+                            "patient": "1", "ios_timepoint": "t2",
+                            "cbct_timepoint": "t2"}}
     assert unpaired == {}
 
 
@@ -157,12 +159,13 @@ def test_a_patient_with_only_one_modality_is_reported_not_dropped(tmp_path):
 def test_no_pair_at_all_gives_both_counts_and_no_key(tmp_path):
     """Counts, never the keys: a key is built from the caller's file names."""
     write_mesh(tmp_path / "ios" / "alpha.vtk")
+    write_mesh(tmp_path / "ios" / "beta.vtk")
     write_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz")
 
     with pytest.raises(ToolInputError) as raised:
         pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     message = str(raised.value)
-    assert "1 intraoral key(s)" in message
+    assert "2 intraoral key(s)" in message
     assert "1 CBCT key(s)" in message
     assert "alpha" not in message
     assert "'1'" not in message
@@ -255,3 +258,87 @@ def test_the_patients_come_back_in_a_stable_order(tmp_path):
 
     paired, _unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     assert list(paired) == ["1", "2", "3"]
+
+
+# ---------------------------------------------------------------------------
+# Several timepoints of one patient
+# ---------------------------------------------------------------------------
+
+def test_each_timepoint_of_a_patient_pairs_with_its_own_cbct(tmp_path):
+    """Matched on the digits alone, a T1 and a T2 were one patient: the first
+    CBCT was kept and the arches of both timepoints were put onto it."""
+    for point in ("T1", "T2"):
+        write_mesh(tmp_path / "ios" / f"case7_{point}_U.vtk")
+        write_mesh(tmp_path / "ios" / f"case7_{point}_L.vtk")
+        write_volume(tmp_path / "cbct" / f"case7_{point}.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert unpaired == {}
+    assert sorted(paired) == ["7_t1", "7_t2"]
+    for point in ("t1", "t2"):
+        entry = paired[f"7_{point}"]
+        assert os.path.basename(entry["cbct"]) == f"case7_{point.upper()}.nii.gz"
+        assert [os.path.basename(path) for path in entry["ios"]] == [
+            f"case7_{point.upper()}_L.vtk", f"case7_{point.upper()}_U.vtk"]
+        assert entry["name"] == f"case7_{point.upper()}"
+        assert entry["patient"] == "7"
+
+
+def test_a_timepoint_named_by_its_folder_counts(tmp_path):
+    for point in ("T1", "T2"):
+        write_mesh(tmp_path / "ios" / point / "case7_U.vtk")
+        write_volume(tmp_path / "cbct" / point / "case7.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert unpaired == {}
+    assert {entry["cbct"].split(os.sep)[-2] for entry in paired.values()} == {"T1", "T2"}
+    for entry in paired.values():
+        assert entry["ios"][0].split(os.sep)[-2] == entry["cbct"].split(os.sep)[-2]
+
+
+def test_a_timepoint_with_no_cbct_is_reported_under_its_timepoint(tmp_path):
+    write_mesh(tmp_path / "ios" / "case7_T1_U.vtk")
+    write_mesh(tmp_path / "ios" / "case7_T2_U.vtk")
+    write_volume(tmp_path / "cbct" / "case7_T1.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert list(paired) == ["7_t1"]
+    assert unpaired == {"case7_T2": "no CBCT"}
+
+
+def test_arches_naming_no_timepoint_are_not_guessed_onto_one_of_two_cbcts(tmp_path):
+    write_mesh(tmp_path / "ios" / "case7_U.vtk")
+    write_volume(tmp_path / "cbct" / "case7_T1.nii.gz")
+    write_volume(tmp_path / "cbct" / "case7_T2.nii.gz")
+
+    with pytest.raises(ToolInputError):
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+
+
+def test_one_timepoint_named_on_one_side_only_still_pairs(tmp_path):
+    write_mesh(tmp_path / "ios" / "case7_U.vtk")
+    write_volume(tmp_path / "cbct" / "case7_T2.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert list(paired) == ["7"] and unpaired == {}
+
+
+def test_the_only_mesh_and_the_only_cbct_pair_whatever_their_names(tmp_path):
+    """A scan picked from the scene or exported without a patient number:
+    with one patient on each side there is nothing to confuse it with."""
+    write_mesh(tmp_path / "ios" / "lower_arch_L.vtk")
+    write_volume(tmp_path / "cbct" / "cbct_scan.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert unpaired == {}
+    (entry,) = paired.values()
+    assert os.path.basename(entry["cbct"]) == "cbct_scan.nii.gz"
+
+
+def test_two_unmatched_patients_on_one_side_are_still_refused(tmp_path):
+    write_mesh(tmp_path / "ios" / "P001_U.vtk")
+    write_mesh(tmp_path / "ios" / "P002_U.vtk")
+    write_volume(tmp_path / "cbct" / "P_0009.nii.gz")
+
+    with pytest.raises(ToolInputError):
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))

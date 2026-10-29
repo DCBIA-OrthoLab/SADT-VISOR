@@ -132,7 +132,8 @@ def _landmarks_by_jaw(directory: str, side: str = "landmark") -> dict:
     return found
 
 
-def _for_patient(candidates: dict, patient: str, sole_patient: bool) -> dict:
+def _for_patient(candidates: dict, patient: str, sole_patient: bool,
+                 timepoint=None) -> dict:
     """The landmark files that belong to one patient.
 
     Matching on the jaw token ALONE is what made a two-patient batch register
@@ -148,11 +149,17 @@ def _for_patient(candidates: dict, patient: str, sole_patient: bool) -> dict:
     `patient_key` cannot read -- one with no digits in it at all, which is what
     the published reference files look like -- would otherwise stop matching
     anything at all.
+
+    `timepoint` narrows it to the files of one timepoint of that patient: a
+    file naming another timepoint is not this one's, a file naming none may
+    be. A side that names no timepoint is not narrowed. Without it a batch holding a T1 and a T2 gave each arch two CBCT
+    landmark files and no way to choose.
     """
     own = {
         name: points
         for name, points in candidates.items()
         if pipeline.patient_key(os.path.basename(name)) == patient
+        and (timepoint is None or pipeline.timepoint_of(name) in (None, timepoint))
     }
     if own:
         return own
@@ -433,8 +440,10 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
         folder = os.path.join(output_dir, data["name"])
         entry = {"cbct": os.path.basename(data["cbct"]), "meshes": {}}
         # Narrowed to this patient BEFORE the jaw is looked at: see _for_patient.
-        own_ios = _for_patient(ios_landmarks, patient, sole_patient)
-        own_cbct = _for_patient(cbct_landmarks, patient, sole_patient)
+        own_ios = _for_patient(ios_landmarks, data["patient"], sole_patient,
+                               data["ios_timepoint"])
+        own_cbct = _for_patient(cbct_landmarks, data["patient"], sole_patient,
+                                data["cbct_timepoint"])
         # The CBCT landmark files the registration read, for the same-space
         # outputs to copy once per patient whichever mesh used them.
         used_cbct = set()

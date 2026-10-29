@@ -14,6 +14,8 @@ holding torch 2.8 for one half and 2.11 for the other -- the exact defect the
 AREG and ALI splits removed. What is left here is geometry.
 """
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -79,6 +81,34 @@ def _filed_as(patient: str, role: str, relative: str, index: int) -> str:
     return f"{patient}_{jaw or f'IOS{index}'}{extension}"
 
 
+def _as_folders(folders: dict, output_dir: Path) -> tuple:
+    """`(folders, scratch)` with a lone FILE given for a side put in a folder.
+
+    The panel lets either side be one file -- the CBCT of the patient at hand
+    beside a folder of intraoral scans -- and everything downstream walks a
+    folder: `os.walk` over a file yields nothing, so a run given one CBCT
+    answered "No CBCT scan found". The file is linked into a scratch folder
+    beside `output_dir`, as `patient_folders.resolve` does for its layout, and
+    `scratch` is that folder for the caller to remove, or None.
+    """
+    files = {role: path for role, path in folders.items() if os.path.isfile(path)}
+    if not files:
+        return folders, None
+    parent = os.path.dirname(os.path.abspath(str(output_dir))) if str(output_dir) else None
+    scratch = tempfile.mkdtemp(prefix="areg-single-", dir=parent)
+    folders = dict(folders)
+    for role, path in files.items():
+        folder = os.path.join(scratch, role)
+        os.makedirs(folder)
+        target = os.path.join(folder, os.path.basename(path))
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)
+        folders[role] = folder
+    return folders, scratch
+
+
 def run(
     # First, because it decides which of the next three the panel asks for.
     # Spelled out because `Literal` takes literals only; a test asserts it
@@ -134,12 +164,14 @@ def run(
         patients: The folder of patient folders, in the one-folder-per-patient
             layout. Each patient's folder name, with its number, names its
             results.
-        ios: The intraoral surfaces (.vtk/.stl), one folder, searched
+        ios: The intraoral surfaces (.vtk/.stl): one file, or a folder searched
             recursively. Upper and lower arches are registered separately and
             matched to their landmarks by the jaw token in the name.
-        cbct: The CBCT volumes, one folder. Paired to the intraoral scans on the
-            digits of the patient identifier, the two modalities being named by
-            different conventions.
+        cbct: The CBCT volumes: one file, or a folder. Paired to the intraoral
+            scans on the digits of the patient identifier, the two modalities
+            being named by different conventions, and on the timepoint (T1, T2)
+            when the names give one, so each timepoint is registered onto its
+            own CBCT.
         output_dir: Where the registered meshes, their 4x4 matrices and
             `AREG_report.json` are written, one folder per patient named as
             its files name it (`case_042`). When the CBCT was oriented first,
@@ -182,7 +214,9 @@ def run(
     folders, scratch = patient_folders.resolve(
         input_layout, patients, {"ios": ios, "cbct": cbct}, output_dir, _role, _filed_as,
     )
+    single = None
     try:
+        folders, single = _as_folders(folders, output_dir)
         main(
             ios=folders["ios"], cbct=folders["cbct"], output_dir=output_dir,
             automation=automation,
@@ -193,6 +227,7 @@ def run(
             orient_cbct_first=orient_cbct_first, outputs=outputs, sup=sup,
         )
     finally:
-        if scratch:
-            shutil.rmtree(scratch, ignore_errors=True)
+        for folder in (scratch, single):
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
     return output_dir
