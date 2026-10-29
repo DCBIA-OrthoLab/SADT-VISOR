@@ -47,6 +47,29 @@ def test_a_small_volume_starts_finer_rather_than_at_a_handful_of_voxels():
     assert gpu_rigid._levels((128, 128, 128)) == [(4, 1), (2, 1), (1, 1)]
 
 
+def test_a_walk_that_goes_uphill_keeps_the_best_point_it_had(monkeypatch):
+    """Adam moves by its step whatever the slope, and on a masked CBCT it
+    walked off an already-aligned pair by 20 degrees and 40 mm, to a WORSE
+    mutual information than its start. Each level now keeps the best point it
+    visited. Modelled on the CPU: every step makes the metric worse."""
+    def uphill(self, level, params):
+        params.grad = -torch.ones_like(params)
+        return float(params.detach().abs().sum())
+
+    monkeypatch.setattr(gpu_rigid._Registration, "_gradient", uphill)
+    fixed = phantom(size=24)
+    registration = gpu_rigid._Registration(fixed, fixed, torch.device("cpu"))
+    transform = registration.run()
+    assert transform.GetAngleX() == transform.GetAngleY() == transform.GetAngleZ() == 0
+    assert np.allclose(transform.GetTranslation(), registration.initial_translation)
+
+
+def test_the_steps_are_the_ones_measured_against_elastix():
+    """(2.0, 0.5, 0.1) walked off both hosted CBCT pairs; (0.5, 0.2, 0.05)
+    lands on elastix's answer to 0.04 mm. Changing them needs that measure again."""
+    assert gpu_rigid.STEPS == (0.5, 0.2, 0.05)
+
+
 def test_without_a_card_the_registration_is_elastixs(monkeypatch):
     monkeypatch.setattr(gpu_rigid, "available", lambda: False)
     monkeypatch.setattr(elastix, "register", lambda fixed, moving: "elastix transform")

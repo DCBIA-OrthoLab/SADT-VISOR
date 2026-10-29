@@ -57,7 +57,18 @@ COARSEST_VOXELS = 32
 ITERATIONS = (150, 120, 80)
 # Adam's step at each level, in millimetres: rotations are expressed as the arc
 # they sweep at `RADIUS`, so one unit means about a millimetre either way.
-STEPS = (2.0, 0.5, 0.1)
+#
+# Adam moves by about its step every iteration whatever the slope, and the
+# mutual information of a masked CBCT is shallow and noisy at the coarse level.
+# At (2.0, 0.5, 0.1) it walked off: both hosted CBCT pairs, aligned to within
+# 2 mm before registration, came back moved by 20 to 23 degrees and 33 to
+# 41 mm, with a WORSE mutual information than where they started -- the metric
+# was right (elastix's answer scored best at every level), the walk was not.
+# At (0.5, 0.2, 0.05) both land on elastix's answer to 0.03 degree and 0.04 mm,
+# in the same time, and the capture range is no narrower: a T2 moved 15 mm, or
+# rotated 5 degrees, is recovered to 0.03 mm, and past about 10 degrees elastix
+# fails as well (which is what orienting both scans first is for).
+STEPS = (0.5, 0.2, 0.05)
 RADIUS = 50.0
 # The cost of an iteration is its number of samples, not the resolution of the
 # volume: above this many, a level samples every other voxel of its grid.
@@ -333,8 +344,8 @@ class _Registration:
         present = joint > 0
         return -(joint[present] * (joint[present] / marginal[present]).log()).sum()
 
-    def _gradient(self, level: _Level, params) -> None:
-        """Set `params.grad` to the exact gradient of the negative MI.
+    def _gradient(self, level: _Level, params) -> float:
+        """Set `params.grad` to the exact gradient of the negative MI; return the MI's value.
 
         The MI is a function of the whole histogram, which is a SUM over
         batches. So: the histogram first, with no graph kept; then dMI/dJ, a
@@ -349,10 +360,12 @@ class _Registration:
             joint = sum(self._batch_joint(level, params, start, end)
                         for start, end in level.batches())
         joint.requires_grad_(True)
-        self._negative_mi(joint).backward()
+        value = self._negative_mi(joint)
+        value.backward()
         slope = joint.grad
         for start, end in level.batches():
             (slope * self._batch_joint(level, params, start, end)).sum().backward()
+        return float(value)
 
     def run(self) -> sitk.Euler3DTransform:
         import torch
@@ -364,11 +377,20 @@ class _Registration:
             optimiser = torch.optim.Adam([params], lr=step)
             schedule = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimiser, iterations, eta_min=step / 20)
+            # The best point this level visited, not the last: a walk that
+            # wanders uphill must not hand the next level, or the patient, a
+            # worse alignment than one it already had. The value comes with
+            # the gradient, so keeping it costs nothing.
+            best_value, best_params = float("inf"), params.detach().clone()
             for _ in range(iterations):
                 optimiser.zero_grad()
-                self._gradient(level, params)
+                value = self._gradient(level, params)
+                if value < best_value:
+                    best_value, best_params = value, params.detach().clone()
                 optimiser.step()
                 schedule.step()
+            with torch.no_grad():
+                params.copy_(best_params)
             del level
         values = params.detach().cpu().numpy().astype(float)
         transform = sitk.Euler3DTransform()
