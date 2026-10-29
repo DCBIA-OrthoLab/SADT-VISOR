@@ -14,6 +14,7 @@ holding torch 2.8 for one half and 2.11 for the other -- the exact defect the
 AREG and ALI splits removed. What is left here is geometry.
 """
 
+import functools
 import os
 import tempfile
 from pathlib import Path
@@ -21,7 +22,7 @@ from typing import Literal
 
 import shutil
 
-from sadt_areg_common import pairing, patient_folders
+from sadt_areg_common import catalogs, pairing, patient_folders
 from sadt_areg_common.errors import ToolInputError
 
 from . import pipeline
@@ -59,13 +60,43 @@ def _role(patient: str, relative: str):
     return None
 
 
-def _filed_as(patient: str, role: str, relative: str, index: int) -> str:
+def _timepoint_in(relative: str):
+    """The timepoint a file inside a patient folder names, in its own name or
+    in a sub-folder (`T1/scan.nii.gz`), or None."""
+    return pipeline.timepoint_of(os.path.join("patient", relative), "patient")
+
+
+def _patient_timepoints(root) -> dict:
+    """`{patient folder: {timepoints}}` over the files this tool reads.
+
+    What `_filed_as` needs to know whether a patient holds more than one
+    timepoint, which one file cannot tell it.
+    """
+    found = {}
+    if not str(root or "").strip() or not os.path.isdir(str(root)):
+        return found
+    for patient in patient_folders.patients_in(str(root)):
+        points = found.setdefault(patient, set())
+        for relative in patient_folders.files_of(os.path.join(str(root), patient)):
+            if _role(patient, relative):
+                points.add(_timepoint_in(relative))
+    return found
+
+
+def _filed_as(patient: str, role: str, relative: str, index: int,
+              timepoints=None) -> str:
     """`<patient>_U.stl`, `<patient>_CBCT.nii.gz`: the names the pairing reads.
 
     The patient's folder name comes first, so `pipeline.patient_name` gives it
     back as the output folder; the jaw stays, since that is how each arch finds
     its landmarks. Patients are matched on the DIGITS of their names, so a
     folder name needs one.
+
+    The timepoint stays too when the patient's folder holds more than one
+    (`timepoints`, from `_patient_timepoints`): `<patient>_T1_CBCT.nii.gz`
+    beside `<patient>_T2_CBCT.nii.gz`. Renamed without it, a T1 and a T2 were
+    two files under one name and the run was refused. A folder holding one
+    timepoint keeps the names, and the outputs, it always had.
     """
     if not any(c.isdigit() for c in patient):
         raise ToolInputError(
@@ -75,6 +106,9 @@ def _filed_as(patient: str, role: str, relative: str, index: int) -> str:
         )
     name = relative.replace("\\", "/").rsplit("/", 1)[-1]
     extension = patient_folders.extension_of(name)
+    point = _timepoint_in(relative)
+    if point and len((timepoints or {}).get(patient, ())) > 1:
+        patient = f"{patient}_{point.upper()}"
     if role == "cbct":
         return f"{patient}_CBCT{extension}"
     jaw = patient_folders.jaw_of(name)
@@ -211,8 +245,11 @@ def run(
         The output directory.
     """
     output_dir = Path(output_dir)
+    timepoints = (_patient_timepoints(patients)
+                  if input_layout == catalogs.LAYOUT_BY_PATIENT else {})
     folders, scratch = patient_folders.resolve(
-        input_layout, patients, {"ios": ios, "cbct": cbct}, output_dir, _role, _filed_as,
+        input_layout, patients, {"ios": ios, "cbct": cbct}, output_dir, _role,
+        functools.partial(_filed_as, timepoints=timepoints),
     )
     single = None
     try:
