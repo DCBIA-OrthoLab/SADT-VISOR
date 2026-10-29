@@ -488,3 +488,38 @@ def test_the_registrations_own_lines_carry_the_patient_and_arch(tmp_path, caplog
     # Outside the loop nothing is prefixed.
     summary = [r.getMessage() for r in caplog.records if "mesh(es) registered" in r.getMessage()]
     assert summary == [summary[0]] and summary[0].startswith("AREG_IOSCBCT: 2 of 2")
+
+
+def test_a_t1_and_a_t2_of_one_patient_are_each_registered_on_their_own_cbct(tmp_path):
+    """The batch that failed every arch: one patient, a CBCT and both arches at
+    T1 and again at T2. The two CBCT landmark files left each arch with two
+    candidates and no way to choose."""
+    for point, shift in (("T1", (3.0, -2.0, 1.0)), ("T2", (-4.0, 5.0, 2.0))):
+        write_volume(tmp_path / "cbct" / f"P_07_{point}.nii.gz")
+        write_markups(tmp_path / "cbct_lm" / f"P_07_{point}_lm_Pred.mrk.json",
+                      moved(UPPER_LABELS, shift))
+        write_mesh(tmp_path / "ios" / f"P07_{point}_U.vtk")
+        write_markups(tmp_path / "ios_lm" / f"P07_{point}_U_lm_Pred.mrk.json",
+                      UPPER_LABELS)
+
+    run_registration(tmp_path)
+    report = read_report(tmp_path / "out")
+    assert report["meshes_failed"] == 0
+    assert sorted(report["patients"]) == ["P07_T1", "P07_T2"]
+    for point, shift in (("T1", (3.0, -2.0, 1.0)), ("T2", (-4.0, 5.0, 2.0))):
+        matrix = np.load(str(tmp_path / "out" / f"P07_{point}" / f"P07_{point}_U_Reg_matrix.npy"))
+        assert np.allclose(matrix[:3, 3], shift, atol=1e-3), point
+
+
+def test_one_cbct_file_beside_a_folder_of_meshes_is_registered(tmp_path):
+    """The panel lets the CBCT be one file. Walking it as a folder found
+    nothing, and the run answered "No CBCT scan found" for a scan it was
+    handed."""
+    cohort(tmp_path)
+    output = tmp_path / "out"
+    run(ios=str(tmp_path / "ios"), cbct=str(tmp_path / "cbct" / "P_0001_T2.nii.gz"),
+        output_dir=str(output), automation="Registration",
+        ios_landmarks=str(tmp_path / "ios_lm"), cbct_landmarks=str(tmp_path / "cbct_lm"))
+
+    assert read_report(output)["meshes_registered"] == 1
+    assert not [name for name in os.listdir(tmp_path) if name.startswith("areg-single-")]

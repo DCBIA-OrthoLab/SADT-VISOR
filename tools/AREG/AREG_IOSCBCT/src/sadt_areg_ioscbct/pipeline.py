@@ -6,8 +6,10 @@ ways, and puts the intraoral scan into the CBCT's frame. Upstream's own test
 set says so plainly -- `P001_T2_U.vtk` beside `P_0001_T2.nii.gz`, both T2.
 
 That is why the arguments are `ios` and `cbct` rather than `t1` and `t2`, and
-why `pairing.pair()` is not what pairs them: there is no timepoint to strip,
-only a patient to match across two naming conventions.
+why `pairing.pair()` is not what pairs them: the work is matching a patient
+across two naming conventions. A batch may still hold several timepoints of
+one patient -- a CBCT and the arches taken with it at T1, the same again at
+T2 -- and each timepoint is then registered on its own: see `discover`.
 """
 
 import json
@@ -17,7 +19,7 @@ import re
 
 import numpy as np
 
-from sadt_areg_common import pairing
+from sadt_areg_common import catalogs, pairing
 from sadt_areg_common.errors import ToolInputError
 
 from . import geometry, where
@@ -77,14 +79,75 @@ def patient_name(filename: str) -> str:
     return stem
 
 
+def timepoint_of(path: str, root: str = "") -> "str | None":
+    """`"t1"` for `case_7_T1_U.vtk` or `ios/T1/case_7_U.vtk`; None when no
+    timepoint is named, or when two different ones are.
+
+    Read off the file name first and, failing that, the folders between `root`
+    and the file, as `pairing.timepoints_in` does: a clinician's export says it
+    in the name, the shipped cohorts in the folder.
+    """
+    stem = pairing.split_scan_extension(os.path.basename(path))[0]
+    parts = [stem]
+    if root:
+        relative = os.path.relpath(os.path.dirname(path), root)
+        if relative != os.curdir:
+            parts += list(reversed(relative.split(os.sep)))
+    for part in parts:
+        found = {token for token in pairing.tokens(part)
+                 if token in catalogs.TIMEPOINT_TOKENS}
+        if len(found) == 1:
+            return found.pop()
+        if found:
+            return None
+    return None
+
+
+def _match_timepoints(ios_points: list, cbct_points: list) -> tuple:
+    """`([(ios_timepoint, cbct_timepoint)], ios_left, cbct_left)` for one patient.
+
+    The same timepoint on both sides pairs first. What is left pairs when it is
+    one group on each side and the two cannot be confused: one of them names no
+    timepoint, or nothing else of this patient paired -- the shape of a batch
+    holding one timepoint, named on one side only or named differently on the
+    two. Anything else is left out rather than guessed: arches that name no
+    timepoint beside a T1 and a T2 CBCT used to be registered onto whichever
+    CBCT sorted first.
+    """
+    pairs = [(point, point) for point in ios_points
+             if point is not None and point in cbct_points]
+    ios_left = [point for point in ios_points if point not in {p for p, _ in pairs}]
+    cbct_left = [point for point in cbct_points if point not in {p for p, _ in pairs}]
+    if len(ios_left) == 1 and len(cbct_left) == 1 and (
+            not pairs or None in (ios_left[0], cbct_left[0])):
+        pairs.append((ios_left[0], cbct_left[0]))
+        ios_left, cbct_left = [], []
+    return pairs, ios_left, cbct_left
+
+
+def _label(name: str, timepoint) -> str:
+    return f"{name}_{timepoint.upper()}" if timepoint else name
+
+
 def discover(ios_dir: str, cbct_dir: str, ios_source: str = "'ios'",
              cbct_source: str = "'cbct'", ios_error=ToolInputError,
              cbct_error=ToolInputError) -> tuple:
-    """`({key: {"ios": [paths], "cbct": path, "name": name}}, {name: why})`.
+    """`({key: {"ios": [paths], "cbct": path, "name": name, "patient": key,
+    "ios_timepoint": t, "cbct_timepoint": t}}, {name: why})`.
 
-    Keyed by `patient_key`, which is what the landmark files are matched on;
-    `name` is `patient_name` of the patient's first intraoral mesh -- the files
-    the output folder holds -- or of its CBCT when it has none.
+    One entry per patient AND timepoint. `patient` is the `patient_key` the
+    landmark files are matched on, and each side's timepoint narrows that
+    match further (see `dispatch._for_patient`). The entry's key is `patient`
+    alone when the patient has one timepoint in the batch, `<patient>_<t>`
+    when it has several. `name` is `patient_name` of the first intraoral mesh
+    -- the files the output folder holds -- or of the CBCT when there is none,
+    with the timepoint appended when the patient has several, so a T1 and a T2
+    never write into the same folder.
+
+    Timepoints are what keep a T1 and a T2 apart. Matched on the digits alone,
+    a folder holding both put four arches and two CBCTs under one patient: the
+    first CBCT was kept, the arches of BOTH timepoints were registered onto it,
+    and the two CBCT landmark files left every arch without a match.
 
     `ios_source` and `cbct_source` name where each folder came from in the
     refusal -- the caller's argument, or the tool that produced it -- and
@@ -108,29 +171,69 @@ def discover(ios_dir: str, cbct_dir: str, ios_source: str = "'ios'",
         directories.sort()
         for name in sorted(files):
             if name.lower().endswith(SURFACE_EXTENSIONS):
-                ios.setdefault(patient_key(name), []).append(os.path.join(root, name))
+                path = os.path.join(root, name)
+                ios.setdefault(patient_key(name), {}).setdefault(
+                    timepoint_of(path, ios_dir), []).append(path)
 
     cbct: dict = {}
     for root, directories, files in os.walk(cbct_dir):
         directories.sort()
         for name in sorted(files):
             if pairing.is_scan_file(name):
-                cbct.setdefault(patient_key(name), os.path.join(root, name))
+                path = os.path.join(root, name)
+                cbct.setdefault(patient_key(name), {}).setdefault(
+                    timepoint_of(path, cbct_dir), path)
 
     if not ios:
         raise ios_error(f"No intraoral mesh (.vtk or .stl) found in {ios_source}.")
     if not cbct:
         raise cbct_error(f"No CBCT scan found in {cbct_source}.")
 
+    order = lambda point: point or ""  # noqa: E731 - None sorts first
     paired, unpaired = {}, {}
     for key in sorted(set(ios) | set(cbct)):
-        name = patient_name(min(ios[key]) if key in ios else cbct[key])
-        if key in ios and key in cbct:
-            paired[key] = {"ios": sorted(ios[key]), "cbct": cbct[key], "name": name}
-        else:
-            unpaired[name] = "no CBCT" if key in ios else "no intraoral scan"
+        meshes, volumes = ios.get(key, {}), cbct.get(key, {})
+        pairs, ios_left, cbct_left = _match_timepoints(
+            sorted(meshes, key=order), sorted(volumes, key=order))
+        several = len(pairs) + len(ios_left) + len(cbct_left) > 1
+        for ios_point, cbct_point in pairs:
+            point = ios_point or cbct_point
+            name = patient_name(min(meshes[ios_point]))
+            entry_key = f"{key}_{point}" if several and point else key
+            paired[entry_key] = {
+                "ios": sorted(meshes[ios_point]), "cbct": volumes[cbct_point],
+                "name": _label(name, point) if several else name,
+                "patient": key,
+                "ios_timepoint": ios_point, "cbct_timepoint": cbct_point,
+            }
+        for point in ios_left:
+            name = patient_name(min(meshes[point]))
+            unpaired[_label(name, point) if several else name] = "no CBCT"
+        for point in cbct_left:
+            name = patient_name(volumes[point])
+            unpaired[_label(name, point) if several else name] = "no intraoral scan"
     _distinct_names(paired)
 
+    if not paired and len(ios) == len(cbct) == 1:
+        # One intraoral patient and one CBCT patient whose names share no
+        # digits: a scan exported as `lower_arch.vtk` beside `cbct.nii.gz`.
+        # With nothing else in the batch they can only mean each other, the
+        # rule `_match_timepoints` applies to one group on each side. Logged,
+        # since it is the one pairing no name vouched for.
+        (ios_key, meshes), = ios.items()
+        (cbct_key, volumes), = cbct.items()
+        if len(meshes) == len(volumes) == 1:
+            (ios_point, paths), = meshes.items()
+            (cbct_point, volume), = volumes.items()
+            logger.warning(
+                "The only intraoral patient and the only CBCT name no common "
+                "patient number; paired as the one pair this batch holds.")
+            paired[ios_key] = {
+                "ios": sorted(paths), "cbct": volume,
+                "name": patient_name(min(paths)), "patient": ios_key,
+                "ios_timepoint": ios_point, "cbct_timepoint": cbct_point,
+            }
+            unpaired = {}
     if not paired:
         # Counts, never the keys: a key is built from the caller's file names,
         # and this message reaches the server's log as well as the caller.
