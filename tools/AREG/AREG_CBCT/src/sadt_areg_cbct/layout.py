@@ -60,7 +60,12 @@ LAYOUT = {
     # odd one out. The server only collects the output of the calls THIS tool
     # makes, so ticking `ASO` returns ASO's own result and not the landmarks
     # ASO predicted on the way.
+    # Hidden in every engine of the facade, so the name means one thing: what
+    # a reader wanted from it -- the oriented scan and ASO's landmarks -- comes
+    # back as an Extra output now, in the result's space, and the raw step
+    # folders were a second, harder way to get the same files.
     "keep_intermediate": {
+        "hidden": True,
         "label": "Raw intermediate files",
         "option_help": {
             "AMASSS": "The bone masks each region's registration is confined to "
@@ -234,5 +239,6 @@ LAYOUT = {
     },
 
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
-    "outputs": catalogs.outputs_layout(_OUTPUTS, catalogs.OUTPUT_T1_SCAN),
+    "outputs": catalogs.outputs_layout(_OUTPUTS, catalogs.OUTPUT_T1_SCAN,
+                                       catalogs.OUTPUT_ORIENTATION_LANDMARKS),
 }

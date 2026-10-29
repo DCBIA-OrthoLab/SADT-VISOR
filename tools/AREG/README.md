@@ -104,22 +104,25 @@ Three behaviours worth knowing before reading a result:
 - **`modality` is never inferred from the file extension.**
 - **What comes back is asked as `outputs` ("Extra outputs"), not as steps.**
   Whatever is ticked is written in the space of the result, so it opens on top
-  of it. IOS to CBCT offers Moved landmarks (the CBCT landmarks the registration used,
-  and each mesh's own moved by its matrix), CBCT scan (the CBCT the meshes were
+  of it. IOS to CBCT offers Registration landmarks (IOS + CBCT) (the CBCT landmarks
+  the registration used, and each mesh's own moved by its matrix), Orientation
+  landmarks (ASO) (the landmarks ASO oriented the CBCT on, when the run oriented
+  it), CBCT scan (the CBCT the meshes were
   registered onto: ASO's oriented scan in the Fully-Automated mode, the
   caller's otherwise) and Transform (.tfm) (each matrix as a `.tfm`, written as
   AREG_IOS writes its own: the inverse, for resampling). CBCT offers T1 scan (the
   T1 the T2 was registered onto: when it was oriented first, the scene points
-  at the copy already under `T1_Oriented/` and at ASO's landmarks beside it,
-  rather than writing the volume a second time). IOS writes everything in the T1's space
-  already and offers nothing more.
+  at the copy already under `T1_Oriented/` rather than writing the volume a
+  second time) and Orientation landmarks (ASO) (ASO's landmarks beside that
+  copy). IOS writes everything in the T1's space already and offers nothing more.
 - **Every registration says which of its files make one scene.** `scene.json`
   (one per patient folder) or `<patient>_..._scene.json` (where patients share a
   folder) lists them, each with its kind and role, paths relative to the
   folder: `sadt_areg_common/scene.py`. A viewer reads it instead of guessing
-  from file names. The raw output of each step the chain ran is a different
-  thing, in that step's own space: "Raw intermediate files", under Quality
-  control.
+  from file names. The raw output of each step the chain ran
+  (`keep_intermediate`, "Raw intermediate files") is hidden in all three
+  engines: what a reader wanted from it now comes back as an Extra output, in
+  the result's space.
 
 ## Versions
 

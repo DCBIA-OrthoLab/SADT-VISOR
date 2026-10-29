@@ -350,7 +350,11 @@ LAYOUT_HELP = {
 # result, so it opens on top of it. Each label says the file a reader gets,
 # and the scan is named after what it is in that mode: a facade shows the
 # options of the mode chosen, so the two never sit side by side.
-OUTPUT_LANDMARKS = "Moved landmarks"
+# The landmarks are split by what they were FOR: the ones the registration
+# paired, and the ones ASO oriented the CBCT on. "Moved landmarks" said
+# neither, and a reader could not tell which set a file was.
+OUTPUT_LANDMARKS = "Registration landmarks (IOS + CBCT)"
+OUTPUT_ORIENTATION_LANDMARKS = "Orientation landmarks (ASO)"
 OUTPUT_CBCT_SCAN = "CBCT scan"
 OUTPUT_T1_SCAN = "T1 scan (oriented when orientation is on)"
 OUTPUT_TRANSFORMS = "Transform (.tfm)"
@@ -362,13 +366,16 @@ OUTPUT_NOTE = ("Saved beside the result, in the same 3D space. The result "
                "and its scene.json are always written.")
 
 OUTPUT_HELP = {
-    OUTPUT_LANDMARKS: "Each scan's landmarks moved with it onto the result, "
-                      "and a copy of the CBCT's, so they all sit on it.",
+    OUTPUT_LANDMARKS: "The landmarks the registration paired: each arch's, "
+                      "moved with it onto the CBCT, and the CBCT's own.",
+    OUTPUT_ORIENTATION_LANDMARKS: "The landmarks ASO oriented the CBCT on, in "
+                                  "the oriented CBCT's space. Only when the "
+                                  "run oriented it.",
     OUTPUT_CBCT_SCAN: "The CBCT the meshes were registered onto, copied beside "
                       "them (the oriented one when the chain oriented it first).",
     OUTPUT_T1_SCAN: "The T1 the T2 was registered onto. Oriented, it is the "
-                    "copy already under T1_Oriented/, with ASO's landmarks; "
-                    "otherwise it is copied beside the result.",
+                    "copy already under T1_Oriented/; otherwise it is copied "
+                    "beside the result.",
     OUTPUT_TRANSFORMS: "Each registration as a .tfm that 3D Slicer opens.",
 }
 

@@ -504,6 +504,8 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
             if catalogs.OUTPUT_LANDMARKS in outputs:
                 entry["cbct_landmarks"] = _copy_cbct_landmarks(
                     used_cbct, cbct_landmark_dir, folder, output_dir)
+            if carry_cbct and catalogs.OUTPUT_ORIENTATION_LANDMARKS in outputs:
+                entry.update(_copy_orientation_landmarks(data["cbct"], folder, output_dir))
             _write_scene(folder, entry, output_dir, oriented=carry_cbct)
         # Under the name the files carry, never the matching key: see
         # pipeline.patient_name.
@@ -550,6 +552,19 @@ def _mesh_outputs(mesh_path: str, destination: str, matrix: np.ndarray,
     return written
 
 
+def _copy_orientation_landmarks(oriented_cbct: str, folder: str, output_dir: str) -> dict:
+    """Copy the landmarks ASO oriented this CBCT on beside it. They are in the
+    oriented scan's space already, the space every mesh was registered into."""
+    source = pairing.oriented_landmarks(oriented_cbct)
+    if not os.path.isfile(source):
+        logger.warning("ASO left no landmarks beside %s", os.path.basename(oriented_cbct))
+        return {}
+    os.makedirs(folder, exist_ok=True)
+    destination = os.path.join(folder, os.path.basename(source))
+    shutil.copy2(source, destination)
+    return {"orientation_landmarks": os.path.relpath(destination, output_dir)}
+
+
 def _copy_cbct_landmarks(used: set, cbct_landmark_dir: str, folder: str,
                          output_dir: str) -> list:
     """Copy the CBCT landmark files the registration used, as they are: they
@@ -573,6 +588,8 @@ def _write_scene(folder: str, entry: dict, output_dir: str, oriented: bool) -> N
                         ("cbct_transform", "orientation")):
         if entry.get(field):
             files.append((here(entry[field]), role))
+    if entry.get("orientation_landmarks"):
+        files.append((here(entry["orientation_landmarks"]), "orientation landmarks"))
     files += [(here(path), "reference landmarks") for path in entry.get("cbct_landmarks", [])]
     for mesh in entry["meshes"].values():
         if mesh["status"] == "failed":

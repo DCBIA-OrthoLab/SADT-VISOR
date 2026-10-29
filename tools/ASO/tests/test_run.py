@@ -745,6 +745,11 @@ class FakeSup:
             for root, _dirs, files in os.walk(str(params["input"]))
             for name in sorted(files)
         ]
+        self.sent_names = [
+            os.path.relpath(os.path.join(root, name), str(params["input"]))
+            for root, _dirs, files in os.walk(str(params["input"]))
+            for name in sorted(files)
+        ]
         # The SUPERVISOR owns where a callee writes, exactly as the server owns
         # it for a request: the caller passes no `output_dir` and reads the path
         # back off the return value. Modelled here because a fake that let the
@@ -873,16 +878,18 @@ def test_the_landmark_tool_is_asked_by_name_for_the_points_aso_needs(tmp_path):
     assert "cbct_regions" not in params
 
 
-def test_the_landmark_tool_is_run_on_the_recentred_scans(tmp_path):
-    """The ordering that made the supervisor necessary at all.
+def test_the_landmark_tool_is_run_on_the_scans_the_caller_sent(tmp_path):
+    """The ORIGINAL scans, not the recentred ones the Slicer chain used.
 
-    The Slicer chain ran PRE_ASO_CBCT before ALI_CBCT, so the landmark tool has
-    always seen centred volumes. Recentring is a pure metadata change and this
-    *ought* to be reorderable -- but ALI takes the absolute value of the origin
-    (issue #11), so it is kept exactly as it was rather than bet on.
+    A stop after `ASO/ALI_CBCT` shows the points the tool placed on the scan
+    the reader sent; placed on a recentred copy they were drawn half a field
+    of view away from it whenever its origin was not already centred, and a
+    correction made there was in the wrong frame. Still never the caller's own
+    folder: the tool walks one ASO built.
     """
     root = tmp_path / "input"
     _write_scan(root / "patient1_scan.nii.gz")
+    image = sitk.ReadImage(str(root / "patient1_scan.nii.gz"))
     sup = FakeSup({"patient1": _predicted()}, tmp_path)
 
     _run_aso(
@@ -893,15 +900,53 @@ def test_the_landmark_tool_is_run_on_the_recentred_scans(tmp_path):
 
     _tool, params = sup.calls[0]
     assert len(sup.sent) == 1
-    sent = sup.sent[0]
-    centre = np.array(
-        sent.TransformContinuousIndexToPhysicalPoint(
-            (np.array(sent.GetSize()) / 2.0).tolist()
-        )
-    )
-    # What it was handed is centred on the physical origin, not the original.
-    assert np.allclose(centre, 0.0, atol=1e-6)
+    assert sup.sent[0].GetOrigin() == image.GetOrigin()
+    assert sup.sent[0].GetSize() == image.GetSize()
     assert str(params["input"]) != str(root)
+
+
+def test_the_landmark_tool_reads_each_scan_under_its_own_name(tmp_path):
+    """It names its points after the file it read, and a stop's viewer pairs
+    points with a scan by that name. Handed `patient1_T1_Or` as `patient1_T1`
+    (the key, `_Or` stripped), its points could not be drawn on any scan."""
+    root = tmp_path / "input"
+    _write_scan(root / "site" / "patient1_T1_Or.nii.gz")
+    sup = FakeSup({"site/patient1_T1": _predicted()}, tmp_path)
+
+    _run_aso(
+        tmp_path, input=str(root), reference=_cbct_reference(tmp_path),
+        modality="CBCT", automation="Fully-Automated",
+        landmark_model="Bundle", cbct_landmarks=list(_REFERENCE_POINTS), sup=sup,
+    )
+
+    assert sup.sent_names == [os.path.join("site", "patient1_T1_Or.nii.gz")]
+
+
+def test_predicted_landmarks_are_moved_into_the_centred_space_like_supplied_ones(tmp_path):
+    """Both describe the original scan now, so the same points must orient it
+    the same way whether the landmark tool placed them or the caller did."""
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    supplied = tmp_path / "landmarks"
+    _write_markups(supplied / "patient1_lm_Pred.mrk.json", _predicted())
+    reference = _cbct_reference(tmp_path)
+
+    by_tool = _run_aso(
+        tmp_path, input=str(root), reference=reference, output_dir=tmp_path / "by_tool",
+        modality="CBCT", automation="Fully-Automated", landmark_model="Bundle",
+        cbct_landmarks=list(_REFERENCE_POINTS), sup=FakeSup({"patient1": _predicted()}, tmp_path),
+    )
+    by_caller = _run_aso(
+        tmp_path, input=str(root), reference=reference, output_dir=tmp_path / "by_caller",
+        modality="CBCT", automation="Fully-Automated", landmarks=str(supplied),
+        cbct_landmarks=list(_REFERENCE_POINTS),
+    )
+
+    oriented = [markups.load_landmarks(os.path.join(out, "patient1_lm_Or.mrk.json"))
+                for out in (by_tool, by_caller)]
+    assert sorted(oriented[0]) == sorted(oriented[1])
+    for name in oriented[0]:
+        np.testing.assert_allclose(oriented[0][name], oriented[1][name], atol=1e-6)
 
 
 def test_supplied_landmarks_need_no_supervisor(tmp_path):

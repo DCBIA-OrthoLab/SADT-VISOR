@@ -18,13 +18,16 @@ The Slicer envelope is gone entirely: no `<filter-progress>` prints, no
 tree.
 
 **Fully-automated CBCT calls another tool, and calls it from the middle.** The
-landmark tool runs on the RECENTRED scans -- that is what the Slicer chain did,
-`PRE_ASO_CBCT` before `ALI_CBCT` -- so it cannot be run before ASO and its
-result handed in. The recentring is a pure metadata change, so it *ought* to be
-reorderable, and it very nearly is; `ALI`'s `physical_position` takes the
-absolute value of the origin, which does not commute with moving it (see issue
-#11). Rather than bet on that, the order is kept exactly as it was and the
-landmark tool is reached through the supervisor, at the point it always ran.
+landmark tool runs on the ORIGINAL scans and its points are then moved into the
+centred space, exactly as a caller's own landmarks are. The Slicer chain ran it
+on the recentred scans (`PRE_ASO_CBCT` before `ALI_CBCT`) because `ALI`'s
+`physical_position` took the absolute value of the origin and did not commute
+with moving it (issue #11). It maps voxels through the full index-to-physical
+transform now, and recentring only moves the origin, so the two orders agree to
+the micrometre. The original order showed at a stop: a reader reviewing
+`ASO/ALI_CBCT` saw points placed in the centred space drawn over the scan they
+sent, half a field of view away whenever its origin was not already centred --
+and a correction made there was in the wrong frame too.
 
 `sup` is keyword-only and unannotated, which is what marks it as the supervisor
 rather than an argument: `describe.py` keeps it out of the schema, and a client
@@ -620,13 +623,27 @@ def _check_ios(automation: str, teeth: list, types: list, jaws: list, occlusion:
 # Calling the landmark tool
 # ---------------------------------------------------------------------------
 
+def _link_scan(scan: str, destination: str) -> None:
+    """Put `scan` at `destination` for the landmark tool, without copying it.
+
+    A link where the filesystem allows one -- a CBCT is hundreds of megabytes
+    -- and a copy where it does not.
+    """
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    try:
+        os.symlink(os.path.abspath(scan), destination)
+    except OSError:
+        shutil.copyfile(scan, destination)
+
+
 def _predict_landmarks(
-    centered_root: str, landmark_model: str, requested: list, work_dir: str, sup
+    scans_root: str, landmark_model: str, requested: list, work_dir: str, sup
 ) -> dict:
-    """Predict landmarks for every centred scan, through the supervisor.
+    """Predict landmarks for every scan under `scans_root`, through the supervisor.
 
     Returns `{patient key: {landmark: position}}`, keyed like
-    `cbct.pipeline.discover`. The results never touch the caller's input tree.
+    `cbct.pipeline.discover`, in the frame of the scans it was given. The
+    results never touch the caller's input tree.
 
     Asked for by NAME, not by region: ASO registers on seven landmarks
     straddling two of the landmark tool's regions, so asking by region would run
@@ -646,7 +663,7 @@ def _predict_landmarks(
     # keep them -- `keep_intermediate` collects from the supervisor's own folder.
     produced = sup.run(
         LANDMARK_TOOL,
-        input=centered_root,
+        input=scans_root,
         landmarks=list(requested),
         **({"model": landmark_model} if landmark_model else {}),
         _progress=LANDMARK_SPAN,
@@ -820,10 +837,12 @@ def _run_cbct(
     report["unmatched_markups"] = orphans
 
     centered_root = os.path.join(work_dir, "centered")
+    # What the landmark tool walks: the ORIGINAL scans, under the patient keys,
+    # so its points are in the frame the reader sent and sees at a stop.
+    scans_root = os.path.join(work_dir, "scans")
 
-    # Phase 1 -- recentre. The landmark tool runs on centred scans (that is what
-    # the Slicer chain did, PRE_ASO_CBCT before ALI_CBCT), so in fully-automated
-    # mode they have to reach disk before it is called.
+    # Phase 1 -- recentre. A predicted patient's centred volume reaches disk,
+    # to be read back for the registration once the landmark tool is done.
     prepared = {}
     # Three phases share the bar, and each is given the slice it occupies so
     # the second does not send it back to zero. The boundaries are where the
@@ -838,6 +857,15 @@ def _run_cbct(
         destination = os.path.join(centered_root, f"{key}.nii") if key in to_predict else None
         try:
             image, translation = cbct_pipeline.prepare(entry["scan"], destination)
+            if key in to_predict:
+                # Under the scan's OWN name, in the key's folder: the landmark
+                # tool names its points after the file it read, and a reviewer
+                # pairs points with a scan by that name. Named after the key,
+                # `P1_T1_Or.nii.gz` came back as `P1_T1_lm_Pred` -- the same
+                # patient to `_collect`, which strips both, and no scan at all
+                # to a stop's viewer.
+                _link_scan(entry["scan"], os.path.join(
+                    scans_root, os.path.dirname(key), os.path.basename(entry["scan"])))
         except RuntimeError as exc:
             # ITK's read error: the scan the caller sent is not one it can open.
             logger.warning("patient %d of %d: reading the scan failed (%s: %s)",
@@ -855,14 +883,13 @@ def _run_cbct(
             "landmarks": None,
         }
 
-    # Phase 2 -- landmarks, either the caller's (moved into the centred space)
-    # or predicted ones (already in it, because the tool ran on the centred
-    # scans).
+    # Phase 2 -- landmarks, the caller's or predicted ones, both describing the
+    # ORIGINAL scan and both moved into the centred space.
     # ONE call for every scan that needs predicting, not one per patient: the
     # landmark tool loads its agents once and walks a folder, so a cohort costs
     # what a cohort costs rather than N times a single scan.
     predictions = (
-        _predict_landmarks(centered_root, landmark_model, requested, work_dir, sup)
+        _predict_landmarks(scans_root, landmark_model, requested, work_dir, sup)
         if to_predict else {}
     )
     if to_predict:
@@ -881,8 +908,9 @@ def _run_cbct(
         )
     for key, entry in prepared.items():
         if key in to_predict:
-            # Already in the centred space: the tool ran on the centred scans.
-            entry["landmarks"] = predictions.get(key, {})
+            # Placed on the original scan, like a caller's: moved the same way.
+            entry["landmarks"] = cbct_pipeline.center_landmarks(
+                predictions.get(key, {}), entry["translation"])
             if not entry["landmarks"]:
                 logger.warning("patient %d of %d: %s returned no landmarks",
                                position[key], total, LANDMARK_TOOL)
