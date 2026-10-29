@@ -6,7 +6,11 @@ import shutil
 import typing
 
 import pytest
-from conftest import cohort, read_report, tree_of
+import numpy as np
+from conftest import (
+    UPPER_LABELS, cohort, moved, read_report, tree_of, write_markups, write_mesh,
+    write_volume,
+)
 from sadt_areg_common import catalogs
 from sadt_areg_common.errors import ToolInputError
 from sadt_areg_ioscbct import run
@@ -72,3 +76,29 @@ def test_the_per_type_layout_still_needs_both_folders(tmp_path):
     cohort(tmp_path)
     with pytest.raises(ToolInputError, match="'cbct' is empty"):
         registration(tmp_path, ios=tmp_path / "ios")
+
+
+@pytest.mark.parametrize("subfolders", [False, True])
+def test_a_patient_folder_holding_a_t1_and_a_t2_registers_each_on_its_own_cbct(
+        tmp_path, subfolders):
+    """Renamed `<patient>_CBCT.nii.gz` both, a T1 and a T2 were one name and
+    the run was refused. The timepoint is kept, in the name or the sub-folder."""
+    shifts = {"T1": (3.0, -2.0, 1.0), "T2": (-4.0, 5.0, 2.0)}
+    root = tmp_path / "patients" / "P007"
+    for point, shift in shifts.items():
+        where, stem = (root / point, "P007") if subfolders else (root, f"P007_{point}")
+        write_volume(where / f"{stem}.nii.gz")
+        write_mesh(where / f"{stem}_U.vtk")
+        write_markups(tmp_path / "cbct_lm" / f"P007_{point}_CBCT_lm.mrk.json",
+                      moved(UPPER_LABELS, shift))
+        write_markups(tmp_path / "ios_lm" / f"P007_{point}_U_lm.mrk.json", UPPER_LABELS)
+
+    registration(tmp_path, input_layout=catalogs.LAYOUT_BY_PATIENT,
+                 patients=tmp_path / "patients")
+
+    report = read_report(tmp_path / "out")
+    assert report["meshes_failed"] == 0
+    assert sorted(report["patients"]) == ["P007_T1", "P007_T2"]
+    for point, shift in shifts.items():
+        matrix = np.load(str(tmp_path / "out" / f"P007_{point}" / f"P007_{point}_U_Reg_matrix.npy"))
+        assert np.allclose(matrix[:3, 3], shift, atol=1e-3), point
