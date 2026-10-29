@@ -198,9 +198,9 @@ class TestSemiAutomatedCBCT:
         )
         assert produced == [
             "AREG_report.json",
-            os.path.join("CB", "P1_CB_Reg.nii.gz"),
-            os.path.join("CB", "P1_CB_Reg_scene.json"),
-            os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+            os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+            os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
+            os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
         ]
 
         with open(os.path.join(run.output_dir, "AREG_report.json")) as handle:
@@ -228,9 +228,9 @@ class TestSemiAutomatedCBCT:
             output_dir=str(tmp_path / "out"),
         )
         transform = sitk.ReadTransform(
-            os.path.join(run.output_dir, "CB", "P1_CB_Reg_transform.tfm")
+            os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_transform.tfm")
         )
-        registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"))
+        registered = sitk.ReadImage(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg.nii.gz"))
         moving = sitk.ReadImage(str(tmp_path / "T2" / "P1_T2_scan.nii.gz"))
 
         # Resampling the ORIGINAL T2 with the written transform, onto the grid
@@ -657,9 +657,9 @@ def test_registrations_side_by_side_produce_exactly_what_one_at_a_time_does(tmp_
 
     assert serial.report["patients"] == wide.report["patients"]
     for subject in ("P1", "P2"):
-        for name in (f"{subject}_CB_Reg.nii.gz", f"{subject}_CB_Reg_transform.tfm"):
-            a = tmp_path / "serial" / "CB" / name
-            b = tmp_path / "wide" / "CB" / name
+        for name in (f"{subject}_T2_CB_Reg.nii.gz", f"{subject}_T2_CB_Reg_transform.tfm"):
+            a = tmp_path / "serial" / "T2_Registered" / name
+            b = tmp_path / "wide" / "T2_Registered" / name
             if name.endswith(".tfm"):
                 assert a.read_text() == b.read_text()
             else:

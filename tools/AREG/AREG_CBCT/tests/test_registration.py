@@ -43,27 +43,27 @@ def test_a_run_writes_a_registered_scan_a_transform_and_a_report(semi_run):
     assert run.succeeded == ["P1"]
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "P1_CB_Reg_transform.tfm"),
-        os.path.join("CB", "P1_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
     ])
 
 
 def test_the_scene_lists_the_registration_in_the_t1_space(semi_run):
     run, _root = semi_run
-    with open(os.path.join(run.output_dir, "CB", "P1_CB_Reg_scene.json")) as handle:
+    with open(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_scene.json")) as handle:
         scene = json.load(handle)
     assert scene == {"version": 1, "space": "the T1", "files": [
-        {"path": "P1_CB_Reg.nii.gz", "kind": "volume", "role": "registered"},
-        {"path": "P1_CB_Reg_transform.tfm", "kind": "transform", "role": "registration"},
+        {"path": "P1_T2_CB_Reg.nii.gz", "kind": "volume", "role": "registered"},
+        {"path": "P1_T2_CB_Reg_transform.tfm", "kind": "transform", "role": "registration"},
     ]}
 
 
 def test_scans_copies_the_t1_beside_the_registered_t2(tmp_path):
     cohort(tmp_path, size=32)
     run = semi(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
-    folder = os.path.join(run.output_dir, "CB")
-    with open(os.path.join(folder, "P1_CB_Reg_scene.json")) as handle:
+    folder = os.path.join(run.output_dir, "T2_Registered")
+    with open(os.path.join(folder, "P1_T2_CB_Reg_scene.json")) as handle:
         files = json.load(handle)["files"]
     reference = [entry["path"] for entry in files if entry["role"] == "reference"]
     assert len(reference) == 1 and os.path.isfile(os.path.join(folder, reference[0]))
@@ -79,12 +79,12 @@ def test_each_region_is_a_registration_of_its_own(tmp_path):
 
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "P1_CB_Reg_transform.tfm"),
-        os.path.join("CB", "P1_CB_Reg_scene.json"),
-        os.path.join("MAND", "P1_MAND_Reg.nii.gz"),
-        os.path.join("MAND", "P1_MAND_Reg_transform.tfm"),
-        os.path.join("MAND", "P1_MAND_Reg_scene.json"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "P1_T2_MAND_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_MAND_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_MAND_Reg_scene.json"),
     ])
     assert set(run.patients["P1"]["regions"]) == {"CB", "MAND"}
 
@@ -104,12 +104,12 @@ def test_a_batch_keeps_the_tree_its_scans_arrived_in(tmp_path):
     assert sorted(run.succeeded) == [os.path.join("siteA", "P1"), os.path.join("siteB", "P1")]
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "siteA", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "siteA", "P1_CB_Reg_transform.tfm"),
-        os.path.join("CB", "siteA", "P1_CB_Reg_scene.json"),
-        os.path.join("CB", "siteB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "siteB", "P1_CB_Reg_transform.tfm"),
-        os.path.join("CB", "siteB", "P1_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "siteA", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "siteA", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "siteA", "P1_T2_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "siteB", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "siteB", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "siteB", "P1_T2_CB_Reg_scene.json"),
     ])
 
 
@@ -118,9 +118,9 @@ def test_the_suffix_reaches_both_names_it_writes(tmp_path):
     run = semi(tmp_path, output_suffix="Study7")
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "P1_CB_Study7.nii.gz"),
-        os.path.join("CB", "P1_CB_Study7_transform.tfm"),
-        os.path.join("CB", "P1_CB_Study7_scene.json"),
+        os.path.join("T2_Registered", "P1_T2_CB_Study7.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Study7_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Study7_scene.json"),
     ])
 
 
@@ -132,7 +132,7 @@ def test_the_output_carries_a_spelling_itk_can_actually_write(tmp_path, given, e
     and ITK has no `.nrrd.gz` writer at all, so that spelling maps back down."""
     cohort(tmp_path, size=32, extension=given)
     run = semi(tmp_path)
-    assert os.path.join("CB", f"P1_CB_Reg{expected}") in tree_of(run.output_dir)
+    assert os.path.join("T2_Registered", f"P1_T2_CB_Reg{expected}") in tree_of(run.output_dir)
 
 
 def test_the_output_directory_is_created_when_it_does_not_exist(tmp_path):
@@ -169,7 +169,7 @@ def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
     field of view."""
     run, root = semi_run
     moving = sitk.ReadImage(os.path.join(root, "T2", "P1_T2_scan.nii.gz"))
-    registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"))
+    registered = sitk.ReadImage(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg.nii.gz"))
 
     assert registered.GetSize() == moving.GetSize()
     assert registered.GetSpacing() == pytest.approx(moving.GetSpacing())
@@ -310,11 +310,11 @@ def test_an_oriented_t1_is_listed_where_it_already_is_not_copied_again(tmp_path)
     """The scene points at the copy under T1_Oriented/: a second copy of the
     heaviest file of the run says nothing the first does not."""
     run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
-    folder = os.path.join(run.output_dir, "CB")
+    folder = os.path.join(run.output_dir, "T2_Registered")
     assert sorted(os.listdir(folder)) == [
-        "P1_CB_Reg.nii.gz", "P1_CB_Reg_scene.json", "P1_CB_Reg_transform.tfm"]
+        "P1_T2_CB_Reg.nii.gz", "P1_T2_CB_Reg_scene.json", "P1_T2_CB_Reg_transform.tfm"]
 
-    with open(os.path.join(folder, "P1_CB_Reg_scene.json")) as handle:
+    with open(os.path.join(folder, "P1_T2_CB_Reg_scene.json")) as handle:
         files = json.load(handle)["files"]
     assert files[0] == {"path": "../T1_Oriented/P1_T1_Or.nii.gz", "kind": "volume",
                         "role": "reference"}
@@ -327,7 +327,7 @@ def test_the_orientation_landmarks_are_listed_beside_the_oriented_t1(tmp_path):
     """Asked for, ASO's landmarks are in the scene where they already are,
     under T1_Oriented/, in the oriented T1's space the T2 was registered into."""
     run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_ORIENTATION_LANDMARKS])
-    with open(os.path.join(run.output_dir, "CB", "P1_CB_Reg_scene.json")) as handle:
+    with open(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_scene.json")) as handle:
         files = json.load(handle)["files"]
     assert files[0] == {"path": "../T1_Oriented/P1_T1_lm_Or.mrk.json", "kind": "markups",
                         "role": "orientation landmarks"}
@@ -335,7 +335,7 @@ def test_the_orientation_landmarks_are_listed_beside_the_oriented_t1(tmp_path):
 
 def test_an_oriented_run_lists_no_t1_unless_asked(tmp_path):
     run, _fixed = _oriented_run(tmp_path)
-    with open(os.path.join(run.output_dir, "CB", "P1_CB_Reg_scene.json")) as handle:
+    with open(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_scene.json")) as handle:
         roles = [entry["role"] for entry in json.load(handle)["files"]]
     assert roles == ["registered", "registration"]
 
@@ -356,7 +356,7 @@ def test_a_t2_far_from_the_oriented_t1_comes_back_whole_and_on_it(tmp_path):
     T2 landed: same size and spacing, and the T2 sits on the T1 it was
     registered onto."""
     run, fixed = _oriented_run(tmp_path)
-    registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"), sitk.sitkFloat32)
+    registered = sitk.ReadImage(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg.nii.gz"), sitk.sitkFloat32)
 
     on_t1 = sitk.GetArrayFromImage(sitk.Resample(registered, fixed, sitk.Transform(), sitk.sitkLinear, 0.0))
     t1 = sitk.GetArrayFromImage(fixed)
@@ -412,9 +412,9 @@ def test_the_report_lists_what_the_run_produced_relative_to_the_output(semi_run)
     run, root = semi_run
     entry = run.patients["P1"]["regions"]["CB"]
     assert entry["outputs"] == sorted([
-        os.path.join("CB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "P1_CB_Reg_transform.tfm"),
-        os.path.join("CB", "P1_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
     ])
     with open(os.path.join(run.output_dir, dispatch.REPORT_NAME), encoding="utf-8") as handle:
         assert root not in handle.read()
@@ -545,7 +545,7 @@ def test_a_second_run_does_not_take_the_first_ones_output_as_input(tmp_path):
     """`P1_CB_Reg.nii.gz` sorts before `P1_T2_scan.nii.gz`, so without the
     previous-output rule a re-run would register an already-registered scan."""
     cohort(tmp_path, size=16)
-    write(phantom(size=16), str(tmp_path / "T2" / "P1_CB_Reg.nii.gz"))
+    write(phantom(size=16), str(tmp_path / "T2" / "P1_T2_CB_Reg.nii.gz"))
 
     found = pairing.discover(str(tmp_path / "T2"), "Reg")
     assert os.path.basename(found["P1"]) == "P1_T2_scan.nii.gz"
@@ -558,9 +558,9 @@ def test_a_previous_output_is_still_usable_when_it_is_all_there_is(tmp_path):
     of the fixed `PATIENT_SUFFIXES` -- so both timepoints of a re-run carry it
     and still pair with each other.
     """
-    write(phantom(size=16), str(tmp_path / "T2" / "P1_CB_Reg.nii.gz"))
+    write(phantom(size=16), str(tmp_path / "T2" / "P1_T2_CB_Reg.nii.gz"))
     found = pairing.discover(str(tmp_path / "T2"), "Reg")
-    assert [os.path.basename(path) for path in found.values()] == ["P1_CB_Reg.nii.gz"]
+    assert [os.path.basename(path) for path in found.values()] == ["P1_T2_CB_Reg.nii.gz"]
 
 
 def test_a_subject_in_only_one_timepoint_is_named_in_the_report(tmp_path):

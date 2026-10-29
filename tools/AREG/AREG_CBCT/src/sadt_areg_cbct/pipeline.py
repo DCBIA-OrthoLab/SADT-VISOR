@@ -36,6 +36,10 @@ from . import elastix, gpu_rigid
 
 logger = logging.getLogger(__name__)
 
+# Where every registered T2 comes back, beside `T1_Oriented/` when ASO ran:
+# named for what it holds, the region code being in each file's name.
+REGISTERED_DIR = "T2_Registered"
+
 
 # Kept under its old name: callers and tests read it from here.
 oriented_landmarks = pairing.oriented_landmarks
@@ -65,8 +69,10 @@ def register_patient(
     Otherwise the T1 is copied beside the result. Orientation landmarks puts
     ASO's landmarks beside that copy in the scene; there are none when the T1
     was not oriented.
-    Whatever is ticked, `<patient>_<region>_<suffix>_scene.json` lists the
-    files of this registration, all in the T1's space.
+    Everything is written under `T2_Registered/`, one folder for every region:
+    `<patient>_T2_<region>_<suffix>` names the T2, its transform and
+    `..._scene.json`, which lists the files of this registration, all in the
+    T1's space.
     """
     fixed = _read(t1_path, "T1 scan")
     mask = _read(mask_path, "mask", cause="mask")
@@ -94,16 +100,17 @@ def register_patient(
     registered = sitk.Cast(resampler.Execute(moving), sitk.sitkInt16)
 
     relative_dir, patient = os.path.split(relative_key)
-    destination = os.path.join(output_dir, region, relative_dir)
+    destination = os.path.join(output_dir, REGISTERED_DIR, relative_dir)
     os.makedirs(destination, exist_ok=True)
 
+    # Says what the file IS: the T2, registered on this region. A clinician
+    # opening the folder looked for the T2 and found only a region code.
+    stem = f"{patient}_T2_{region}_{suffix}"
     _, extension = pairing.split_scan_extension(os.path.basename(t2_path))
-    scan_output = os.path.join(
-        destination, f"{patient}_{region}_{suffix}{pairing.compressed_extension(extension)}"
-    )
+    scan_output = os.path.join(destination, f"{stem}{pairing.compressed_extension(extension)}")
     sitk.WriteImage(registered, scan_output, useCompression=True)
 
-    transform_output = os.path.join(destination, f"{patient}_{region}_{suffix}_transform.tfm")
+    transform_output = os.path.join(destination, f"{stem}_transform.tfm")
     sitk.WriteTransform(transform, transform_output)
 
     in_scene = []
@@ -111,8 +118,11 @@ def register_patient(
         if oriented_t1:
             in_scene.append((oriented_t1, "reference"))
         else:
+            # One copy for every region registered on it: the regions share
+            # this folder now.
             reference = os.path.join(destination, os.path.basename(t1_path))
-            shutil.copy2(t1_path, reference)
+            if not os.path.isfile(reference):
+                shutil.copy2(t1_path, reference)
             in_scene.append((reference, "reference"))
     if catalogs.OUTPUT_ORIENTATION_LANDMARKS in (outputs or ()) and oriented_t1:
         landmarks = oriented_landmarks(oriented_t1)
@@ -122,7 +132,7 @@ def register_patient(
             logger.warning("ASO left no landmarks beside %s", os.path.basename(oriented_t1))
     in_scene += [(scan_output, "registered"), (transform_output, "registration")]
     scene_output = scene.write(destination, "the T1", in_scene,
-                               name=f"{patient}_{region}_{suffix}_{scene.SCENE_NAME}")
+                               name=f"{stem}_{scene.SCENE_NAME}")
 
     entry = {
         "status": "ok",

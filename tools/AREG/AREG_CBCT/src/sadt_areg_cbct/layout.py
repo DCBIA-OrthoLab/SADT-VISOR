@@ -154,9 +154,9 @@ LAYOUT = {
     # `inline` did not. No `groups` -- three options are not two kinds of thing,
     # and a heading over each would say less than the chips do.
     #
-    # `option_help` gives each region its code, which is the name of the folder
-    # the transforms come back in (`CB/C_0001_CB_Reg.nii.gz`), so the panel says
-    # where to look for the answer.
+    # `option_help` gives each region its code, which is in the name of the
+    # files that come back (`T2_Registered/C_0001_T2_CB_Reg.nii.gz`), so the
+    # panel says where to look for the answer.
     "regions": {
         "section": _REGISTRATION,
         "label": "Register on",
