@@ -130,6 +130,23 @@ def resolve_model_file(model) -> Path:
     return candidates[0]
 
 
+def bundle_for(model, notes_type: str):
+    """The bundle to load when `model` is the hosted models FOLDER itself.
+
+    A server that hosts this tool hands over `DATA/CNE/models/` when the
+    caller named no model, and leaves the choice inside it to the tool
+    (VISOR-serve, `execution/dispatch.py`). That folder holds one bundle per
+    note type, so the note type picks: `models/TMJ/` for TMJ notes. Without
+    this, every run that named no model was refused for the folder's two
+    `.gguf` files. A bundle named on purpose has no such sub-folder and is
+    returned as it is.
+    """
+    if not model:
+        return model
+    nested = Path(model) / notes_type
+    return nested if nested.is_dir() else model
+
+
 # The DATA folder this tool's weights live in. Written rather than derived, as
 # CLIC's is: which folder holds which bundle is a deployment fact.
 DATA_NAME = "CNE"
@@ -325,6 +342,13 @@ def complete(model, messages: list, max_tokens: int, temperature: float) -> tupl
     was cut off at `max_tokens` mid-sentence -- and, for a model asked for JSON,
     mid-object. The caller is what refuses to write that.
     """
+    # Every note starts from an empty context. llama-cpp-python otherwise
+    # keeps the previous call's tokens and reuses the prefix they share --
+    # the TMJ system prompt, for every note of a batch -- and the answer then
+    # depends on which note came before: measured on the two public TMJ
+    # notes, the second note of a batch extracted differently from the same
+    # note alone, on CPU and on CUDA alike. Upstream has the same defect.
+    model.reset()
     output = model.create_chat_completion(
         messages=messages,
         max_tokens=max_tokens,
@@ -457,6 +481,7 @@ __all__ = [
     "TRUNCATED",
     "ToolUnavailableError",
     "build_messages",
+    "bundle_for",
     "complete",
     "context_for",
     "engine_module",
