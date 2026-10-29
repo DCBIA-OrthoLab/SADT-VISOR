@@ -58,7 +58,12 @@ LAYOUT = {
     # odd one out. The server only collects the output of the calls THIS tool
     # makes, so ticking `ASO` returns ASO's own result and not the landmarks
     # ASO predicted on the way.
+    # Hidden in every engine of the facade, so the name means one thing: what
+    # a reader wanted from it -- the oriented scan and ASO's landmarks -- comes
+    # back as an Extra output now, in the result's space, and the raw step
+    # folders were a second, harder way to get the same files.
     "keep_intermediate": {
+        "hidden": True,
         "label": "Raw intermediate files",
         "option_help": {
             "ALI_CBCT": "The landmarks placed on the CBCT, before this tool "
@@ -197,6 +202,6 @@ LAYOUT = {
     "max_dist": {"section": _OUTPUTS, "label": "ICP match distance (mm)", "hidden": True},
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
     "outputs": catalogs.outputs_layout(
-        _OUTPUTS, catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_CBCT_SCAN,
-        catalogs.OUTPUT_TRANSFORMS),
+        _OUTPUTS, catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_ORIENTATION_LANDMARKS,
+        catalogs.OUTPUT_CBCT_SCAN, catalogs.OUTPUT_TRANSFORMS),
 }

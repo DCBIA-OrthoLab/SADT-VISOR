@@ -307,9 +307,8 @@ def test_an_oriented_run_returns_the_t1_the_t2_was_registered_onto(tmp_path):
 
 
 def test_an_oriented_t1_is_listed_where_it_already_is_not_copied_again(tmp_path):
-    """The scene points at the copy under T1_Oriented/ and at ASO's landmarks
-    beside it: a second copy of the heaviest file of the run says nothing the
-    first does not."""
+    """The scene points at the copy under T1_Oriented/: a second copy of the
+    heaviest file of the run says nothing the first does not."""
     run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
     folder = os.path.join(run.output_dir, "CB")
     assert sorted(os.listdir(folder)) == [
@@ -317,13 +316,21 @@ def test_an_oriented_t1_is_listed_where_it_already_is_not_copied_again(tmp_path)
 
     with open(os.path.join(folder, "P1_CB_Reg_scene.json")) as handle:
         files = json.load(handle)["files"]
-    assert files[:2] == [
-        {"path": "../T1_Oriented/P1_T1_Or.nii.gz", "kind": "volume", "role": "reference"},
-        {"path": "../T1_Oriented/P1_T1_lm_Or.mrk.json", "kind": "markups",
-         "role": "reference landmarks"},
-    ]
+    assert files[0] == {"path": "../T1_Oriented/P1_T1_Or.nii.gz", "kind": "volume",
+                        "role": "reference"}
+    assert all(entry["kind"] != "markups" for entry in files), "landmarks are their own option"
     for entry in files:
         assert os.path.isfile(os.path.join(folder, *entry["path"].split("/")))
+
+
+def test_the_orientation_landmarks_are_listed_beside_the_oriented_t1(tmp_path):
+    """Asked for, ASO's landmarks are in the scene where they already are,
+    under T1_Oriented/, in the oriented T1's space the T2 was registered into."""
+    run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_ORIENTATION_LANDMARKS])
+    with open(os.path.join(run.output_dir, "CB", "P1_CB_Reg_scene.json")) as handle:
+        files = json.load(handle)["files"]
+    assert files[0] == {"path": "../T1_Oriented/P1_T1_lm_Or.mrk.json", "kind": "markups",
+                        "role": "orientation landmarks"}
 
 
 def test_an_oriented_run_lists_no_t1_unless_asked(tmp_path):

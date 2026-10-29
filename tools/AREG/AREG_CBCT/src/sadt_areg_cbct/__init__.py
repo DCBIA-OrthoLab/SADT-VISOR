@@ -131,7 +131,8 @@ def run(
     # The same argument as the other two engines', so the AREG facade shows
     # one "Extra outputs" box whose options follow the mode. Nothing ticked by
     # default: a scan is the heaviest file of a run.
-    outputs: list[Literal["T1 scan (oriented when orientation is on)"]] = [],
+    outputs: list[Literal["T1 scan (oriented when orientation is on)",
+                          "Orientation landmarks (ASO)"]] = [],
     num_workers: int = 0,
     *,
     sup=None,
@@ -192,8 +193,10 @@ def run(
         outputs: What to hand back beside each registered T2, in the T1's
             space so it opens on top of it. T1 scan: the T1 it was registered
             onto; when it was oriented first, the copy under `T1_Oriented/`
-            and ASO's landmarks, rather than a second copy. Each
-            registration's `_scene.json` lists what was written.
+            rather than a second copy. Orientation landmarks (ASO): the
+            landmarks ASO oriented the T1 on, beside that copy; none when the
+            T1 was not oriented. Each registration's `_scene.json` lists what
+            was written.
         num_workers: How many registrations to run at once. Left at 0 the
             server decides, from what one registration was measured to cost.
 

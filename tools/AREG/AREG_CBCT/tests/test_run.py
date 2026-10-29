@@ -717,14 +717,15 @@ class TestSpans:
         assert sup.spans == [("AMASSS", None)]
 
 
-def test_the_steps_to_keep_are_offered_and_each_one_is_explained():
+def test_the_raw_step_folders_are_not_offered():
     """`keep_intermediate` is injected by the server from the tools this one
-    calls. Hidden, a clinician had no way to look at a step's working; named,
-    every step the chain runs says what it hands back."""
+    calls. Hidden in every engine of the facade: what a reader wanted from it
+    comes back as an Extra output, in the result's space. Its wording stays,
+    for the day it is shown again."""
     from sadt_areg_cbct.layout import LAYOUT
 
     hints = LAYOUT["keep_intermediate"]
-    assert not hints.get("hidden")
+    assert hints.get("hidden") is True
     assert hints["label"] == "Raw intermediate files"
     assert set(hints["option_help"]) == {"AMASSS", "ASO"}
 

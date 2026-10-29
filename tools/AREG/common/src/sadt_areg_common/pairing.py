@@ -63,6 +63,19 @@ def split_scan_extension(filename: str) -> tuple:
     return os.path.splitext(filename)
 
 
+def oriented_landmarks(oriented_scan: str) -> str:
+    """Where ASO put the landmarks it oriented `oriented_scan` on.
+
+    ASO writes `<patient>_<suffix>.nii.gz` and `<patient>_lm_<suffix>.mrk.json`
+    side by side; the suffix is read off the scan rather than assumed `Or`.
+    Shared by the CBCT and IOS-to-CBCT engines, which both hand them back.
+    """
+    stem, _extension = split_scan_extension(os.path.basename(oriented_scan))
+    patient, _, suffix = stem.rpartition("_")
+    name = f"{patient}_lm_{suffix}.mrk.json" if patient else f"{stem}_lm.mrk.json"
+    return os.path.join(os.path.dirname(oriented_scan), name)
+
+
 def compressed_extension(extension: str) -> str:
     return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
 

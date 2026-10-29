@@ -24,7 +24,11 @@ from conftest import (
 from sadt_areg_common import catalogs
 from sadt_areg_ioscbct import pipeline, run
 
+# What a Registration run can write: nothing in it was oriented, so the
+# orientation landmarks are tested on their own below.
 EVERYTHING = [catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_CBCT_SCAN, catalogs.OUTPUT_TRANSFORMS]
+OFFERED = [catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_ORIENTATION_LANDMARKS,
+           catalogs.OUTPUT_CBCT_SCAN, catalogs.OUTPUT_TRANSFORMS]
 
 
 def _folder(tmp_path):
@@ -37,8 +41,33 @@ def _scene(tmp_path):
 
 def test_the_options_are_the_catalogs():
     annotation = typing.get_type_hints(run)["outputs"]
-    assert list(typing.get_args(typing.get_args(annotation)[0])) == EVERYTHING
-    assert set(EVERYTHING) <= set(catalogs.OUTPUT_HELP)
+    assert list(typing.get_args(typing.get_args(annotation)[0])) == OFFERED
+    assert set(OFFERED) <= set(catalogs.OUTPUT_HELP)
+
+
+def test_a_cbct_nobody_oriented_has_no_orientation_landmarks(tmp_path):
+    cohort(tmp_path)
+    run_registration(tmp_path, outputs=[catalogs.OUTPUT_ORIENTATION_LANDMARKS])
+    assert set(os.listdir(_folder(tmp_path))) == {
+        "P001_T2_U_Reg.vtk", "P001_T2_U_Reg_matrix.npy", "scene.json"}
+
+
+def test_an_oriented_cbct_hands_back_the_landmarks_aso_oriented_it_on(tmp_path):
+    """ASO writes `<patient>_lm_<suffix>.mrk.json` beside the scan it oriented.
+    Asked for, it is copied beside the meshes, in the space they were
+    registered into, and the scene lists it as what it is."""
+    from sadt_areg_ioscbct import dispatch
+
+    cohort(tmp_path)
+    write_markups(tmp_path / "cbct" / "P_0001_lm_T2.mrk.json", {"Ba": [0.0, 0.0, 0.0]})
+    (tmp_path / "out").mkdir()
+    dispatch.register(
+        str(tmp_path / "ios"), str(tmp_path / "cbct"), str(tmp_path / "ios_lm"),
+        str(tmp_path / "cbct_lm"), str(tmp_path / "out"), "Reg", {"patients": {}}, 1.0,
+        carry_cbct=True, outputs=[catalogs.OUTPUT_ORIENTATION_LANDMARKS])
+    assert (_folder(tmp_path) / "P_0001_lm_T2.mrk.json").is_file()
+    assert {"path": "P_0001_lm_T2.mrk.json", "kind": "markups",
+            "role": "orientation landmarks"} in _scene(tmp_path)["files"]
 
 
 def test_nothing_ticked_adds_only_the_scene(tmp_path):

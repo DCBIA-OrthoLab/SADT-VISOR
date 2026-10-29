@@ -119,7 +119,8 @@ def run(
     # Nothing ticked by default: the CBCT is the heaviest file of a run, and
     # each of these is for a reader who asked for it. Spelled out because
     # `Literal` takes literals only; a test pins it to `catalogs`.
-    outputs: list[Literal["Moved landmarks", "CBCT scan", "Transform (.tfm)"]] = [],
+    outputs: list[Literal["Registration landmarks (IOS + CBCT)", "Orientation landmarks (ASO)",
+                          "CBCT scan", "Transform (.tfm)"]] = [],
     *,
     sup=None,
 ) -> Path:
@@ -167,8 +168,10 @@ def run(
             are supplied, there being nothing to orient for once they are.
         output_suffix: Added to each output name, e.g. `scan_Reg.vtk`.
         outputs: What to hand back beside the registered meshes, all in the
-            CBCT's space so it opens on top of them. Moved landmarks: each
-            mesh's own, moved with it, and the CBCT landmarks used. CBCT scan:
+            CBCT's space so it opens on top of them. Registration landmarks
+            (IOS + CBCT): each mesh's own, moved with it, and the CBCT
+            landmarks used. Orientation landmarks (ASO): the landmarks ASO
+            oriented the CBCT on, when the run oriented it. CBCT scan:
             the CBCT the meshes were registered onto. Transform (.tfm): each
             registration as a `.tfm`. Each patient's `scene.json` lists what was written.
 
