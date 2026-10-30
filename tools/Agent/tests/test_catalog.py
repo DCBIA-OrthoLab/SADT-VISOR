@@ -64,7 +64,7 @@ def test_the_live_registry_is_the_default_source(monkeypatch):
     monkeypatch.setenv(catalog.API_ENV, "http://127.0.0.1:8000")
     seen = {}
 
-    def fake_urlopen(url, timeout=None):
+    def fake_urlopen(url, timeout=None, context=None):
         seen["url"] = url
         seen["timeout"] = timeout
         return io.BytesIO(json.dumps(CATALOG).encode("utf-8"))
@@ -89,7 +89,7 @@ def test_a_catalog_file_wins_over_the_registry(monkeypatch, catalog_file):
 def test_an_unreachable_registry_names_the_url_and_the_alternative(monkeypatch):
     monkeypatch.setenv(catalog.API_ENV, "http://127.0.0.1:9")
 
-    def refuse(url, timeout=None):
+    def refuse(url, timeout=None, context=None):
         raise OSError("Connection refused")
 
     monkeypatch.setattr("urllib.request.urlopen", refuse)
@@ -126,7 +126,7 @@ def test_a_malformed_registry_is_the_servers_fault_not_the_callers(monkeypatch):
     monkeypatch.setenv(catalog.API_ENV, "http://127.0.0.1:8000")
     monkeypatch.setattr(
         "urllib.request.urlopen",
-        lambda url, timeout=None: io.BytesIO(b'[{"description": "x"}]'),
+        lambda url, timeout=None, context=None: io.BytesIO(b'[{"description": "x"}]'),
     )
     with pytest.raises(CatalogError) as raised:
         catalog.load_catalog("")
@@ -141,7 +141,7 @@ def test_no_token_is_sent_to_the_registry(monkeypatch):
     monkeypatch.setenv(catalog.API_ENV, "http://127.0.0.1:8000")
     captured = {}
 
-    def fake_urlopen(url, timeout=None):
+    def fake_urlopen(url, timeout=None, context=None):
         captured["url"] = url
         return io.BytesIO(b"[]")
 
@@ -293,3 +293,26 @@ def test_missing_required_keeps_signature_order():
     tools = catalog.normalise(CATALOG)
     reg = catalog.find_tool(tools, "Timepoint_Reg")
     assert catalog.missing_required(reg, {}) == ["baseline", "followup"]
+
+
+def test_the_registry_is_verified_against_the_server_s_own_certificate(monkeypatch, tmp_path):
+    """The server speaks HTTPS with its own certificate and names it in
+    SADT_API_CAFILE; the system store alone cannot verify it."""
+    monkeypatch.setenv(catalog.API_ENV, "https://127.0.0.1:8000")
+    monkeypatch.setenv(catalog.CAFILE_ENV, str(tmp_path / "server.pem"))
+    created, used = {}, {}
+
+    def fake_context(cafile=None):
+        created["cafile"] = cafile
+        return "context"
+
+    def fake_urlopen(url, timeout=None, context=None):
+        used["context"] = context
+        return io.BytesIO(json.dumps(CATALOG).encode("utf-8"))
+
+    monkeypatch.setattr("ssl.create_default_context", fake_context)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    catalog.load_catalog("")
+
+    assert created["cafile"] == str(tmp_path / "server.pem")
+    assert used["context"] == "context"

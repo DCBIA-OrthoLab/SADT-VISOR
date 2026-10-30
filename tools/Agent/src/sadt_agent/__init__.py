@@ -78,7 +78,8 @@ def run(
             proposes a run, whatever `execute` says.
         folders: The folders holding the data this request is about. They are
             the only paths the model is shown, and it is told to use them
-            verbatim. Sent as a list, so a folder whose name contains a comma
+            verbatim; with `execute`, they are also the only paths a run may
+            be handed. Sent as a list, so a folder whose name contains a comma
             stays one folder.
         history: Earlier turns of this conversation, as a JSON array of
             `{"role": "user"|"assistant"|"system", "content": "..."}`, so a
@@ -93,10 +94,13 @@ def run(
             is complete. Off by default and deliberately so -- a model choosing
             what to run on patient data unattended is a decision a person should
             make. It is refused anyway when no tool was chosen, when a required
-            argument is missing, or when the router's own confidence is below
-            0.5.
+            argument is missing, when the router's own confidence is below
+            0.5, when a path argument does not resolve inside one of
+            `folders`, or when a model-named argument is anything but a bare
+            name.
         endpoint: The Ollama server to talk to, e.g. `http://127.0.0.1:11434`.
-            Empty means `OLLAMA_HOST`, then loopback. The endpoint is an
+            Empty means `OLLAMA_HOST`, then loopback. Anything else must be a
+            loopback address or `OLLAMA_HOST` itself. The endpoint is an
             operational prerequisite: this tool does not install Ollama, does
             not start it, and does not pull models.
         model_tag: The Ollama model to route with, e.g. `qwen3:8b`. It must
@@ -271,6 +275,12 @@ def _route(client, prompt, selected, folder_list, turns, scores,
     _log_outcome(decision)
 
     allowed, reason = routing.can_execute(decision)
+    if allowed:
+        # Last, so the refusal a person reads is the first thing wrong with
+        # the proposal; see `execution.confinement_refusal` for why the values
+        # are checked at all.
+        reason = execution.confinement_refusal(tool, values, folder_list)
+        allowed = not reason
     if not execute:
         decision["executed"] = False
         return decision

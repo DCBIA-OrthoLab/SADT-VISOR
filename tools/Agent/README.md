@@ -71,7 +71,7 @@ JSON a `ModelAnswerError` -- both server faults, 500.
 | `history` | earlier turns, `[{"role", "content"}, ...]` as JSON |
 | `candidates` | how many tools the model is shown, best first. `0` = all |
 | `execute` | run the chosen tool as well as proposing it. **Off by default** |
-| `endpoint` | the Ollama server. Empty = `OLLAMA_HOST`, then loopback |
+| `endpoint` | the Ollama server. Empty = `OLLAMA_HOST`, then loopback. Otherwise a loopback address or `OLLAMA_HOST` itself: the server sends requests to no other host a caller names |
 | `model_tag` | the Ollama model, e.g. `qwen3:8b` |
 | `temperature`, `seed` | 0 and 0, so the same request routes the same way twice |
 | `timeout_seconds` | per model call, and for reading the registry |
@@ -168,6 +168,16 @@ Turning it on is not enough. Execution is refused, with the reason recorded in
   up);
 - the router's own confidence is below 0.5 -- a floor against a model that has
   said in its own answer that it is guessing, not a quality bar;
+- a `path` argument does not resolve, links followed, inside one of `folders`.
+  The server refuses a file argument sent as a path -- a file has to be
+  uploaded -- and a supervised call does not pass that check, so without this a
+  prompt naming a path, or a model inventing one, would have the callee read it.
+  `folders` is itself a value the caller chose, so on a server (`SADT_JOB_DIR`
+  set) a folder counts only if it lies inside the run's own job directory;
+- a model-named argument (`model`, `reference`, `*_model`, `*_reference`) is a
+  path rather than a bare name. Nothing on a supervised call resolves it among
+  the hosted models on the way, so a path would load whatever weights sit
+  there;
 - nothing injected a supervisor (`SupervisorRequired`, which names both ways
   forward).
 
