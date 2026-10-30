@@ -62,7 +62,8 @@ TAG_PREFIX = "data-"
 def _anonymous(url: str):
     # Deliberately no Authorization header, whatever the environment holds:
     # what this can read is what anybody can read.
-    return urllib.request.urlopen(urllib.request.Request(url, headers=_HEADERS), timeout=60)
+    # The URL is a GitHub release asset's https address.
+    return urllib.request.urlopen(urllib.request.Request(url, headers=_HEADERS), timeout=60)  # nosec B310
 
 
 def _plan(manifest: dict, excluded_tools: set) -> list:

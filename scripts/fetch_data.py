@@ -240,7 +240,8 @@ def _download(url: str, destination: str, progress) -> str:
     digest = hashlib.sha256()
     request = urllib.request.Request(url, headers=_HEADERS)
     last_report = 0.0
-    with urllib.request.urlopen(request) as response:  # noqa: S310 - https URLs from the manifest
+    # https URLs from the manifest.
+    with urllib.request.urlopen(request) as response:  # noqa: S310  # nosec B310
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         with open(destination, "wb") as out:
