@@ -22,23 +22,25 @@ router and the extractor both need. Reasoning models still wrap it, so
 `parse_json_object` unwraps rather than trusting.
 """
 
+import ipaddress
 import json
 import logging
 import os
 import re
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 
-from .errors import ModelAnswerError, ToolUnavailableError
+from .errors import ModelAnswerError, ToolInputError, ToolUnavailableError
 
 logger = logging.getLogger("Agent")
 
 # Where Ollama listens when nothing says otherwise. `OLLAMA_HOST` is Ollama's
 # own convention and a property of the DEPLOYMENT, like `SADT_API` -- not a
 # setting that should have become an argument, because it says where a service
-# is rather than what the tool should do. The `endpoint` argument overrides it
-# per request either way.
+# is rather than what the tool should do. The `endpoint` argument overrides it,
+# per request, but only with an address on this machine (see resolve_endpoint).
 ENDPOINT_ENV = "OLLAMA_HOST"
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
 
@@ -53,14 +55,45 @@ _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
 
 def resolve_endpoint(endpoint: str) -> str:
-    """The endpoint to talk to: the argument, then `OLLAMA_HOST`, then loopback."""
-    chosen = (endpoint or "").strip() or os.environ.get(ENDPOINT_ENV, "").strip()
-    chosen = chosen or DEFAULT_ENDPOINT
-    if "://" not in chosen:
+    """The endpoint to talk to: the argument, then `OLLAMA_HOST`, then loopback.
+
+    The argument is a request field, so it may only name this machine or the
+    operator's own endpoint: any other host would make the server send requests
+    wherever it can reach and the caller cannot. Raises `ToolInputError`.
+    """
+    operator = os.environ.get(ENDPOINT_ENV, "").strip()
+    asked = (endpoint or "").strip()
+    if asked:
+        asked = _with_scheme(asked)
+        if asked != (_with_scheme(operator) if operator else None) and not _is_loopback(asked):
+            raise ToolInputError(
+                "endpoint '{}' is not on this server: leave it empty to use the "
+                "deployment's Ollama, or name a loopback address.".format(asked)
+            )
+        return asked
+    return _with_scheme(operator or DEFAULT_ENDPOINT)
+
+
+def _with_scheme(endpoint: str) -> str:
+    if "://" not in endpoint:
         # `OLLAMA_HOST=127.0.0.1:11434` is how Ollama's own documentation
         # spells it, and urllib will not open that.
-        chosen = "http://" + chosen
-    return chosen.rstrip("/")
+        endpoint = "http://" + endpoint
+    return endpoint.rstrip("/")
+
+
+def _is_loopback(endpoint: str) -> bool:
+    """Whether `endpoint` is http(s) to this machine, by literal address only:
+    a name other than `localhost` is resolved by DNS, which the caller may own."""
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    if parsed.hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def chat(endpoint: str, model: str, messages, *, json_format: bool = False,

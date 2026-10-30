@@ -13,7 +13,7 @@ import urllib.error
 import pytest
 
 from sadt_agent import llm
-from sadt_agent.errors import ModelAnswerError, ToolUnavailableError
+from sadt_agent.errors import ModelAnswerError, ToolInputError, ToolUnavailableError
 
 
 def response(payload):
@@ -28,9 +28,27 @@ def answer(content):
 # Where the endpoint is
 # ---------------------------------------------------------------------------
 
-def test_the_argument_wins(monkeypatch):
+def test_a_loopback_argument_wins(monkeypatch):
     monkeypatch.setenv(llm.ENDPOINT_ENV, "http://elsewhere:1234")
-    assert llm.resolve_endpoint("http://asked:9999") == "http://asked:9999"
+    assert llm.resolve_endpoint("http://127.0.0.1:9999") == "http://127.0.0.1:9999"
+    assert llm.resolve_endpoint("localhost:9999") == "http://localhost:9999"
+
+
+def test_the_argument_may_name_the_operator_s_own_endpoint(monkeypatch):
+    monkeypatch.setenv(llm.ENDPOINT_ENV, "http://elsewhere:1234")
+    assert llm.resolve_endpoint("http://elsewhere:1234/") == "http://elsewhere:1234"
+
+
+@pytest.mark.parametrize("asked", [
+    "http://169.254.169.254", "http://evil.example:11434", "http://10.0.0.5:8000",
+    "http://127.0.0.1.evil.example:1", "http://[::ffff:10.0.0.5]:1", "file:///etc/passwd",
+])
+def test_an_argument_off_this_machine_is_refused(monkeypatch, asked):
+    """A request field: honouring any host would make the server a proxy to
+    whatever it can reach that the caller cannot."""
+    monkeypatch.delenv(llm.ENDPOINT_ENV, raising=False)
+    with pytest.raises(ToolInputError, match="endpoint"):
+        llm.resolve_endpoint(asked)
 
 
 def test_the_environment_is_used_when_nothing_is_asked(monkeypatch):
@@ -51,7 +69,7 @@ def test_a_host_and_port_with_no_scheme_is_accepted(monkeypatch):
 
 
 def test_a_trailing_slash_never_doubles(monkeypatch):
-    assert llm.resolve_endpoint("http://host:1/") == "http://host:1"
+    assert llm.resolve_endpoint("http://127.0.0.1:1/") == "http://127.0.0.1:1"
 
 
 # ---------------------------------------------------------------------------

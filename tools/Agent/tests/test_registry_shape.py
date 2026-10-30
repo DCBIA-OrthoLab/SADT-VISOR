@@ -98,7 +98,7 @@ def test_the_live_registry_shape_is_a_usable_catalogue(monkeypatch):
     monkeypatch.setenv(catalog.API_ENV, "http://127.0.0.1:8000")
     monkeypatch.setattr(
         "urllib.request.urlopen",
-        lambda url, timeout=None: io.BytesIO(json.dumps(REGISTRY).encode("utf-8")),
+        lambda url, timeout=None, context=None: io.BytesIO(json.dumps(REGISTRY).encode("utf-8")),
     )
     tools, source = catalog.load_catalog("")
     assert [tool["name"] for tool in tools] == ["ALI_CBCT", "FlexReg", "Example_Tool"]

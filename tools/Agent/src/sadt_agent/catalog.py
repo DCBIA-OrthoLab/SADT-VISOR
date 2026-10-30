@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import urllib.error
 import urllib.request
 
@@ -45,6 +46,9 @@ logger = logging.getLogger("Agent")
 # What the server sets so a tool can reach it. Read only when `catalog` is not
 # supplied, and only to build `<value>/tools`.
 API_ENV = "SADT_API"
+# The certificate the server listens with, which it names for its tools: the
+# system store alone cannot verify a server's own certificate.
+CAFILE_ENV = "SADT_API_CAFILE"
 
 # Filled in at dispatch with the job's own output directory, and taken out of
 # the published schema before a client ever sees it. A router must never
@@ -140,8 +144,11 @@ def load_catalog(catalog_path, timeout_seconds: int = 30):
 def fetch_catalog(api: str, timeout_seconds: int = 30):
     """`GET <api>/tools`, decoded. Stdlib only, and no token: it needs none."""
     url = api.rstrip("/") + "/tools"
+    cafile = os.environ.get(CAFILE_ENV, "").strip()
+    context = ssl.create_default_context(cafile=cafile) if cafile else None
     try:
-        with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+        # The URL is the server's own address, from SADT_API.
+        with urllib.request.urlopen(url, timeout=timeout_seconds, context=context) as response:  # nosec B310
             body = response.read()
     except (urllib.error.URLError, OSError) as exc:
         if is_timeout(exc):
