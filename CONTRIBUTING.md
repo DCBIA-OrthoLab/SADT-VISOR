@@ -76,6 +76,25 @@ folder and kept its name -- and that renaming a folder without meaning to change
 the API name fails at startup instead of silently renaming the tool clients ask
 for.
 
+**Bump `cost_epoch` when a release changes what the tool costs.** The server
+learns each tool's RAM and VRAM from its runs and keeps them across restarts
+and updates; a tool it has not measured runs alone. A release with a new or
+larger model, a different handling of the input's size, or a new engine makes
+those figures wrong, and says so here:
+
+```toml
+[tool.sadt]
+tool = true
+name = "Crown_Seg"
+cost_epoch = 1      # absent is 0; +1 for each such release
+```
+
+The server then drops that tool's learned figures, and no other tool's, at its
+next start, logs `Learned costs  RESET Crown_Seg: cost_epoch 0 -> 1`, and
+relearns from the next run. Not for an ordinary release -- a bug fix, a new
+argument, a panel change: learned figures are worth keeping. A value that is
+not an integer is logged and ignored.
+
 The naming convention:
 
 - an acronym stays as it is -- `ALI`, `ASO`, `AMASSS`;

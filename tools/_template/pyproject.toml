@@ -11,6 +11,19 @@ requires-python = ">=3.11,<3.13"
 # revalidating against reference data, not just a green test run.
 dependencies = ["numpy==1.26.4"]
 
+# What makes a copy of this template a TOOL (CONTRIBUTING.md, section 2).
+# Uncomment it in the copy, never here: CI and the server key on this section,
+# and the template is a plain package.
+#
+# [tool.sadt]
+# tool = true
+# name = "MyTool"
+# # Bump by one in a release that changes what the tool COSTS -- a new or
+# # larger model, a different handling of the input's size -- so the server
+# # drops the RAM/VRAM it learned from the previous release and relearns it.
+# # Absent is 0. Not for an ordinary release: learned figures are worth keeping.
+# # cost_epoch = 1
+
 [dependency-groups]
 dev = ["pytest==8.3.4", "sadt-testkit"]
 
