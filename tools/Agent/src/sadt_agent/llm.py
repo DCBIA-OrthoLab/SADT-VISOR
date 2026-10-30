@@ -122,7 +122,8 @@ def chat(endpoint: str, model: str, messages, *, json_format: bool = False,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        # The URL is the configured model endpoint's address.
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:  # nosec B310
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise _http_failure(exc, endpoint, model) from exc
