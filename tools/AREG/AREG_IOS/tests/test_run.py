@@ -1343,6 +1343,44 @@ class TestTheCheckpointIsTheServers:
             net.load(str(foreign), "cpu")
         assert type(raised.value) is RuntimeError
 
+    def test_a_checkpoint_that_runs_code_when_unpickled_runs_none(self, tmp_path, monkeypatch):
+        import pickle
+        from sadt_areg_ios import net
+
+        marker = tmp_path / "executed"
+
+        class _Payload:
+            def __reduce__(self):
+                return (os.mkdir, (str(marker),))
+
+        planted = tmp_path / "planted.ckpt"
+        planted.write_bytes(pickle.dumps({"state_dict": _Payload()}))
+        monkeypatch.setattr(net, "build", lambda device: None)
+        with pytest.raises(RuntimeError, match="^loading the palate patch checkpoint failed"):
+            net.load(str(planted), "cpu")
+        assert not marker.exists()
+
+    def test_a_lightning_checkpoint_holding_its_namespace_still_loads(self, tmp_path, monkeypatch):
+        import argparse
+        import torch
+        from sadt_areg_ios import net
+
+        saved = tmp_path / "lightning.ckpt"
+        torch.save({"state_dict": {"model.weight": torch.ones(1)},
+                    "hyper_parameters": {"args": argparse.Namespace(lr=1e-4)}}, str(saved))
+
+        class _Model:
+            def load_state_dict(self, state, strict):
+                self.state = state
+                return [], []
+
+            def eval(self):
+                return self
+
+        monkeypatch.setattr(net, "build", lambda device: _Model())
+        loaded = net.load(str(saved), "cpu")
+        assert float(loaded.state["model.weight"]) == 1.0
+
 
 class TestWarningsSayWhichMesh:
     def test_missing_landmarks_name_the_subject_position(self, caplog):

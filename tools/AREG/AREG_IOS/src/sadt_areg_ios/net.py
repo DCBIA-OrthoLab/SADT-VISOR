@@ -19,6 +19,7 @@ registry on a deployment that lacks it -- CBCT registration included, which
 needs none of this.
 """
 
+import argparse
 import logging
 import os
 
@@ -201,7 +202,11 @@ def load(checkpoint_path: str, device: str):
     # a pickle traceback that names neither the step nor the device.
     logger.info("AREG IOS: loading the palate patch checkpoint on %s", device)
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        # weights_only: a full unpickle runs whatever the file says, and this
+        # argument can be an upload. The Lightning checkpoint holds tensors
+        # plus the training run's argparse.Namespace, which is all it allows.
+        with torch.serialization.safe_globals([argparse.Namespace]):
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     except Exception as exc:  # noqa: BLE001 -- any failure here is the bundle's
         # A RuntimeError, never a ValueError: the checkpoint is the deployment's,
         # so an unreadable one is a server fault and must not reach the caller
