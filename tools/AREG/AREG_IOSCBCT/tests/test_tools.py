@@ -144,15 +144,16 @@ def test_the_twelve_cbct_landmarks_are_three_per_quadrant():
     assert all(name.endswith("O") for name in tools.CBCT_LANDMARKS)
 
 
-def test_the_intraoral_request_asks_for_the_occlusal_family_alone(tmp_path):
-    """The cross-modality alignment matches crown points against their CBCT
-    counterparts; the cervical and mucogingival passes would cost a run over
-    every mesh for points nothing here reads."""
+def test_the_intraoral_request_names_the_matched_landmarks_alone(tmp_path):
+    """The alignment matches the twelve crown points both modalities share;
+    asking for a whole family would hand the user some eighty points of which
+    only those twelve are used."""
     sup = FakeSup(tmp_path, {"ALI_IOS": lambda params: planted(tmp_path, "lm")})
     tools.predict_ios_landmarks(sup, str(tmp_path / "seg"), "")
 
     params = sup.asked("ALI_IOS")
-    assert params["networks"] == ["Occlusal"]
+    assert params["landmarks"] == list(tools.CBCT_LANDMARKS)
+    assert "networks" not in params
     assert "model" not in params
     assert "prediction_ID" not in params
 

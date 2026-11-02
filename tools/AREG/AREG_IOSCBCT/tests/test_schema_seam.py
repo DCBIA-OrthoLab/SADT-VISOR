@@ -126,12 +126,12 @@ def test_the_orientation_request_matches_asos_schema(tmp_path):
     assert_sends_only_declared_arguments("ASO", sup.calls[0][1])
 
 
-def test_occlusal_is_a_network_ali_ios_really_offers():
-    """The one value in the whole seam that is neither an argument name nor a
-    path: it names one of ALI_IOS's landmark families, and a family renamed
-    there would be a 422 three tools down."""
+def test_every_intraoral_landmark_it_asks_for_is_one_ali_ios_can_predict():
+    """Asked for by name on this side too, so a landmark ALI_IOS renamed would
+    be a 422 three tools down instead of a failing test here."""
     schema = schema_of("ALI_IOS")
-    assert "Occlusal" in schema["arguments"]["networks"]["choices"]
+    offered = set(schema["arguments"]["landmarks"]["choices"])
+    assert set(tools.CBCT_LANDMARKS) <= offered
 
 
 def test_every_cbct_landmark_it_asks_for_is_one_ali_cbct_can_predict():

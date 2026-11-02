@@ -50,8 +50,9 @@ logger = logging.getLogger(__name__)
 # upstream's IOSCBCT parameter dict. Twelve occlusal crown points, three per
 # quadrant -- the central incisor, the canine and the first molar -- chosen
 # because they are the points visible in BOTH modalities: a crown tip is a crown
-# tip whether it was imaged by a CBCT or scanned intra-orally. That is also why
-# the intraoral side asks for the Occlusal network alone.
+# tip whether it was imaged by a CBCT or scanned intra-orally. The intraoral side
+# asks ALI_IOS for these same twelve names, so its result holds only the points
+# the alignment matches.
 CBCT_LANDMARKS = (
     "UR1O", "UR3O", "UR6O",
     "UL1O", "UL3O", "UL6O",
@@ -167,15 +168,16 @@ def predict_cbct_landmarks(sup, scan_dir: str, model_path: str, span=None) -> st
 def predict_ios_landmarks(sup, mesh_dir: str, model_path: str, span=None) -> str:
     """The intraoral landmarks, the other half of the correspondence.
 
-    `networks` names the occlusal family alone: the cross-modality alignment
-    matches crown points against their CBCT counterparts, and the cervical and
-    mucogingival passes would cost a run over every mesh for points nothing
-    here reads.
+    Asked for BY NAME, the same twelve as the CBCT side: the alignment matches
+    those crown points and nothing else, so the other occlusal cusps would only
+    clutter the result the user opens. The cost is unchanged -- ALI_IOS still
+    runs the Occlusal network alone, the one these names belong to, and narrows
+    what it writes rather than what it computes.
     """
     _waypoint(sup, span, "predicting intraoral landmarks with ALI_IOS")
     parameters = {
         "input": mesh_dir,
-        "networks": ["Occlusal"],
+        "landmarks": list(CBCT_LANDMARKS),
     }
     if model_path:
         parameters["model"] = model_path
