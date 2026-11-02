@@ -46,6 +46,7 @@ from sadt_ali_common.discovery import (
 
 from .errors import ToolInputError, ToolUnavailableError
 from . import catalog as ios_catalog
+from . import progress
 
 logger = logging.getLogger(__name__)
 
@@ -695,6 +696,7 @@ def identify(
     with open(os.path.join(output_dir, REPORT_NAME), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
 
+    _tell_the_user(report, "mesh")
     logger.info(
         "ALI_IOS finished: %d/%d scan(s) in %.1fs",
         report["summary"]["processed"],
@@ -702,3 +704,43 @@ def identify(
         report["duration_seconds"],
     )
     return report
+
+
+# A cohort larger than this gets one line per scan that missed something, and
+# a total, rather than one line per scan.
+_EVERY_SCAN_UP_TO = 10
+
+
+def user_summary(report: dict, noun: str) -> list:
+    """What the run placed, as `[(level, line)]` for the person who started it.
+
+    By position and landmark name, never by file: "{noun} 2/3: 6 landmarks
+    placed, 1 not found (LR6O)". A scan that missed a landmark is a warning,
+    since that is what the reader has to go and look at.
+    """
+    cases = list((report.get("cases") or {}).values())
+    lines = []
+    complete = 0
+    for index, record in enumerate(cases, start=1):
+        where = "{} {}/{}".format(noun, index, len(cases))
+        if record.get("status") != "ok":
+            lines.append(("warning", "{}: no landmark placed".format(where)))
+            continue
+        found = len(record.get("landmarks_found") or [])
+        missing = sorted(record.get("landmarks_failed") or [])
+        text = "{}: {} landmark{} placed".format(where, found, "" if found == 1 else "s")
+        if missing:
+            names = ", ".join(missing[:8]) + (", ..." if len(missing) > 8 else "")
+            lines.append(("warning", "{}, {} not found ({})".format(text, len(missing), names)))
+        else:
+            complete += 1
+            if len(cases) <= _EVERY_SCAN_UP_TO:
+                lines.append(("info", text))
+    if len(cases) > _EVERY_SCAN_UP_TO:
+        lines.append(("info", "{} of {} {}s have every landmark".format(complete, len(cases), noun)))
+    return lines
+
+
+def _tell_the_user(report: dict, noun: str) -> None:
+    for level, line in user_summary(report, noun):
+        progress.log(line, level, user=True)

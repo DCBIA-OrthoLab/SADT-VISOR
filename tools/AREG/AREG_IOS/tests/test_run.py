@@ -910,7 +910,8 @@ def test_the_cohort_loop_reports_one_event_per_subject(tmp_path, monkeypatch):
         output_dir=str(tmp_path / "out"),
     )
 
-    events = _events(events_file)
+    # The progress events, not the log lines (the metrics) sharing the file.
+    events = [event for event in _events(events_file) if "fraction" in event]
     assert [event["message"] for event in events] == ["subject 1 of 2", "subject 2 of 2"]
     assert [event["fraction"] for event in events] == [0.0, 0.5]
     assert not any("P1" in event["message"] for event in events)
@@ -946,7 +947,8 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
     )
 
     assert sup.messages == []
-    assert [event["message"] for event in _events(events_file)] == ["subject 1 of 1"]
+    assert [event["message"] for event in _events(events_file)
+            if "fraction" in event] == ["subject 1 of 1"]
 
 
 # ---------------------------------------------------------------------------

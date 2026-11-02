@@ -28,6 +28,8 @@ reported rather than guessed.
 import logging
 import os
 
+import numpy as np
+
 from sadt_areg_common import catalogs, pairing, scene
 from sadt_areg_common.errors import ToolInputError
 
@@ -164,10 +166,14 @@ class MGLPainter:
                 "send one per lower scan, or leave the field empty to have them predicted"
             )
 
-    def __call__(self, surface, scan_path: str, where: str = None) -> tuple:
+    def landmarks_for(self, scan_path: str) -> dict:
+        """{label: position} of the mucogingival landmarks of the scan at `scan_path`."""
         path = landmark_files.for_scan(self.index, scan_path, also_drop=_MATCHING_TOKENS)
+        return landmark_files.load(path)
+
+    def __call__(self, surface, scan_path: str, where: str = None) -> tuple:
         return mgl.build_patch(
-            surface, landmark_files.load(path), height=self.height, where=where
+            surface, self.landmarks_for(scan_path), height=self.height, where=where
         )
 
 
@@ -217,10 +223,15 @@ def register_patient(
         where=_where(position, "T2"),
     )
 
-    matrix = icp.align(
-        butterfly.patch_cloud(t2_surface, painter.array_name),
-        butterfly.patch_cloud(t1_surface, painter.array_name),
-    )
+    t2_patch = butterfly.patch_cloud(t2_surface, painter.array_name)
+    t1_patch = butterfly.patch_cloud(t1_surface, painter.array_name)
+    alignment = {}
+    matrix = icp.align(t2_patch, t1_patch, stats=alignment)
+    metrics = {"icp": icp.measure(t2_patch, t1_patch, matrix,
+                                  iterations=alignment.get("iterations"))}
+    displacement = _landmark_displacement(painter, registered, matrix)
+    if displacement:
+        metrics["landmark_displacement"] = displacement
 
     relative_dir, patient = os.path.split(relative_key)
     destination = os.path.join(output_dir, relative_dir)
@@ -278,11 +289,38 @@ def register_patient(
             else "the registered T2 mesh -> the T1 mesh AREG was given"
         ),
         "outputs": sorted(os.path.relpath(path, output_dir) for path in written),
+        "metrics": metrics,
     }
     notes = [note for note in (t1_note, t2_note) if note]
     if notes:
         entry["notes"] = notes
     return entry
+
+
+def _landmark_displacement(painter, registered: dict, matrix) -> dict:
+    """How far each landmark is from its T1 position once T2 is registered.
+
+    Only for a painter that reads landmarks per scan (the mucogingival band):
+    the T2 landmark is moved by the registration and compared with the T1
+    landmark of the same label. On a stable region that is what is left of the
+    misalignment, plus the landmarks' own placement noise and any real change.
+    None when the painter has no landmarks or the two scans share no label.
+    """
+    read = getattr(painter, "landmarks_for", None)
+    if read is None:
+        return None
+    try:
+        t1, t2 = read(registered["t1"]), read(registered["t2"])
+    except landmark_files.LandmarkError:
+        return None
+    labels = [label for label in mgl.MGL_ORDER + mgl.MGL_ORDER_LEGACY
+              if label in t1 and label in t2]
+    labels += sorted(label for label in set(t1) & set(t2) if label not in labels)
+    if not labels:
+        return None
+    moved = np.array([t2[label] for label in labels]) @ matrix[:3, :3].T + matrix[:3, 3]
+    distances = np.linalg.norm(moved - np.array([t1[label] for label in labels]), axis=1)
+    return {"labels": labels, "distances_mm": [round(float(d), 4) for d in distances]}
 
 
 def _where(position: str, timepoint: str) -> str:

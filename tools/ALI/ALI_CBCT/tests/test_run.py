@@ -1273,7 +1273,10 @@ def test_a_batch_says_which_scan_it_is_on(tmp_path, stub_agent, cbct_environment
     assert not any("patient01" in event["message"] for event in events)
     # The bundle has none of the other cranial-base landmarks, and the
     # clinician is told so once, by count.
-    logs = [record for record in records if record.get("kind") == "log"]
+    # Apart from the end-of-run summary, one line per scan of what was placed.
+    logs = [record for record in records if record.get("kind") == "log"
+            and "landmark placed" not in record["message"]
+            and "landmarks placed" not in record["message"]]
     assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
     assert "have no model in this bundle" in logs[0]["message"]
 
@@ -1316,7 +1319,9 @@ def test_the_bar_moves_inside_a_scan_as_its_landmarks_come_back(
     assert [event["fraction"] for event in events] == [
         0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875,
     ]
-    assert [record for record in records if record.get("kind") == "log"] == []
+    # Nothing but the end-of-run summary, which names positions, never people.
+    logs = [record["message"] for record in records if record.get("kind") == "log"]
+    assert logs == ["scan 1/2: 4 landmarks placed", "scan 2/2: 4 landmarks placed"]
     text = events_file.read_text()
     assert "Smith" not in text and "Jones" not in text
 

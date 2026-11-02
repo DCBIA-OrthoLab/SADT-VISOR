@@ -77,6 +77,10 @@ def run(
     output_suffix: str = "Or",
     max_triplets: int = 2500,
     seed: int = 0,
+    # Last, so no positional caller's argument shifts. Nothing ticked by
+    # default: each extra output is for a reader who asked for it. Spelled out
+    # because `Literal` takes literals only; a test pins it to `catalogs`.
+    outputs: list[Literal["Metrics spreadsheet (.xlsx + .csv)"]] = [],
     *,
     sup=None,
     data_root=None,
@@ -140,6 +144,10 @@ def run(
             running ICP. Lower is faster and less thorough; it changes the
             result, so the run report records it.
         seed: Seed for that search, so a run is reproducible.
+        outputs: What to hand back beside the oriented scans. Metrics
+            spreadsheet: what each orientation measured, one row per scan and
+            one per landmark or tooth, as `ASO_metrics.xlsx` and `.csv` files
+            beside `ASO_report.json`, which lists them.
 
     Returns:
         The output directory, holding the oriented cases and the run report.
@@ -170,6 +178,7 @@ def run(
         output_suffix=output_suffix,
         max_triplets=max_triplets,
         seed=seed,
+        outputs=outputs,
         sup=sup,
     )
     return output_dir

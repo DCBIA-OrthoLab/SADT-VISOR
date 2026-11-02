@@ -240,5 +240,6 @@ LAYOUT = {
 
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
     "outputs": catalogs.outputs_layout(_OUTPUTS, catalogs.OUTPUT_T1_SCAN,
-                                       catalogs.OUTPUT_ORIENTATION_LANDMARKS),
+                                       catalogs.OUTPUT_ORIENTATION_LANDMARKS,
+                                       catalogs.OUTPUT_METRICS),
 }

@@ -32,8 +32,8 @@ from collections import Counter
 
 from sadt_areg_common.errors import ToolInputError
 
-from sadt_areg_common import catalogs, pairing
-from . import dicom, progress, tools
+from sadt_areg_common import catalogs, metrics_table, pairing
+from . import dicom, metrics, progress, tools
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +497,9 @@ def _run_cbct(
         cause = entry.pop("cause", None)
         report["patients"][key]["regions"][code] = entry
         if entry.get("status") != "failed":
+            # Here, in the listed order, and not in the worker: the worker
+            # does not know which patient of the run it registered.
+            metrics.report_metrics(metrics.header(position[key], total, entry), entry)
             continue
         kind = kind or "RegistrationError"
         logger.warning("subject %d of %d: %s registration failed (%s: %s)",
@@ -654,6 +657,48 @@ def _as_directory(path: str, destination: str) -> str:
     return destination
 
 
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as a table, read off the report it already wrote.
+
+    `cases`: one row per patient and region, the numbers the console showed:
+    the optimiser's cost at the finest resolution, where it started and where
+    it ended, the iterations it took, and the rigid transform applied. No
+    landmark table: there are no landmarks on both timepoints.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient:
+    this file stays with the caller's own results.
+    """
+    cases = []
+    for patient, entry in (report.get("patients") or {}).items():
+        for code, detail in (entry.get("regions") or {}).items():
+            row = {"patient": patient,
+                   "region": detail.get("region") or catalogs.region_name(code),
+                   "status": detail.get("status")}
+            if detail.get("status") == "failed":
+                row["error"] = detail.get("reason")
+                cases.append(row)
+                continue
+            row["engine"] = detail.get("engine")
+            cost = detail.get("registration_cost") or {}
+            resolutions = cost.get("resolutions") or []
+            if resolutions:
+                row["cost_metric"] = cost.get("metric", metrics.METRIC)
+                row["cost_computed_on"] = cost.get("computed_on")
+                milestones = resolutions[-1].get("milestones") or []
+                if milestones:
+                    row["cost_start"] = milestones[0][1]
+                    row["cost_end"] = milestones[-1][1]
+                row["iterations_finest"] = resolutions[-1].get("iterations")
+                row["iterations_total"] = sum(
+                    level.get("iterations", 0) for level in resolutions)
+            rigid = detail.get("rigid_transform") or {}
+            row["rotation_deg"] = rigid.get("rotation_deg")
+            row["translation_mm"] = rigid.get("translation_mm")
+            cases.append(row)
+    return {"cases": cases}
+
+
 def _summarize(report: dict, failures=()) -> None:
     statuses = [entry.get("status") for entry in report["patients"].values()]
     report["summary"] = {
@@ -775,6 +820,10 @@ def register(
     shutil.rmtree(work_dir, ignore_errors=True)
 
     _summarize(report, failures)
+    if catalogs.OUTPUT_METRICS in set(outputs or ()):
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
     _raise_if_nothing_registered(report, failures)

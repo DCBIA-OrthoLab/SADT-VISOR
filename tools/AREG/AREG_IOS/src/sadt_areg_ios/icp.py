@@ -33,10 +33,12 @@ class RegistrationError(Exception):
     """One patient could not be registered. Reported, and the batch goes on."""
 
 
-def align(source: vtk.vtkPolyData, target: vtk.vtkPolyData) -> np.ndarray:
+def align(source: vtk.vtkPolyData, target: vtk.vtkPolyData, stats: dict = None) -> np.ndarray:
     """The 4x4 matrix moving `source`'s points onto `target`'s.
 
     Both are the vertex-only patch clouds `butterfly.patch_cloud` builds.
+    `stats`, when given, receives what the alignment itself measured and
+    `measure` cannot recompute: the number of iterations it ran.
     """
     if source.GetNumberOfPoints() == 0 or target.GetNumberOfPoints() == 0:
         raise RegistrationError("one of the two patches holds no point")
@@ -53,7 +55,57 @@ def align(source: vtk.vtkPolyData, target: vtk.vtkPolyData) -> np.ndarray:
     matrix = surfaces.matrix_from_vtk(icp.GetMatrix())
     if not np.all(np.isfinite(matrix)):
         raise RegistrationError("the alignment did not converge to a usable transform")
+    if stats is not None:
+        # GetMeanDistance is NOT reported: without CheckMeanDistanceOn, which
+        # this alignment never set, VTK leaves it at 0, and even with it on it
+        # is how far the points moved in the last iteration, not how far they
+        # are from the target. The iteration count is real, and with no
+        # stopping test it is always MAX_ITERATIONS.
+        stats["iterations"] = int(icp.GetNumberOfIterations())
     return matrix
+
+
+def _nearest_distances(points: np.ndarray, target: vtk.vtkPolyData) -> np.ndarray:
+    """Distance from each of `points` to the closest point of `target`, in mm."""
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(target)
+    locator.BuildLocator()
+    target_points = surfaces.points_of(target)
+    nearest = np.fromiter((locator.FindClosestPoint(point) for point in points),
+                          dtype=np.int64, count=len(points))
+    return np.linalg.norm(points - target_points[nearest], axis=1)
+
+
+def measure(source: vtk.vtkPolyData, target: vtk.vtkPolyData, matrix: np.ndarray,
+            iterations: int = None) -> dict:
+    """How far `source`'s patch sits from `target`'s, before and after `matrix`.
+
+    The cost `vtkIterativeClosestPointTransform` minimises is the mean squared
+    distance from every source point to its closest target point (rigid, all
+    points kept, none rejected). It exposes no history of it, so it is
+    evaluated here where it starts -- the source translated onto the target's
+    centroid, as `StartByMatchingCentroidsOn` does before the first iteration --
+    and where it ends, the source moved by `matrix`. The final distances
+    themselves, unsquared, are the surface distance after registration.
+    """
+    points = surfaces.points_of(source)
+    target_points = surfaces.points_of(target)
+    start = points + (target_points.mean(axis=0) - points.mean(axis=0))
+    moved = points @ matrix[:3, :3].T + matrix[:3, 3]
+
+    before = _nearest_distances(start, target)
+    after = _nearest_distances(moved, target)
+    return {
+        "cost": "point-to-point",
+        # [(iteration, mean squared distance in mm^2)], first and last.
+        "cost_milestones": [(0, round(float(np.mean(before ** 2)), 4)),
+                            (int(iterations or 0), round(float(np.mean(after ** 2)), 4))],
+        "iterations": iterations,
+        "surface_mean_mm": round(float(np.mean(after)), 4),
+        "surface_std_mm": round(float(np.std(after)), 4),
+        "surface_max_mm": round(float(np.max(after)), 4),
+        "points": int(len(points)),
+    }
 
 
 # ---------------------------------------------------------------------------

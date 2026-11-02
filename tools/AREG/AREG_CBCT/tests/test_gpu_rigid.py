@@ -72,17 +72,17 @@ def test_the_steps_are_the_ones_measured_against_elastix():
 
 def test_without_a_card_the_registration_is_elastixs(monkeypatch):
     monkeypatch.setattr(gpu_rigid, "available", lambda: False)
-    monkeypatch.setattr(elastix, "register", lambda fixed, moving: "elastix transform")
+    monkeypatch.setattr(elastix, "register", lambda fixed, moving, cost=None: "elastix transform")
     assert pipeline._register(None, None) == ("elastix transform", "elastix")
 
 
 def test_a_failure_on_the_card_falls_back_to_elastix(monkeypatch):
-    def out_of_memory(fixed, moving):
+    def out_of_memory(fixed, moving, cost=None):
         raise RuntimeError("CUDA out of memory")
 
     monkeypatch.setattr(gpu_rigid, "available", lambda: True)
     monkeypatch.setattr(gpu_rigid, "register", out_of_memory)
-    monkeypatch.setattr(elastix, "register", lambda fixed, moving: "elastix transform")
+    monkeypatch.setattr(elastix, "register", lambda fixed, moving, cost=None: "elastix transform")
     assert pipeline._register(None, None) == ("elastix transform", "elastix")
 
 

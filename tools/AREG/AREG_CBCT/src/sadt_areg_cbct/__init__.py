@@ -132,7 +132,8 @@ def run(
     # one "Extra outputs" box whose options follow the mode. Nothing ticked by
     # default: a scan is the heaviest file of a run.
     outputs: list[Literal["T1 scan (oriented when orientation is on)",
-                          "Orientation landmarks (ASO)"]] = [],
+                          "Orientation landmarks (ASO)",
+                          "Metrics spreadsheet (.xlsx + .csv)"]] = [],
     num_workers: int = 0,
     *,
     sup=None,
@@ -195,8 +196,11 @@ def run(
             onto; when it was oriented first, the copy under `T1_Oriented/`
             rather than a second copy. Orientation landmarks (ASO): the
             landmarks ASO oriented the T1 on, beside that copy; none when the
-            T1 was not oriented. Each registration's `_scene.json` lists what
-            was written.
+            T1 was not oriented. Metrics spreadsheet: what each registration
+            measured (the optimiser's cost, its iterations, the rigid
+            transform applied), one row per patient and region, as
+            `AREG_metrics.xlsx` and `.csv` beside `AREG_report.json`. Each
+            registration's `_scene.json` lists the 3D files written.
         num_workers: How many registrations to run at once. Left at 0 the
             server decides, from what one registration was measured to cost.
 

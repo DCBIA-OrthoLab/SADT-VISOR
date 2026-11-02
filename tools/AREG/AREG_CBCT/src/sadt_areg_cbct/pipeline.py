@@ -32,7 +32,7 @@ import numpy as np
 import SimpleITK as sitk
 
 from sadt_areg_common import catalogs, pairing, scene
-from . import elastix, gpu_rigid
+from . import elastix, gpu_rigid, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,8 @@ def register_patient(
     masked, note = elastix.apply_mask(fixed, mask, label=segmentation_label)
 
     moving = _read(t2_path, "T2 scan")
-    transform, engine = _register(masked, moving)
+    cost = []
+    transform, engine = _register(masked, moving, cost)
 
     # The T2's own size, spacing and direction, in the T1's frame -- placed where
     # the T2 now IS. (Resampling onto the T1 grid instead would crop the T2 to the
@@ -150,11 +151,27 @@ def register_patient(
     }
     if note:
         entry["note"] = note
+    # What the registration measured, for the user's console (see `metrics`):
+    # the optimiser's own cost and the transform it settled on.
+    region_label = catalogs.region_name(region).lower()
+    if segmentation_label:
+        computed_on = f"label {segmentation_label} of the {region_label} mask"
+    elif note:
+        computed_on = f"the {region_label} mask, all its labels"
+    else:
+        computed_on = f"the {region_label} mask"
+    summary = metrics.summarise_cost(cost, engine, computed_on)
+    if summary:
+        entry["registration_cost"] = summary
+    entry["rigid_transform"] = metrics.rigid_motion(transform)
     return entry
 
 
-def _register(masked: sitk.Image, moving: sitk.Image) -> tuple:
+def _register(masked: sitk.Image, moving: sitk.Image, cost: list = None) -> tuple:
     """`(transform, engine)`: on the card when there is one, elastix otherwise.
+
+    `cost`, when a list, receives the engine that answered's per-iteration
+    cost, one list per resolution (see each engine's `register`).
 
     The GPU engine solves the same problem four times faster (see `gpu_rigid`).
     A failure there -- the card full of other runs, a driver error -- falls
@@ -163,10 +180,13 @@ def _register(masked: sitk.Image, moving: sitk.Image) -> tuple:
     """
     if gpu_rigid.available():
         try:
-            return gpu_rigid.register(masked, moving), "gpu"
+            return gpu_rigid.register(masked, moving, cost=cost), "gpu"
         except Exception as exc:  # noqa: BLE001 - elastix is the fallback, not the patient's failure
             logger.warning("GPU registration failed (%s); registering with elastix", elastix.describe(exc))
-    return elastix.register(masked, moving), "elastix"
+            if cost is not None:
+                # The levels the card finished belong to an answer not kept.
+                del cost[:]
+    return elastix.register(masked, moving, cost=cost), "elastix"
 
 
 def register_all(jobs: list, width: int, on_done=None) -> list:

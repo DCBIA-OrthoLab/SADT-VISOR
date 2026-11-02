@@ -124,4 +124,8 @@ LAYOUT = {
 
     # -- Outputs ------------------------------------------------------------
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
+    "outputs": {
+        "section": _OUTPUTS, "label": catalogs.OUTPUT_LABEL, "note": catalogs.OUTPUT_NOTE,
+        "option_help": dict(catalogs.OUTPUT_HELP),
+    },
 }

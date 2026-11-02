@@ -184,7 +184,8 @@ def run(
     # each of these is for a reader who asked for it. Spelled out because
     # `Literal` takes literals only; a test pins it to `catalogs`.
     outputs: list[Literal["Registration landmarks (IOS + CBCT)", "Orientation landmarks (ASO)",
-                          "CBCT scan", "Transform (.tfm)"]] = [],
+                          "CBCT scan", "Transform (.tfm)",
+                          "Metrics spreadsheet (.xlsx + .csv)"]] = [],
     *,
     sup=None,
 ) -> Path:
@@ -239,7 +240,10 @@ def run(
             landmarks used. Orientation landmarks (ASO): the landmarks ASO
             oriented the CBCT on, when the run oriented it. CBCT scan:
             the CBCT the meshes were registered onto. Transform (.tfm): each
-            registration as a `.tfm`. Each patient's `scene.json` lists what was written.
+            registration as a `.tfm`. Metrics spreadsheet: what each
+            registration measured, one row per arch and one per landmark, as
+            `AREG_metrics.xlsx` and `.csv` beside the report. Each patient's
+            `scene.json` lists what was written.
 
     Returns:
         The output directory.

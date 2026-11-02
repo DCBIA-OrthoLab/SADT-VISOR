@@ -28,10 +28,11 @@ import json
 import logging
 import os
 import shutil
+import statistics
 
 from sadt_areg_common.errors import ToolInputError
 
-from sadt_areg_common import catalogs, pairing
+from sadt_areg_common import catalogs, metrics_table, pairing
 from . import progress, tools
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,116 @@ def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
         progress.log(message, level=level, user=user)
 
 
+def _spread(values) -> str:
+    """`mean ± std mm` for a list of distances (the population std)."""
+    values = [float(value) for value in values]
+    return "{:.2f} ± {:.2f} mm".format(statistics.fmean(values), statistics.pstdev(values))
+
+
+def metric_lines(entry: dict) -> list:
+    """What the registration measured, one quantity per line, for the user.
+
+    - The ICP's cost, the mean squared point-to-point distance in mm^2 from
+      each point of the T2 patch to the closest point of the T1 patch: what
+      `vtkIterativeClosestPointTransform` minimises. VTK keeps no history of
+      it, so it is given where the ICP started (centroids matched) and where
+      it ended.
+    - The surface distance after registration: those same closest-point
+      distances, unsquared, mean ± standard deviation. The VTK ICP keeps every
+      point, so there is no share of matched points to report.
+    - With the mucogingival band, the landmark displacement T1 to T2 after
+      registration: each T2 landmark moved by the registration, against the
+      T1 landmark of the same label; mean ± standard deviation and the
+      landmark furthest from its T1 position.
+
+    Numbers and landmark names only, never a file name.
+    """
+    lines = []
+    metrics = entry.get("metrics") or {}
+    fit = metrics.get("icp") or {}
+    milestones = fit.get("cost_milestones") or []
+    if milestones:
+        # No iteration count: this ICP has no stopping test and always runs
+        # its fixed maximum, which says nothing about the case. Two values,
+        # start and end, since VTK keeps no history in between.
+        lines.append("ICP cost, mean squared {} distance: {:.4f} at the start > {:.4f} "
+                     "at the end mm²".format(fit.get("cost", "point-to-point"),
+                                            milestones[0][1], milestones[-1][1]))
+    if fit.get("surface_mean_mm") is not None:
+        lines.append("surface distance after registration: {:.2f} ± {:.2f} mm".format(
+            fit["surface_mean_mm"], fit["surface_std_mm"]))
+    moved = metrics.get("landmark_displacement") or {}
+    distances, labels = moved.get("distances_mm") or [], moved.get("labels") or []
+    if distances:
+        worst = max(range(len(distances)), key=distances.__getitem__)
+        lines.append("landmark displacement T1 to T2 after registration: {}, "
+                     "max {:.2f} mm ({}), {} pairs".format(
+                         _spread(distances), distances[worst], labels[worst], len(distances)))
+    return lines
+
+
+# The region a report's `patch` names, as one word a spreadsheet filters on.
+_REGION = {catalogs.PATCH_PALATE: "palate", catalogs.PATCH_MGL: "mucogingival"}
+
+
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as two tables, read off the report it already wrote.
+
+    `cases`: one row per patient, the numbers `metric_lines` showed.
+    `landmarks`: one row per patient and landmark, the distance from its T1
+    position once T2 is registered. Only the mucogingival band reads
+    landmarks, so on the palate this table is empty and `metrics_table.write`
+    leaves its sheet out.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient
+    key: this file stays with the caller's own results.
+    """
+    region = _REGION.get(report.get("patch"))
+    cases, landmarks = [], []
+    for patient, entry in (report.get("patients") or {}).items():
+        row = {"patient": patient, "status": entry.get("status")}
+        if region:
+            row["region"] = region
+        if entry.get("status") == "failed":
+            row["error"] = entry.get("reason") or entry.get("error")
+            cases.append(row)
+            continue
+        metrics = entry.get("metrics") or {}
+        fit = metrics.get("icp") or {}
+        milestones = fit.get("cost_milestones") or []
+        if milestones:
+            row["icp_cost"] = fit.get("cost", "point-to-point")
+            row["icp_cost_start_mm2"] = milestones[0][1]
+            row["icp_cost_end_mm2"] = milestones[-1][1]
+        if fit.get("surface_mean_mm") is not None:
+            row["surface_mean_mm"] = fit["surface_mean_mm"]
+            row["surface_std_mm"] = fit.get("surface_std_mm")
+        moved = metrics.get("landmark_displacement") or {}
+        distances, labels = moved.get("distances_mm") or [], moved.get("labels") or []
+        if distances:
+            values = [float(value) for value in distances]
+            worst = max(range(len(values)), key=values.__getitem__)
+            row["landmark_displacement_mean_mm"] = statistics.fmean(values)
+            row["landmark_displacement_std_mm"] = statistics.pstdev(values)
+            row["landmark_displacement_max_mm"] = values[worst]
+            row["landmark_displacement_max_label"] = labels[worst]
+            for label, distance in zip(labels, values):
+                landmarks.append({"patient": patient, "landmark": label,
+                                  "displacement_mm": distance})
+        cases.append(row)
+    return {"cases": cases, "landmarks": landmarks}
+
+
+def report_metrics(here: str, entry: dict) -> None:
+    """Send `metric_lines` to the user, under one line saying which subject."""
+    lines = metric_lines(entry)
+    if lines:
+        progress.log(here, level="metric", user=True)
+    for line in lines:
+        progress.log(line, level="metric", user=True)
+
+
 def _run_ios(
     t1_root, t2_root, automation, registration_model, crown_model, mgl_model, orientation_reference,
     ios_patch, mgl_landmarks_path, mgl_patch_height,
@@ -359,6 +470,8 @@ def _run_ios(
                 prior_transforms=prior_transforms,
                 position=f"subject {index} of {total}",
             )
+            # The header AREG IOS-CBCT uses, so every registration reads alike.
+            report_metrics(f"patient {index}/{total}", report["patients"][key])
         except (
             icp.RegistrationError,
             surfaces.SurfaceError,
@@ -565,6 +678,7 @@ def register(
     output_dir: str = None,
     sup=None,
     registration_model_named: bool = True,
+    outputs=(),
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
@@ -574,6 +688,10 @@ def register(
     `registration_model_named` is False when the deployment filled
     `registration_model` itself, which makes a broken bundle a server fault
     rather than a bad request.
+
+    `outputs` is the Extra outputs ticked: with `catalogs.OUTPUT_METRICS`,
+    `metric_tables` is written beside the report and listed in it as
+    `metrics_files`.
 
     Raises RuntimeError (ToolInputError when every failure was the caller's)
     when no subject at all could be registered.
@@ -629,6 +747,10 @@ def register(
     shutil.rmtree(work_dir, ignore_errors=True)
 
     _summarize(report, failures)
+    if catalogs.OUTPUT_METRICS in set(outputs or ()):
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
     return RegistrationRun(output_dir, report)
@@ -649,6 +771,7 @@ def main(
     output_dir=None,
     sup=None,
     data_root=None,
+    outputs=(),
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -711,6 +834,7 @@ def main(
         output_dir=output_dir,
         sup=sup,
         registration_model_named=registration_model_named,
+        outputs=outputs,
     )
 
     return run.output_dir

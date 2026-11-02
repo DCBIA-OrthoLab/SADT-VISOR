@@ -155,4 +155,5 @@ LAYOUT = {
     },
 
     "output_suffix": {"section": _OUTPUTS, "label": "Output suffix"},
+    "outputs": catalogs.outputs_layout(_OUTPUTS, catalogs.OUTPUT_METRICS),
 }

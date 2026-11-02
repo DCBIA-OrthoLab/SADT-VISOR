@@ -42,9 +42,13 @@ import os
 import shutil
 from collections import Counter
 
+import numpy as np
+
 from . import catalogs
 from . import markups
+from . import metrics_table
 from . import progress
+from . import user_metrics
 from sadt_naming import split_extension as split_scan_extension
 from .cbct import dicom
 from .cbct import pipeline as cbct_pipeline
@@ -130,6 +134,7 @@ def orient(
     sup=None,
     frame: str = catalogs.FRAME_FROM_LANDMARKS,
     data_root=None,
+    outputs=None,
 ) -> OrientationRun:
     """Orient every case under `input_path` onto `reference_path`.
 
@@ -138,8 +143,12 @@ def orient(
 
     Every cross-argument rule is checked BEFORE any file is read: a request that
     cannot work has to come back in a second, not after minutes of registration.
+
+    `outputs` are the `catalogs.OUTPUT_*` the caller ticked; the oriented scans
+    and the report are written whatever it holds.
     """
     modality, automation = str(modality), str(automation)
+    outputs = set(_selected(outputs, catalogs.OUTPUT_CHOICES, "outputs"))
     occlusion = str(ios_occlusion or catalogs.OCCLUSION_INDEPENDENT)
     suffix = (output_suffix or "Or").strip() or "Or"
     if os.sep in suffix or (os.altsep and os.altsep in suffix):
@@ -285,10 +294,131 @@ def orient(
         shutil.rmtree(work_dir, ignore_errors=True)
 
     _summarize(report, input_faults)
+    if catalogs.OUTPUT_METRICS in outputs:
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
 
     return OrientationRun(output_dir, report)
+
+
+# ---------------------------------------------------------------------------
+# Metrics spreadsheet
+# ---------------------------------------------------------------------------
+
+# Column prefix of each step the engines measure after, in the order they run.
+_STAGE_KEYS = {
+    user_metrics.STEP_OCCLUSAL_PLANE: "occlusal_plane",
+    user_metrics.STEP_THREE_POINT: "three_point_fit",
+    user_metrics.STEP_ORIENTATION: "orientation",
+}
+
+
+def _stage_key(after: str) -> str:
+    """The short column prefix of a stage, a slug of its name if it is new."""
+    if after in _STAGE_KEYS:
+        return _STAGE_KEYS[after]
+    return "_".join("".join(c if c.isalnum() else " " for c in str(after).lower()).split())
+
+
+def _yes_no(value) -> str:
+    # Spelled out rather than left a bool: the .csv would read True/False and
+    # the .xlsx yes/no, and the two are meant to be the same table.
+    return "yes" if value else "no"
+
+
+def _scans(report: dict):
+    """`(patient, jaw or None, scan entry)` for each scan the report holds.
+
+    A CBCT case is one scan; an IOS case is one scan per jaw. An IOS case
+    that failed before any jaw was looked at is one scan with no jaw.
+    """
+    ios = report.get("modality") == catalogs.MODALITY_IOS
+    for patient, entry in sorted((report.get("cases") or {}).items()):
+        jaws = entry.get("jaws") if ios else None
+        if not jaws:
+            yield patient, ("" if ios else None), entry
+            continue
+        for jaw, detail in jaws.items():
+            yield patient, jaw, detail
+
+
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as two tables, read off the report it already wrote.
+
+    `cases`: one row per scan (per jaw for IOS), the numbers the console
+    showed: for each stage the mean, population std and maximum of the point
+    distances to the reference, and which point was furthest.
+    `landmarks`: one row per scan and point -- landmark or tooth centroid --
+    with its distance after each stage, and the points left out of the fit
+    with the reason.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient:
+    this file stays with the caller's own results.
+    """
+    modality = report.get("modality")
+    scans = list(_scans(report))
+    # Every stage any scan was measured after, in the order they run, so the
+    # columns come out in that order whichever scan is first in the table.
+    seen = {_stage_key(stage.get("after"))
+            for _patient, _jaw, detail in scans
+            for stage in (detail.get("metrics") or {}).get("stages") or []}
+    stage_keys = [key for key in _STAGE_KEYS.values() if key in seen]
+    stage_keys += sorted(seen - set(stage_keys))
+
+    cases, points = [], []
+    for patient, jaw, detail in scans:
+        where = {"patient": patient}
+        if jaw is not None:
+            where["jaw"] = jaw
+        row = dict(where, modality=modality, status=detail.get("status"),
+                   error=detail.get("reason") if detail.get("status") == "failed" else None)
+        metrics = detail.get("metrics") or {}
+        if detail.get("status") != "ok" or not metrics:
+            cases.append(row)
+            continue
+
+        labels = list(metrics.get("labels") or [])
+        left_out = dict(metrics.get("left_out") or {})
+        if labels:
+            row["points"] = (metrics.get("points") or user_metrics.POINTS_LANDMARK)[1]
+            row["n_points"] = len(labels)
+        row["left_out"] = ", ".join(sorted(left_out))
+        by_stage = {}
+        for stage in metrics.get("stages") or []:
+            values = stage.get("distances_mm") or []
+            if values and len(values) == len(labels):
+                by_stage[_stage_key(stage.get("after"))] = (values, bool(stage.get("centred")))
+        for key in stage_keys:
+            values = by_stage.get(key, (None,))[0]
+            worst = int(np.argmax(values)) if values else None
+            row[key + "_mean_mm"] = float(np.mean(values)) if values else None
+            row[key + "_std_mm"] = float(np.std(values)) if values else None
+            row[key + "_max_mm"] = float(values[worst]) if values else None
+            row[key + "_max_label"] = labels[worst] if values else None
+        row["centres_matched"] = (_yes_no(any(centred for _v, centred in by_stage.values()))
+                                  if by_stage else None)
+        row["icp_rms_closest_mm"] = (metrics.get("icp") or {}).get("rms_closest_mm")
+        row["rotation_deg"] = metrics.get("rotation_deg")
+        row["translation_mm"] = metrics.get("translation_mm")
+        row["moved_with"] = metrics.get("moved_with")
+        cases.append(row)
+
+        for index, label in enumerate(labels):
+            point = dict(where, point=label)
+            for key in stage_keys:
+                values = by_stage.get(key, (None,))[0]
+                point[key + "_mm"] = float(values[index]) if values else None
+            point["in_fit"] = _yes_no(True)
+            point["left_out_because"] = None
+            points.append(point)
+        for label in sorted(left_out):
+            points.append(dict(where, point=label, in_fit=_yes_no(False),
+                               left_out_because=left_out[label]))
+    return {"cases": cases, "landmarks": points}
 
 
 # ---------------------------------------------------------------------------
@@ -972,6 +1102,10 @@ def _run_cbct(
                 max_triplets=max_triplets,
                 seed=seed,
             )
+            # Its position in the cohort, never its key: the key is the scan's name.
+            user_metrics.report_metrics(
+                f"patient {position[key]}/{total}", report["cases"][key].get("metrics")
+            )
         except (cbct_pipeline.icp.RegistrationError, RuntimeError, OSError) as exc:
             failed(key, step, f"{type(exc).__name__}: {exc}"
                    if not isinstance(exc, cbct_pipeline.icp.RegistrationError) else str(exc))
@@ -1031,6 +1165,12 @@ def _run_ios(
             cache=cache,
             patient=(index, len(patients)),
         )
+        for jaw, outcome in report["cases"][key]["jaws"].items():
+            if outcome.get("status") == "ok":
+                user_metrics.report_metrics(
+                    f"patient {index}/{len(patients)}, {jaw.lower()} jaw",
+                    outcome.get("metrics"),
+                )
 
     # Unconditional now. It only fires when EVERY jaw failed for want of tooth
     # labels, which can only happen on the centroid path -- there is no mode to

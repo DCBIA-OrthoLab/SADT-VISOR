@@ -28,7 +28,7 @@ from sadt_areg_ioscbct import pipeline, run
 # orientation landmarks are tested on their own below.
 EVERYTHING = [catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_CBCT_SCAN, catalogs.OUTPUT_TRANSFORMS]
 OFFERED = [catalogs.OUTPUT_LANDMARKS, catalogs.OUTPUT_ORIENTATION_LANDMARKS,
-           catalogs.OUTPUT_CBCT_SCAN, catalogs.OUTPUT_TRANSFORMS]
+           catalogs.OUTPUT_CBCT_SCAN, catalogs.OUTPUT_TRANSFORMS, catalogs.OUTPUT_METRICS]
 
 
 def _folder(tmp_path):
@@ -188,3 +188,14 @@ def test_both_arches_share_one_copy_of_the_cbct_landmarks(tmp_path):
         "P_0001_T2_lm_Pred.mrk.json"]
     assert sorted(path for path, role in roles if role == "registered") == [
         "P001_T2_L_Reg.vtk", "P001_T2_U_Reg.vtk"]
+
+
+def test_the_metrics_spreadsheet_is_written_beside_the_report_only_when_asked(tmp_path):
+    cohort(tmp_path)
+    run_registration(tmp_path, outputs=[])
+    assert not any("metrics" in name for name in os.listdir(tmp_path / "out"))
+
+    cohort(tmp_path / "again")
+    run_registration(tmp_path / "again", outputs=[catalogs.OUTPUT_METRICS])
+    written = sorted(name for name in os.listdir(tmp_path / "again" / "out") if "metrics" in name)
+    assert written == ["AREG_metrics.xlsx", "AREG_metrics_cases.csv", "AREG_metrics_landmarks.csv"]
