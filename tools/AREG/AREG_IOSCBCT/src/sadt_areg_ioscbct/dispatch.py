@@ -21,7 +21,7 @@ import time
 
 import numpy as np
 
-from sadt_areg_common import catalogs, pairing, scene
+from sadt_areg_common import catalogs, metrics_table, pairing, scene
 from sadt_areg_common.errors import ToolInputError
 
 from . import geometry, pipeline, progress, tools, where
@@ -50,10 +50,22 @@ def _read_mesh(path: str):
 
 
 def _write_mesh(mesh, path: str) -> None:
+    import vtk
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Through the VTK writer rather than `mesh.save`, which cannot set the
+    # header: Slicer reads a .vtk without a SPACE= line as LPS and warns about
+    # it on every load, and saying LPS keeps exactly that reading.
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetHeader("SPACE=LPS")
     # Binary, not ASCII: it round-trips float32 exactly, while ASCII prints six
     # significant digits, and it parses far faster.
-    mesh.save(path, binary=True)
+    writer.SetFileTypeToBinary()
+    writer.SetFileName(path)
+    writer.SetInputData(mesh)
+    if writer.Write() != 1:
+        raise RuntimeError(f"VTK could not write the registered mesh (error code "
+                           f"{writer.GetErrorCode()})")
 
 
 def _cbct_surface(scan_path: str, landmark_sets: dict):
@@ -179,6 +191,157 @@ def _arch(mesh_path: str):
     if found & {"l", "lower"}:
         return "L"
     return None
+
+
+def _spread(values) -> str:
+    """`mean ± std mm` for a list of distances (the population std)."""
+    values = np.asarray(values, dtype=float)
+    return "{:.2f} ± {:.2f} mm".format(float(np.mean(values)), float(np.std(values)))
+
+
+def metric_lines(detail: dict) -> list:
+    """What the registration measured, one quantity per line, for the user.
+
+    - Every landmark the rigid fit left out, and why: not on a tooth in the
+      CBCT, too far from where the others put it, or missing on one side.
+    - The landmark pairs, IOS to CBCT, after the rigid landmark fit and after
+      the ICP: mean ± standard deviation of the Euclidean distances, and the
+      pair furthest apart. This is the check the surface fit does not grade
+      itself on.
+    - The ICP's own cost, the mean squared point-to-plane distance in mm^2,
+      at the iterations where it fell: the quantity it minimises.
+    - Where the crowns ended up: the distance from each crown point kept to
+      the CBCT surface, mean ± standard deviation, and the share kept.
+
+    Numbers and landmark names only, never a file name.
+    """
+    lines = []
+    icp = detail.get("icp") or {}
+    gaps = icp.get("landmark_gaps") or {}
+    if not gaps and rigid_gaps(detail):
+        # No ICP: the per-pair distances after the rigid fit are all there is.
+        gaps = {"labels": detail["rigid_fit_gaps"]["labels"],
+                "before_mm": detail["rigid_fit_gaps"]["mm"]}
+    labels = gaps.get("labels") or []
+    pre = detail.get("prealignment") or {}
+    # What the fit was not made on, first: it is what the next lines exclude.
+    for label, why in sorted((pre.get("landmarks_excluded") or {}).items()):
+        lines.append("{} left out of the rigid fit: {}".format(label, why))
+    for label, side in sorted((detail.get("landmarks_missing") or {}).items()):
+        lines.append("{} left out of the rigid fit: not found on the {} side".format(label, side))
+    if labels:
+        for when, key in (("rigid landmark fit", "before_mm"), ("ICP", "after_mm")):
+            values = gaps.get(key) or []
+            if not values:
+                continue
+            worst = int(np.argmax(values))
+            lines.append("landmark distance after the {}: {}, max {:.2f} mm ({}), {} pairs".format(
+                when, _spread(values), values[worst], labels[worst], len(values)))
+    elif pre.get("residual_mm") is not None:
+        fitted = len(pre.get("landmarks_fitted") or [])
+        lines.append("landmark distance after the rigid landmark fit: {:.2f} mm RMS, "
+                     "{} pairs{}".format(pre["residual_mm"], fitted,
+                                         "" if pre.get("accepted") else ", too far apart to be used"))
+    milestones = icp.get("cost_milestones") or []
+    if milestones:
+        lines.append("ICP cost, mean squared {} distance: {} mm², {} iterations".format(
+            icp.get("cost", "point-to-plane"),
+            " > ".join("{:.4f}".format(cost) for _i, cost in milestones),
+            milestones[-1][0] + 1))
+    mean, std = icp.get("surface_mean_mm"), icp.get("surface_std_mm")
+    if mean is not None and np.isfinite(mean):
+        lines.append("crown to CBCT surface distance: {:.2f} ± {:.2f} mm, over {:.0%} "
+                     "of the crown points".format(mean, std, icp.get("fitness", 0.0)))
+    return lines
+
+
+def _stats(values) -> dict:
+    values = np.asarray(values, dtype=float)
+    return {"mean_mm": float(np.mean(values)), "std_mm": float(np.std(values)),
+            "max_mm": float(np.max(values))}
+
+
+def rigid_gaps(detail: dict) -> bool:
+    return bool((detail.get("rigid_fit_gaps") or {}).get("mm"))
+
+
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as two tables, read off the report it already wrote.
+
+    `cases`: one row per patient and arch, the numbers the console showed.
+    `landmarks`: one row per patient, arch and landmark, for the statistics
+    per landmark -- used or left out of the rigid fit, and its distance to
+    its CBCT counterpart after the fit and after the ICP.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient:
+    this file stays with the caller's own results.
+    """
+    cases, landmarks = [], []
+    for patient, entry in (report.get("patients") or {}).items():
+        for mesh, detail in (entry.get("meshes") or {}).items():
+            arch = _arch(mesh) or ""
+            row = {"patient": patient, "arch": arch, "status": detail.get("status")}
+            if detail.get("status") == "failed":
+                row["error"] = detail.get("error")
+                cases.append(row)
+                continue
+            pre = detail.get("prealignment") or {}
+            icp = detail.get("icp") or {}
+            gaps = icp.get("landmark_gaps") or {}
+            excluded = dict(pre.get("landmarks_excluded") or {})
+            for label, side in (detail.get("landmarks_missing") or {}).items():
+                excluded[label] = "not found on the {} side".format(side)
+            row["landmarks_in_fit"] = len(pre.get("landmarks_fitted") or [])
+            row["landmarks_left_out"] = ", ".join(sorted(excluded))
+            if not gaps and rigid_gaps(detail):
+                gaps = {"labels": detail["rigid_fit_gaps"]["labels"],
+                        "before_mm": detail["rigid_fit_gaps"]["mm"]}
+            for prefix, key in (("rigid_fit", "before_mm"), ("after_icp", "after_mm")):
+                if gaps.get(key):
+                    stats = _stats(gaps[key])
+                    row[prefix + "_landmark_mean_mm"] = stats["mean_mm"]
+                    row[prefix + "_landmark_std_mm"] = stats["std_mm"]
+                    row[prefix + "_landmark_max_mm"] = stats["max_mm"]
+                    row[prefix + "_landmark_max_label"] = gaps["labels"][int(np.argmax(gaps[key]))]
+            if not gaps and pre.get("residual_mm") is not None:
+                row["rigid_fit_landmark_rms_mm"] = pre["residual_mm"]
+            milestones = icp.get("cost_milestones") or []
+            if milestones:
+                row["icp_cost"] = icp.get("cost")
+                row["icp_cost_start_mm2"] = milestones[0][1]
+                row["icp_cost_end_mm2"] = milestones[-1][1]
+                row["icp_iterations"] = milestones[-1][0] + 1
+            if icp:
+                row["surface_mean_mm"] = icp.get("surface_mean_mm")
+                row["surface_std_mm"] = icp.get("surface_std_mm")
+                row["crown_points_matched_pct"] = 100.0 * float(icp.get("fitness") or 0.0)
+            if detail.get("review"):
+                row["review"] = detail["review"]
+            cases.append(row)
+
+            rigid = detail.get("rigid_fit_gaps") or {}
+            fitted = gaps.get("labels") or rigid.get("labels") or []
+            before = gaps.get("before_mm") or rigid.get("mm") or [None] * len(fitted)
+            after = gaps.get("after_mm") or [None] * len(fitted)
+            for index, label in enumerate(fitted):
+                landmarks.append({
+                    "patient": patient, "arch": arch, "landmark": label, "in_fit": True,
+                    "after_rigid_fit_mm": before[index], "after_icp_mm": after[index],
+                })
+            for label in sorted(excluded):
+                landmarks.append({"patient": patient, "arch": arch, "landmark": label,
+                                  "in_fit": False, "left_out_because": excluded[label]})
+    return {"cases": cases, "landmarks": landmarks}
+
+
+def report_metrics(here: str, detail: dict) -> None:
+    """Send `metric_lines` to the user, under one line saying which arch."""
+    lines = metric_lines(detail)
+    if lines:
+        progress.log(here, level="metric", user=True)
+    for line in lines:
+        progress.log(line, level="metric", user=True)
 
 
 def _needs_review(detail: dict) -> str:
@@ -471,6 +634,7 @@ def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_d
                     matrix, detail = pipeline.register_one(
                         mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
                     )
+                    report_metrics(here, detail)
                     destination = os.path.join(
                         folder, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
                     )
@@ -785,6 +949,10 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
         shutil.rmtree(work_dir, ignore_errors=True)
 
     report["duration_seconds"] = round(time.monotonic() - started_at, 2)
+    if catalogs.OUTPUT_METRICS in set(outputs or ()):
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
     failed = report.get("meshes_failed", 0)

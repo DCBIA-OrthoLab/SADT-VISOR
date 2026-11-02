@@ -212,7 +212,8 @@ def landmark_spread_ratio(landmarks) -> float:
     return float(singular[1] / singular[0]) if singular[0] > 0 else 0.0
 
 
-def fit_rigid_without_outliers(moving_lms, fixed_lms, labels=None, on_enamel=None):
+def fit_rigid_without_outliers(moving_lms, fixed_lms, labels=None, on_enamel=None,
+                               excluded=None):
     """Fit, drop any pair the fit cannot account for, fit again.
 
     Two tests, in the order their evidence is worth. A landmark the scan says is
@@ -222,8 +223,10 @@ def fit_rigid_without_outliers(moving_lms, fixed_lms, labels=None, on_enamel=Non
     residual, so deciding them all from one fit would throw away points that
     were never the problem.
 
-    Returns the matrix and the indices it was fitted on.
+    Returns the matrix and the indices it was fitted on. `excluded`, when
+    given, is filled with {label: why} for every pair left out, for the user.
     """
+    excluded = {} if excluded is None else excluded
     moving_lms = np.asarray(moving_lms, dtype=float)
     fixed_lms = np.asarray(fixed_lms, dtype=float)
     keep = list(range(len(moving_lms)))
@@ -237,6 +240,8 @@ def fit_rigid_without_outliers(moving_lms, fixed_lms, labels=None, on_enamel=Non
                 "remaining %d.", ", ".join(labels[i] for i in off),
                 "is" if len(off) == 1 else "are", len(keep) - len(off))
             keep = [i for i in keep if i not in off]
+            for i in off:
+                excluded[labels[i]] = "not on a tooth in the CBCT"
         elif off:
             logger.warning(
                 "%d of %d CBCT landmarks are not on a tooth, which leaves too "
@@ -273,6 +278,10 @@ def fit_rigid_without_outliers(moving_lms, fixed_lms, labels=None, on_enamel=Non
             "not the same point on both scans, so it is left out of the fit.",
             labels[keep[position]] if labels else "#%d" % keep[position],
             residuals[position], len(keep) - 1, best, rms)
+        if labels:
+            excluded[labels[keep[position]]] = (
+                "{:.1f} mm from where the other {} put it".format(
+                    residuals[position], len(keep) - 1))
         keep.pop(position)
 
     return matrix, keep
@@ -296,8 +305,9 @@ def prealign(moving_lms, fixed_lms, labels=None, on_enamel=None):
         return np.eye(4), {"accepted": False, "reason": "too few pairs",
                            "landmarks_fitted": [], "residual_mm": None}
 
+    excluded = {}
     matrix, keep = fit_rigid_without_outliers(
-        moving_lms, fixed_lms, labels, on_enamel)
+        moving_lms, fixed_lms, labels, on_enamel, excluded=excluded)
     fitted = [labels[i] for i in keep] if labels else list(keep)
     rms = alignment_residual(moving_lms[keep], fixed_lms[keep], matrix)
 
@@ -307,7 +317,8 @@ def prealign(moving_lms, fixed_lms, labels=None, on_enamel=None):
             "CBCT landmarks do not describe the same points. Skipping the "
             "pre-alignment.", rms, len(keep), MAX_LANDMARK_RESIDUAL_MM)
         return np.eye(4), {"accepted": False, "reason": "residual too large",
-                           "landmarks_fitted": fitted, "residual_mm": rms}
+                           "landmarks_fitted": fitted, "residual_mm": rms,
+                           "landmarks_excluded": excluded}
 
     spread = landmark_spread_ratio(moving_lms[keep])
     if spread < MIN_LANDMARK_SPREAD_RATIO:
@@ -321,6 +332,7 @@ def prealign(moving_lms, fixed_lms, labels=None, on_enamel=None):
                 rms, len(keep), ", ".join(str(f) for f in fitted))
     return matrix, {"accepted": True, "reason": None,
                     "landmarks_fitted": fitted, "residual_mm": rms,
+                    "landmarks_excluded": excluded,
                     "spread": spread}
 
 
@@ -539,6 +551,12 @@ def _icp_run(moving_points, moving_normals, target, tree, sign, max_dist):
 
     inlier_rmse, fitness, pairs, rejected_by_normal, settled, iteration = (
         float("inf"), 0.0, 0, 0, 0, 0)
+    # The cost the ICP minimises, at every iteration, for `error_milestones` to
+    # show the user how it converged rather than only where it ended: the mean
+    # squared point-to-plane distance (point-to-point when there are no
+    # normals) over the pairs that iteration kept, in mm^2.
+    history = []
+    surface_mean = surface_std = float("nan")
 
     for iteration in range(ICP_MAX_ITERATIONS):
         # workers=-1 spreads the query over every core: it is the dominant cost
@@ -561,6 +579,17 @@ def _icp_run(moving_points, moving_normals, target, tree, sign, max_dist):
                        if np.any(valid) else float("inf"))
         fitness = float(np.sum(valid)) / len(moving_points)
         pairs = int(np.sum(valid))
+        if pairs:
+            kept = distances[valid]
+            surface_mean, surface_std = float(np.mean(kept)), float(np.std(kept))
+            if use_normals:
+                along = np.einsum("ij,ij->i", current[valid] - target.points[indices[valid]],
+                                  sign * target.normals[indices[valid]])
+                history.append(float(np.mean(along ** 2)))
+            else:
+                history.append(float(np.mean(kept ** 2)))
+        else:
+            history.append(float("inf"))
 
         # Checked here rather than after the update, so the numbers reported are
         # the ones that describe the transform actually returned.
@@ -597,7 +626,39 @@ def _icp_run(moving_points, moving_normals, target, tree, sign, max_dist):
         "rejected_by_normal": rejected_by_normal,
         "used_normals": use_normals,
         "sign": sign,
+        # What the ICP minimises, iteration by iteration, and what it is
+        # called -- point-to-plane or, without normals, point-to-point.
+        "cost_milestones": error_milestones(history, digits=4),
+        "cost": "point-to-plane" if use_normals else "point-to-point",
+        # Distance from each kept crown point to the nearest CBCT surface
+        # point, at the end: what "how close is the arch" means to a reader.
+        "surface_mean_mm": surface_mean,
+        "surface_std_mm": surface_std,
     }
+
+
+def error_milestones(history, drop=0.10, most=6, digits=3):
+    """The iterations at which the surface error visibly fell, as `[(i, mm)]`.
+
+    The first iteration, every one where the error is at least `drop` lower
+    than at the last milestone, and the last: a few numbers that show the fit
+    converging, where all three hundred would only show noise. Thinned to
+    `most`, keeping the first and the last, so a slow descent stays one line.
+    An iteration without a usable error (no correspondences) is skipped.
+    """
+    points = [(i, e) for i, e in enumerate(history) if np.isfinite(e)]
+    if not points:
+        return []
+    kept = [points[0]]
+    for i, error in points[1:]:
+        if error <= kept[-1][1] * (1.0 - drop):
+            kept.append((i, error))
+    if kept[-1] != points[-1]:
+        kept.append(points[-1])
+    if len(kept) > most:
+        step = (len(kept) - 1) / (most - 1)
+        kept = [kept[round(k * step)] for k in range(most)]
+    return [(int(i), round(float(e), digits)) for i, e in kept]
 
 
 def icp_point_to_plane(moving_mesh, target, max_dist=ICP_MAX_DIST_MM):

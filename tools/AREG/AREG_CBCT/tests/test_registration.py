@@ -839,7 +839,7 @@ def test_a_run_where_the_engine_failed_everyone_is_a_server_error(tmp_path, monk
 
     cohort(tmp_path, subjects=("P1", "P2"), size=32)
 
-    def broken(fixed, moving):
+    def broken(fixed, moving, cost=None):
         raise RuntimeError("elastix rigid registration failed: too few samples")
 
     monkeypatch.setattr(elastix, "register", broken)
@@ -862,7 +862,7 @@ def test_one_server_fault_among_input_faults_keeps_it_a_server_error(tmp_path, m
     cohort(tmp_path, subjects=("P1", "P2"), size=32)
     os.remove(str(tmp_path / "masks" / "P2_T1_CB_seg.nii.gz"))
     monkeypatch.setattr(elastix, "register",
-                        lambda fixed, moving: (_ for _ in ()).throw(RuntimeError("boom")))
+                        lambda fixed, moving, cost=None: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError) as raised:
         semi(tmp_path)
     assert not isinstance(raised.value, ToolInputError)

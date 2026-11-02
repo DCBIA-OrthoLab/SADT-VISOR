@@ -568,6 +568,45 @@ def test_the_transform_file_maps_the_result_back_to_the_original(tmp_path):
         ), name
 
 
+def test_the_cbct_transform_is_one_affine_that_slicer_reads(tmp_path):
+    """SimpleITK writes a chain as a CompositeTransform of
+    `MatrixOffsetTransformBase` members, which 3D Slicer cannot read: every
+    review that loaded the file logged "Failed to read transform"."""
+    root = tmp_path / "input"
+    original = _rotate(_REFERENCE_POINTS, (0.2, 1.0, 0.3), 17.0, offset=(12.0, -8.0, 5.0))
+    _write_scan(root / "p1_scan.nii.gz", size=(24, 24, 24), spacing=(0.4, 0.4, 0.4))
+    _write_markups(root / "p1_lm.mrk.json", original)
+
+    run = dispatch.orient(
+        input_path=str(root),
+        reference_path=_cbct_reference(tmp_path),
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(_REFERENCE_POINTS),
+        output_dir=str(tmp_path / "out"),
+    )
+    with open(os.path.join(run.output_dir, "p1_Or_transform.tfm"), encoding="utf-8") as handle:
+        written = handle.read()
+
+    assert "AffineTransform_double_3_3" in written
+    assert "MatrixOffsetTransformBase" not in written
+    assert "CompositeTransform" not in written
+
+
+def test_a_transform_that_is_not_linear_is_written_unchanged():
+    """Approximating a deformation by an affine would move every point it
+    carries; refusing to flatten it keeps what was computed."""
+    bspline = sitk.BSplineTransform(3)
+    bspline.SetTransformDomainMeshSize([2, 2, 2])
+    bspline.SetTransformDomainPhysicalDimensions([300.0, 300.0, 300.0])
+    bspline.SetTransformDomainOrigin([-150.0, -150.0, -150.0])
+    parameters = list(bspline.GetParameters())
+    parameters[len(parameters) // 2] = 5.0
+    bspline.SetParameters(parameters)
+
+    assert cbct_pipeline.as_one_affine(bspline) is bspline
+
+
 def test_landmarks_follow_the_recentring(tmp_path):
     """Recentring the volume without moving the landmarks compares a centred
     scan against uncentred points -- the state the semi-automated CLI ran in,
@@ -1595,7 +1634,10 @@ def test_arguments_naming_hosted_weights_end_in_model_or_reference():
 # ---------------------------------------------------------------------------
 
 def _events(path) -> list:
-    return [json.loads(line) for line in Path(path).read_text().splitlines() if line]
+    """The progress events only: the user's metric lines share the stream as
+    log records and are tested in test_metrics.py."""
+    records = [json.loads(line) for line in Path(path).read_text().splitlines() if line]
+    return [record for record in records if record.get("kind") != "log"]
 
 
 def test_the_cbct_phases_report_where_they_have_got_to(tmp_path, monkeypatch):

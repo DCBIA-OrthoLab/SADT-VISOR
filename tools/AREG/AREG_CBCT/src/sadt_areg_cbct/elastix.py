@@ -208,8 +208,13 @@ def apply_mask(image: sitk.Image, mask: sitk.Image, label: int = None) -> tuple:
 # Registration
 # ---------------------------------------------------------------------------
 
-def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Transform:
+def register(fixed: sitk.Image, moving: sitk.Image, cost: list = None) -> sitk.Transform:
     """Rigidly register `moving` onto `fixed`; return the resampling transform.
+
+    `cost`, when given a list, receives what elastix's own log says the
+    optimiser did: one list of per-iteration metric values per resolution,
+    coarse to fine (see `read_cost`). Read from the log this function already
+    keeps, so asking for it costs a parse of a few hundred lines.
 
     The returned transform maps a point of the FIXED image's space to the
     corresponding point of the MOVING image's space, which is the direction
@@ -255,7 +260,70 @@ def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Transform:
             raise RuntimeError(
                 f"elastix rigid registration failed: {_failure_description(exc, log_dir)}"
             ) from exc
+        if cost is not None:
+            cost.extend(read_cost(log_dir))
     return retrieve_transform(registration.GetTransformParameterObject())
+
+
+def read_cost(log_dir: str) -> list:
+    """The metric value of every iteration, one list per resolution, from an
+    elastix output directory; `[]` when there is nothing to read.
+
+    elastix writes its iteration table to `IterationInfo.<n>.R<r>.txt` when
+    asked to, and always into `elastix.log`: the same tab-separated table,
+    under a header whose `2:Metric` column is the cost. The per-resolution
+    files win when present. Never raises: a metric the user does not get is
+    no reason to fail a registration that worked.
+    """
+    try:
+        names = sorted(
+            (name for name in os.listdir(log_dir)
+             if re.fullmatch(r"IterationInfo\.0\.R\d+\.txt", name)),
+            key=lambda name: int(name.rsplit(".R", 1)[1].split(".")[0]),
+        )
+        texts = []
+        for name in names or ["elastix.log"]:
+            with open(os.path.join(log_dir, name), encoding="utf-8", errors="replace") as handle:
+                texts.append(handle.read())
+    except OSError:
+        return []
+    levels = []
+    for text in texts:
+        levels += parse_iterations(text)
+    return levels
+
+
+def parse_iterations(text: str) -> list:
+    """Every iteration table in `text`, as one list of metric values per table.
+
+    A table starts at a header line beginning `1:ItNr` and runs as long as the
+    lines that follow start with an iteration number.
+    """
+    levels, column, values = [], None, None
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if fields[0].strip() == "1:ItNr":
+            if values:
+                levels.append(values)
+            names = [field.strip() for field in fields]
+            column = names.index("2:Metric") if "2:Metric" in names else None
+            values = []
+            continue
+        if values is None:
+            continue
+        if not fields[0].strip().isdigit():
+            if values:
+                levels.append(values)
+            column, values = None, None
+            continue
+        if column is not None and column < len(fields):
+            try:
+                values.append(float(fields[column]))
+            except ValueError:
+                pass
+    if values:
+        levels.append(values)
+    return levels
 
 
 # "ITK ERROR: RecursiveGaussianImageFilter(0x59508e2d5540): " -- the class and

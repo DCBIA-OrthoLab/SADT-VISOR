@@ -90,8 +90,13 @@ def available() -> bool:
     return torch.cuda.is_available()
 
 
-def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Euler3DTransform:
-    """Rigidly register `moving` onto `fixed`; return the resampling transform."""
+def register(fixed: sitk.Image, moving: sitk.Image, cost: list = None) -> sitk.Euler3DTransform:
+    """Rigidly register `moving` onto `fixed`; return the resampling transform.
+
+    `cost`, when given a list, receives one list per level, coarse to fine, of
+    the negative mutual information of the best pose found so far at each
+    iteration (see `_Registration.run`).
+    """
     import torch
 
     torch.use_deterministic_algorithms(True)
@@ -105,7 +110,7 @@ def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Euler3DTransform:
         BINS, _levels(fixed.GetSize()),
     )
     try:
-        return _Registration(fixed, moving, torch.device("cuda")).run()
+        return _Registration(fixed, moving, torch.device("cuda")).run(cost)
     finally:
         # The card is shared: what this run held goes back the moment it ends,
         # not when the process does.
@@ -367,7 +372,14 @@ class _Registration:
             (slope * self._batch_joint(level, params, start, end)).sum().backward()
         return float(value)
 
-    def run(self) -> sitk.Euler3DTransform:
+    def run(self, cost: list = None) -> sitk.Euler3DTransform:
+        """Register, level by level. `cost`, when a list, gets one list per
+        level: at each iteration, the negative mutual information of the best
+        pose this level has visited so far. The best, not the current one,
+        because the best is what the level hands on (see below), so the last
+        value of a level is the cost of the pose it kept. It comes with the
+        gradient: recording it costs nothing.
+        """
         import torch
 
         params = torch.zeros(6, device=self.device, requires_grad=True)
@@ -382,15 +394,19 @@ class _Registration:
             # worse alignment than one it already had. The value comes with
             # the gradient, so keeping it costs nothing.
             best_value, best_params = float("inf"), params.detach().clone()
+            history = []
             for _ in range(iterations):
                 optimiser.zero_grad()
                 value = self._gradient(level, params)
                 if value < best_value:
                     best_value, best_params = value, params.detach().clone()
+                history.append(best_value)
                 optimiser.step()
                 schedule.step()
             with torch.no_grad():
                 params.copy_(best_params)
+            if cost is not None:
+                cost.append(history)
             del level
         values = params.detach().cpu().numpy().astype(float)
         transform = sitk.Euler3DTransform()

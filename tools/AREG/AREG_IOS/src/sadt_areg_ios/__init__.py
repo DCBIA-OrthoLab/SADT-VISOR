@@ -100,6 +100,11 @@ def run(
     mgl_landmarks: Path = "",
     mgl_patch_height: float = 0.0,
     output_suffix: str = "Reg",
+    # Nothing ticked by default: each Extra output is for a reader who asked
+    # for it. Named and spelled as AREG_IOSCBCT's, because the AREG facade
+    # merges every engine's `outputs` per mode. Spelled out because `Literal`
+    # takes literals only; a test pins it to `catalogs`.
+    outputs: list[Literal["Metrics spreadsheet (.xlsx + .csv)"]] = [],
     *,
     sup=None,
     data_root=None,
@@ -137,6 +142,11 @@ def run(
         mgl_patch_height: How far the band extends from the mucogingival
             line, in millimetres. 0 uses the engine's default.
         output_suffix: Added to each output name, e.g. `scan_Reg.vtk`.
+        outputs: What to hand back beside the registered meshes, their
+            transforms and scenes, which are always written. Metrics
+            spreadsheet: what each registration measured, one row per patient
+            and one per landmark, as `AREG_metrics.xlsx` and `.csv` beside
+            the report.
 
     Returns:
         The output directory.
@@ -161,6 +171,7 @@ def run(
             mgl_landmarks=mgl_landmarks,
             mgl_patch_height=mgl_patch_height,
             output_suffix=output_suffix,
+            outputs=outputs,
             sup=sup,
             data_root=data_root,
         )

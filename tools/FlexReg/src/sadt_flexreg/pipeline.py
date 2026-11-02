@@ -94,6 +94,9 @@ def write_surface(surface, path):
     import vtk
 
     writer = vtk.vtkPolyDataWriter()
+    # Slicer reads a .vtk without a SPACE= header as LPS and warns about it
+    # on every load; saying LPS keeps exactly that reading, without the warning.
+    writer.SetHeader("SPACE=LPS")
     writer.SetFileName(path)
     writer.SetFileTypeToBinary()
     writer.SetInputData(_flip_lps_ras(surface))

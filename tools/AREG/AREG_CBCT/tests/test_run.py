@@ -594,7 +594,9 @@ def test_progress_counts_the_registrations_as_they_finish(tmp_path, monkeypatch)
     assert [event["fraction"] for event in events] == [0.0, 0.0, 0.5, 1.0]
     # The region no subject has a mask for is said once, to the clinician, at
     # warning level -- with no supervisor, through the progress file's log.
-    logs = [record for record in records if record.get("kind") == "log"]
+    # The registrations' own metric lines are test_metrics.py's.
+    logs = [record for record in records
+            if record.get("kind") == "log" and record.get("level") != "metric"]
     assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
     assert "Mandible" in logs[0]["message"]
 
@@ -625,7 +627,8 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
     )
 
     assert sup.messages == []
-    assert [event["message"] for event in _events(events_file)] == [
+    assert [event["message"] for event in _events(events_file)
+            if event.get("level") != "metric"] == [
         "pairing timepoints", "registering 1 region(s) of 1 subject(s)",
         "registration 1 of 1",
     ]

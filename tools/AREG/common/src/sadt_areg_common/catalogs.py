@@ -358,6 +358,9 @@ OUTPUT_ORIENTATION_LANDMARKS = "Orientation landmarks (ASO)"
 OUTPUT_CBCT_SCAN = "CBCT scan"
 OUTPUT_T1_SCAN = "T1 scan (oriented when orientation is on)"
 OUTPUT_TRANSFORMS = "Transform (.tfm)"
+# Not a 3D file: the numbers the registration measured, for a cohort's table.
+OUTPUT_METRICS = "Metrics spreadsheet (.xlsx + .csv)"
+METRICS_STEM = "AREG_metrics"
 
 OUTPUT_LABEL = "Extra outputs"
 # Drawn under the label, always visible: the one thing a reader needs before
@@ -377,6 +380,10 @@ OUTPUT_HELP = {
                     "copy already under T1_Oriented/; otherwise it is copied "
                     "beside the result.",
     OUTPUT_TRANSFORMS: "Each registration as a .tfm that 3D Slicer opens.",
+    OUTPUT_METRICS: "What each registration measured, one row per case and one "
+                    "per landmark, as AREG_metrics.xlsx and as .csv files beside "
+                    "the report: the numbers the console shows, kept for a "
+                    "cohort's statistics.",
 }
 
 

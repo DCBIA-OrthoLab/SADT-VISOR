@@ -61,6 +61,9 @@ def write_surface(surface, path: str) -> str:
         writer = vtk.vtkXMLPolyDataWriter()
     else:
         writer = vtk.vtkPolyDataWriter()
+        # Slicer reads a .vtk without a SPACE= header as LPS and warns about it
+        # on every load; saying LPS keeps exactly that reading, without the warning.
+        writer.SetHeader("SPACE=LPS")
         # Version 42, the legacy format every Slicer in use reads. The writer's
         # default is 5.1, which older readers refuse outright.
         writer.SetFileVersion(42)

@@ -507,6 +507,9 @@ def write_surface(image, destination: str, scratch_dir: str, padding_mm: float,
         _color_by_label(model, labels)
 
         writer = vtk.vtkPolyDataWriter()
+        # Slicer reads a .vtk without a SPACE= header as LPS and warns about it
+        # on every load; saying LPS keeps exactly that reading, without the warning.
+        writer.SetHeader("SPACE=LPS")
         writer.SetFileName(destination)
         writer.SetInputData(model)
         if writer.Write() != 1 or writer.GetErrorCode():

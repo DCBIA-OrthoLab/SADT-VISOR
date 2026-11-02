@@ -29,7 +29,10 @@ CALL_VARIABLE = "SADT_PROGRESS_CALL"
 DEPTH_VARIABLE = "SADT_SUPERVISOR_DEPTH"
 
 # What `log` accepts; anything else is read as "info".
-LEVELS = ("debug", "info", "warning", "error")
+# "metric" is a number the user may want and can skip -- a residual, a volume,
+# a score -- shown apart from ordinary lines; a reader that predates it reads
+# it as "info", so it can be sent to any server and any client.
+LEVELS = ("debug", "info", "warning", "error", "metric")
 
 # The server truncates a message to 200 characters; truncating here too is what
 # keeps the write under PIPE_BUF, below which POSIX makes a write to an
@@ -97,7 +100,7 @@ def _append(record):
 def log(message, level="info", user=False):
     """Say something about this run. Never raises; does nothing when unset.
 
-    `level` is debug, info, warning or error. `user=False` (the default) is
+    `level` is debug, info, warning, error or metric. `user=False` (the default) is
     for whoever runs the server: it reaches the operator page, redacted, and a
     warning or error is kept with the run's history. `user=True` is written for
     the clinician who started the run and reaches their panel.

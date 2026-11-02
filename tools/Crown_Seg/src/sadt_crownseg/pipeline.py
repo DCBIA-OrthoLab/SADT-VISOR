@@ -729,6 +729,9 @@ def _write_as_vtk(source: str, destination: str) -> None:
     reader.Update()
 
     writer = vtk.vtkPolyDataWriter()
+    # Slicer reads a .vtk without a SPACE= header as LPS and warns about it
+    # on every load; saying LPS keeps exactly that reading, without the warning.
+    writer.SetHeader("SPACE=LPS")
     writer.SetFileName(destination)
     writer.SetInputData(reader.GetOutput())
     writer.Write()

@@ -55,6 +55,35 @@ OUTPUT_SUFFIXES = PATIENT_SUFFIXES
 _SEPARATOR = re.compile(r"[_\-.\s]")
 
 
+
+def as_one_affine(transform):
+    """`transform` as a single AffineTransform, when it is one.
+
+    The orientation is a chain of translations and rotations, and SimpleITK
+    writes a chain as a CompositeTransform whose members are
+    `MatrixOffsetTransformBase` -- a class 3D Slicer's reader does not know,
+    so the file failed to load there ("Failed to read transform from file").
+    A linear chain is one 4x4: read off the transform itself, by where it sends
+    the origin and the three unit vectors, so no member type has to be known.
+
+    Checked on points spread over a head before it is trusted; a chain that is
+    not linear after all is returned unchanged rather than approximated.
+    """
+    origin = np.array(transform.TransformPoint((0.0, 0.0, 0.0)))
+    columns = [np.array(transform.TransformPoint(tuple(unit))) - origin
+               for unit in np.eye(3)]
+    affine = sitk.AffineTransform(3)
+    affine.SetMatrix(np.column_stack(columns).flatten().tolist())
+    affine.SetTranslation(origin.tolist())
+
+    probes = np.array([[x, y, z] for x in (-150.0, 150.0)
+                       for y in (-150.0, 150.0) for z in (-150.0, 150.0)])
+    for point in probes:
+        expected = np.array(transform.TransformPoint(tuple(point)))
+        if np.linalg.norm(np.array(affine.TransformPoint(tuple(point))) - expected) > 1e-6:
+            return transform
+    return affine
+
 def _token_aligned_index(stem: str, suffix: str) -> int:
     """Where `suffix` occurs in `stem` as WHOLE tokens, or -1.
 
@@ -387,12 +416,13 @@ def orient_patient(
     markups.write_landmarks(registration.landmarks, landmark_output)
 
     transform_output = os.path.join(destination, f"{patient}_{suffix}_transform.tfm")
-    sitk.WriteTransform(registration.full_transform, transform_output)
+    sitk.WriteTransform(as_one_affine(registration.full_transform), transform_output)
 
     return {
         "status": "ok",
         "landmarks_used": registration.used,
         "landmarks_dropped": registration.dropped,
+        "metrics": registration.metrics,
         "produced": sorted(
             os.path.relpath(path, output_dir)
             for path in (scan_output, landmark_output, transform_output)

@@ -161,6 +161,10 @@ def _write(polydata, writer_name: str, destination: str, binary: bool) -> str:
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     writer = getattr(vtk, writer_name)()
     writer.SetFileName(destination)
+    if writer_name == "vtkPolyDataWriter":
+        # Slicer reads a .vtk without a SPACE= header as LPS and warns about it
+        # on every load; saying LPS keeps exactly that reading, without the warning.
+        writer.SetHeader("SPACE=LPS")
     writer.SetInputData(polydata)
     if binary:
         # These writers default to ASCII, which prints every coordinate as a

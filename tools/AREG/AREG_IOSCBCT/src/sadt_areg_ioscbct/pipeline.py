@@ -343,9 +343,25 @@ def register_one(mesh, ios_landmarks: dict, cbct_landmarks: dict,
     report = {
         "landmarks_used": used,
         "landmarks_dropped": dropped,
+        # Which side each dropped label of THIS arch was missing from, for the
+        # user. The CBCT carries both arches' landmarks, so the other arch's
+        # are not "missing" from this scan: the jaw letter (U, L) leaves them out.
+        "landmarks_missing": {
+            label: ("CBCT" if label in ios_landmarks else "IOS")
+            for label in dropped
+            if label[:1] in {own[:1] for own in ios_landmarks}},
         "prealignment": prealignment,
         "icp": None,
     }
+    # Per pair after the rigid fit, whether or not an ICP follows: the
+    # landmark table of the metrics spreadsheet has a row per landmark either way.
+    fitted = [i for i, label in enumerate(used) if label in set(prealignment["landmarks_fitted"])]
+    if fitted:
+        report["rigid_fit_gaps"] = {
+            "labels": [used[i] for i in fitted],
+            "mm": [round(float(g), 3) for g in np.linalg.norm(
+                geometry.apply(moving[fitted], matrix) - fixed[fitted], axis=1)],
+        }
     if cbct_surface is None:
         return matrix, report
 
@@ -389,10 +405,10 @@ def _landmark_drift(moving, fixed, labels, matrix, refinement, fitted, stats) ->
         return {}
 
     placed = geometry.apply(moving[keep], matrix)
-    before = float(np.sqrt(np.mean(
-        np.sum((placed - fixed[keep]) ** 2, axis=1))))
-    after = float(np.sqrt(np.mean(
-        np.sum((geometry.apply(placed, refinement) - fixed[keep]) ** 2, axis=1))))
+    gaps_before = np.linalg.norm(placed - fixed[keep], axis=1)
+    gaps_after = np.linalg.norm(geometry.apply(placed, refinement) - fixed[keep], axis=1)
+    before = float(np.sqrt(np.mean(gaps_before ** 2)))
+    after = float(np.sqrt(np.mean(gaps_after ** 2)))
 
     if after - before > geometry.MAX_ICP_LANDMARK_DRIFT_MM:
         logger.warning(
@@ -406,4 +422,11 @@ def _landmark_drift(moving, fixed, labels, matrix, refinement, fitted, stats) ->
     else:
         logger.info("Landmarks %.1f mm from their CBCT counterparts after the ICP, "
                     "against %.1f mm before it.", after, before)
-    return {"landmark_rms_before_mm": before, "landmark_rms_after_mm": after}
+    return {"landmark_rms_before_mm": before, "landmark_rms_after_mm": after,
+            # Per pair, for the user: a mean with its spread and the worst pair
+            # says more than one RMS, and names which landmark to look at.
+            "landmark_gaps": {
+                "labels": [labels[i] for i in keep],
+                "before_mm": [round(float(g), 3) for g in gaps_before],
+                "after_mm": [round(float(g), 3) for g in gaps_after],
+            }}
