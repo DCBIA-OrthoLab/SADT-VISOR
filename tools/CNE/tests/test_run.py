@@ -1071,6 +1071,9 @@ def test_an_answer_shaped_wrong_is_a_server_fault_not_the_callers():
     """The note was fine; the engine answered in the wrong shape. A ValueError
     would be answered 422 and blamed on the request."""
     class Broken:
+        def reset(self):
+            pass
+
         def create_chat_completion(self, **_kwargs):
             return {"choices": []}
 
@@ -1406,6 +1409,57 @@ def test_no_model_named_runs_the_note_types_own_bundle(tmp_path, llm):
     report = report_of(output)
     assert report["model"] == "model-q4_k_m.gguf"
     assert report["warnings"] == []
+
+
+def _two_bundles(root):
+    for notes_type, name in (("TMJ", "qwen-ft-q4_k_m.gguf"),
+                             ("Ortho", "model-q4_k_m.gguf")):
+        bundle = root / "CNE" / "models" / notes_type
+        bundle.mkdir(parents=True)
+        (bundle / name).write_bytes(b"GGUF not really")
+    return root / "CNE" / "models"
+
+
+def test_the_hosted_models_folder_runs_the_note_types_own_bundle(tmp_path, llm):
+    """What a server sends when the caller named no model: the folder itself.
+    Its two bundles used to be refused as "2 .gguf files"."""
+    models = _two_bundles(tmp_path / "data")
+    write_txt(tmp_path / "notes" / "note.txt", "Patient reports left TMJ pain.")
+
+    for notes_type, name in (("TMJ", "qwen-ft-q4_k_m.gguf"), ("Ortho", "model-q4_k_m.gguf")):
+        output = sadt_cne.run(tmp_path / "notes", notes_type, tmp_path / f"out-{notes_type}",
+                              model=models)
+        assert report_of(output)["model"] == name
+        assert report_of(output)["warnings"] == []
+
+
+def test_a_bundle_named_on_purpose_is_run_whatever_the_note_type(tmp_path, llm):
+    models = _two_bundles(tmp_path / "data")
+    write_txt(tmp_path / "notes" / "note.txt", "Patient reports left TMJ pain.")
+
+    output = sadt_cne.run(tmp_path / "notes", "Ortho", tmp_path / "out", model=models / "TMJ")
+
+    assert report_of(output)["model"] == "qwen-ft-q4_k_m.gguf"
+    assert report_of(output)["warnings"], "the other type's weights are still warned about"
+
+
+def test_every_note_starts_from_an_empty_context():
+    """A note's extraction must not depend on the note asked before it."""
+    calls = []
+
+    class Engine:
+        def reset(self):
+            calls.append("reset")
+
+        def create_chat_completion(self, **_kwargs):
+            calls.append("complete")
+            return {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+
+    engine = Engine()
+    for _note in range(2):
+        extraction.complete(engine, [], 10, 0.0)
+
+    assert calls == ["reset", "complete", "reset", "complete"]
 
 
 def test_no_model_named_and_none_staged_is_the_deployments_fault(tmp_path, llm):

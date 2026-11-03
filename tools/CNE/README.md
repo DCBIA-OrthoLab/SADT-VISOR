@@ -44,6 +44,9 @@ It is optional. Left empty -- "(automatic)" in a panel -- the run uses
 is how upstream's panel worked (it asked for the note type alone), and it keeps
 the Ortho weights from being paired with the TMJ prompt by a slip of the model
 dropdown. No such bundle staged is the deployment's to fix and answers 503.
+A server that hosts the tool sends the models folder itself when no model is
+named, and leaves the choice inside it to the tool; `models/<notes_type>/` is
+then the bundle run (`bundle_for`).
 
 `notes` publishes the extensions its readers read (`ACCEPTS`), so a client's
 file dialog offers notes rather than scans.
@@ -124,6 +127,14 @@ each has a test named after it in `tests/test_run.py`.
 - **`temperature` defaults to 0.** Upstream used 0.1, so the same note extracted
   twice gave two different answers -- a clinical extraction that cannot be
   reproduced cannot be checked.
+- **A note's extraction does not depend on the note before it.** Upstream
+  kept one engine for the whole folder and never cleared it, and
+  llama-cpp-python reuses the tokens a call shares with the previous one --
+  the TMJ instruction, for every note. Measured on the two public TMJ notes,
+  the second note of a batch extracted differently from the same note alone
+  (two list values swapped, one field more), on CPU and on CUDA alike, so a
+  note's result depended on how the cohort was sorted and what it held. The
+  engine is reset before every note (`complete`).
 - **The JSON is kept.** Upstream flattened the model's object to `key : value`
   text at the very last step and threw the object away, so nothing downstream
   could read it. Both are written; the JSON is the canonical one (a value
@@ -220,12 +231,42 @@ A bundle folder holding exactly one `.gguf` resolves to it, recursively. One
 holding several is **refused by name**: which model vintage ran must never
 depend on sort order.
 
+## Validated against
+
+- **Input**: the four synthetic consult notes the upstream module ships
+  (`CNE/Resources/testfiles/`, SlicerAutomatedDentalTools at `3c67957`), not
+  patient data: two TMJ notes (4 728 and 6 984 characters) and two Ortho notes
+  (1 130 and 267). The first TMJ note is the one the server hosts as its test
+  file (`TMJ/TMJ_note1.txt`, sha256 `5c0a06ca...`).
+- **Weights**: both bundles as `scripts/data-manifest.yml` pins them, downloaded
+  and checked by `fetch_data.py`: TMJ `qwen-ft-q4_k_m.gguf` (sha256
+  `66b7e2be...`) and Ortho `model-q4_k_m.gguf` (sha256 `6aad2eb3...`).
+- **Engine**: `llama-cpp-python` 0.3.35 from the CPU index, installed from
+  `uv.lock` (`llama_supports_gpu_offload()` is False), on a 56-thread Xeon.
+- **Reference**: upstream's `CNE_CLI/CNE_CLI.py`, run on the same notes, weights
+  and engine, with the two defaults this port changes on purpose aligned:
+  `temperature` 0.1 -> 0.0 and `max_tokens` 500 -> 2048, plus `seed=0`.
+- **Result**: **identical**. For each of the four notes, the model's raw answer
+  is the same string, character for character, from upstream and from the
+  port. Every answer ended on `stop`; the extractions hold 46, 46, 19 and 14
+  fields. CPU time per note: 61-85 s for TMJ, 22-30 s for Ortho.
+- **Reproducibility**: two runs of a batch give identical answers, and with the
+  reset above, each note of a batch, in either order, answers exactly as it
+  does alone. Run with the models folder as `model`, which is what a server
+  sends, the TMJ batch picks the TMJ bundle and gives the same answers.
+- **Tolerance**: none needed. Equality was exact, so any difference is a
+  regression rather than noise.
+
+Not covered: `.pdf` and `.docx` notes (no public sample exists, the readers
+are tested on generated files), and the CUDA build, which answers differently
+from the CPU one (see "The CPU build").
+
 ## Working on it
 
 ```bash
 cd tools/CNE
 uv sync --all-groups
-uv run pytest                                   # 165 tests, no weights, no GPU
+uv run pytest                                   # 168 tests, no weights, no GPU
 uv run pytest -m models -o addopts=             # needs CNE_MODEL=<bundle>
 .venv/bin/python -m pyflakes src tests
 .venv/bin/python ../../scripts/describe.py .    # the schema the server publishes

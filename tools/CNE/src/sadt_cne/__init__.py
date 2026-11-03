@@ -14,6 +14,7 @@ from .extraction import (
     SYSTEM_PROMPTS,
     TRUNCATED,
     build_messages,
+    bundle_for,
     complete,
     context_for,
     default_model,
@@ -143,7 +144,9 @@ def run(
     root = notes.parent if notes.is_file() else notes
     destinations = plan_outputs(found, root, output_dir)
 
-    model_file = resolve_model_file(model or default_model(notes_type, data_root))
+    model_file = resolve_model_file(
+        bundle_for(model, notes_type) or default_model(notes_type, data_root)
+    )
     warnings = []
     hint = model_type_hint(model_file)
     if hint and hint != notes_type:
