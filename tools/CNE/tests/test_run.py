@@ -858,6 +858,17 @@ def test_the_cuda_device_offloads_every_layer(tmp_path, model, llm):
     assert llm.loaded["n_gpu_layers"] == -1
 
 
+def test_the_mps_device_offloads_every_layer(tmp_path, model, llm):
+    """Metal is how llama.cpp reaches the GPU of a Mac, and it is asked for
+    with the same `n_gpu_layers` the CUDA build takes."""
+    write_txt(tmp_path / "notes" / "a.txt")
+
+    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+                 device="mps")
+
+    assert llm.loaded["n_gpu_layers"] == -1
+
+
 # --------------------------------------------------------------------------
 # `device` says what was asked for; `gpu_offload` says what happened
 #

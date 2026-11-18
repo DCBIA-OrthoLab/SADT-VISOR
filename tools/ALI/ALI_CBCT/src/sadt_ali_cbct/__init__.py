@@ -11,6 +11,7 @@ intraoral engine needs torch 2.11 for pytorch3d; this one has no reason to
 move. That is what the split buys.
 """
 
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -59,6 +60,10 @@ OUTPUT_SUFFIXES = ("_lm_Pred", "_lm")
 REVIEW_KIND = "landmarks"
 
 
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+
+
 def run(
     input: Path,
     output_dir: Path,
@@ -92,7 +97,7 @@ def run(
             "LL2R", "LR2R", "UR3OIP", "UL3OIP", "UR3RIP", "UL3RIP",
         ]
     ] = [],
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
     search_steps: int = 0,
     seed: int = 0,
     num_workers: int = 0,

@@ -46,6 +46,24 @@ def test_cpu_is_never_upgraded_to_cuda(with_cuda):
     assert pipeline.resolve_device("cpu") == "cpu"
 
 
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):
+    """`mps` is only published on macOS, but a direct call can still name it
+    anywhere: it must run on the CPU and say why, not die inside torch."""
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with caplog.at_level(logging.WARNING, logger="CLIC"):
+        assert pipeline.resolve_device("mps") == "cpu"
+    assert any("MPS is unavailable" in record.message for record in caplog.records)
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert pipeline.resolve_device("mps") == "mps"
+
+
 def test_the_report_records_the_device_actually_used(tmp_path, stub_network,
                                                      make_scan, no_cuda):
     """Not the device that was requested. A run silently on the CPU is the

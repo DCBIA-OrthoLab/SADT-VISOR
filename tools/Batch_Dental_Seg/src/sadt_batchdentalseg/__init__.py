@@ -4,10 +4,14 @@ One nnUNet v2 bundle per model, run over one scan or a whole folder of them.
 The pipeline is in pipeline.py; only `run` is public.
 """
 
+import sys
 from pathlib import Path
 from typing import Literal
 
 from .pipeline import segment
+
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
 
 
 def run(
@@ -16,7 +20,7 @@ def run(
     output_dir: Path,
     separate_segments: bool = False,
     prediction_ID: str = "Seg",
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
     export_formats: list[

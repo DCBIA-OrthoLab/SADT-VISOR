@@ -51,6 +51,9 @@ def resolve_device(requested: str = None) -> str:
     if wanted.startswith("cuda") and not torch.cuda.is_available():
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
         return "cpu"
+    if wanted == "mps" and not torch.backends.mps.is_available():
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
+        return "cpu"
     return wanted
 
 
