@@ -153,6 +153,15 @@ def build(device: str):
                     cameras=p3d["FoVPerspectiveCameras"](), lights=p3d["AmbientLights"]()
                 ),
             )
+            from . import embree_raster
+
+            if embree_raster.wanted(device):
+                # macOS / MPS: pytorch3d has no Metal rasterizer. Same cameras and
+                # settings, fragments from Embree; the shader stays pytorch3d's.
+                self.renderer.rasterizer = embree_raster.rasterizer_class()(
+                    cameras=self.renderer.rasterizer.cameras,
+                    raster_settings=self.renderer.rasterizer.raster_settings,
+                )
 
         def to(self, *args, **kwargs):
             self.renderer = self.renderer.to(*args, **kwargs)

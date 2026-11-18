@@ -136,6 +136,14 @@ def build_renderer(device, image_size: int = IMAGE_SIZE, blur_radius: float = BL
         image_size=image_size, blur_radius=blur_radius, faces_per_pixel=faces_per_pixel
     )
     rasterizer = p3d["MeshRasterizer"](cameras=cameras, raster_settings=raster_settings)
+    from . import embree_raster
+
+    if embree_raster.wanted(device):
+        # macOS / MPS: pytorch3d has no Metal rasterizer. Same cameras and settings,
+        # fragments from Embree; the shader below is pytorch3d's, unchanged.
+        rasterizer = embree_raster.rasterizer_class()(
+            cameras=cameras, raster_settings=raster_settings
+        )
     shader = p3d["HardPhongShader"](
         device=device,
         cameras=cameras,
