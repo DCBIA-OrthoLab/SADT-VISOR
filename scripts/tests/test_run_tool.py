@@ -203,7 +203,38 @@ def test_a_callers_span_is_never_passed_to_the_callee(tmp_path, monkeypatch):
 
     sup.run("Leaf", scans="in", _progress=(0.2, 0.6))
 
-    assert sent == {"scans": "in"}
+    assert sent["scans"] == "in"
+    assert "_progress" not in sent
+
+
+def _sent_to_callee(tmp_path, monkeypatch, **params):
+    sent = {}
+
+    def fake_run(command, **_):
+        sent.update(json.loads(Path(command[command.index("--params-file") + 1]).read_text()))
+        result = Path(command[command.index("--result-file") + 1])
+        result.write_text(json.dumps({"kind": "path", "value": str(tmp_path)}))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(run_tool.subprocess, "run", fake_run)
+    run_tool.LocalSupervisor(out=tmp_path / "out", tmp=tmp_path).run("Leaf", **params)
+    return sent
+
+
+def test_a_callee_is_given_an_output_folder_of_its_own(tmp_path, monkeypatch):
+    """The callee's `output_dir` is required and its caller names none: the
+    supervisor chooses, as the server's does, and it is not the caller's own
+    output folder."""
+    sent = _sent_to_callee(tmp_path, monkeypatch, scans="in")
+
+    assert Path(sent["output_dir"]).is_absolute()
+    assert Path(sent["output_dir"]) != tmp_path / "out"
+
+
+def test_an_output_folder_a_caller_names_is_kept(tmp_path, monkeypatch):
+    sent = _sent_to_callee(tmp_path, monkeypatch, scans="in", output_dir=str(tmp_path / "mine"))
+
+    assert sent["output_dir"] == str(tmp_path / "mine")
 
 
 def test_supervisor_paths_are_absolute(tmp_path, monkeypatch):
@@ -222,6 +253,22 @@ def test_an_unknown_tool_says_what_exists():
         run_tool.tool_python("NoSuchTool")
     assert "NoSuchTool" in str(raised.value)
     assert "_template" in str(raised.value)
+
+
+def test_a_tool_in_a_grouping_folder_is_found_by_its_name(tmp_path, monkeypatch):
+    """`ASO` asks for `ALI_CBCT`, which lives in `tools/ALI/ALI_CBCT`: the name
+    alone has to find it, and the path form has to keep working."""
+    for relative in ("Flat", "Group/Inner"):
+        folder = tmp_path / "tools" / relative
+        (folder / ".venv" / "bin").mkdir(parents=True)
+        (folder / ".venv" / "bin" / "python").write_text("")
+        (folder / "pyproject.toml").write_text("")
+    monkeypatch.setattr(run_tool, "TOOLS_DIR", tmp_path / "tools")
+
+    assert run_tool.tool_root("Flat") == tmp_path / "tools" / "Flat"
+    assert run_tool.tool_root("Inner") == tmp_path / "tools" / "Group" / "Inner"
+    assert run_tool.tool_root("Group/Inner") == tmp_path / "tools" / "Group" / "Inner"
+    assert run_tool.tool_python("Inner") == tmp_path / "tools" / "Group" / "Inner" / ".venv" / "bin" / "python"
 
 
 # ---------------------------------------------------------------------------
