@@ -6,7 +6,6 @@ pytorch3d imports.
 """
 
 import pytest
-
 from sadt_docshapeaxi import pipeline
 
 torch = pytest.importorskip("torch")

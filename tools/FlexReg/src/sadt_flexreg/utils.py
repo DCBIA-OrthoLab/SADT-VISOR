@@ -3,20 +3,9 @@ import vtk
 import numpy as np
 import json
 
-import sys
 import logging
 
-# ===== Logging Configuration =====
-logger = logging.getLogger("FlexReg_CLI_utils")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-if logger.handlers:
-    logger.handlers.clear()
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(name)s - %(levelname)s - (%(filename)s:%(lineno)d) - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+logger = logging.getLogger(__name__)
 
 
 def ReadSurf(fileName):
@@ -163,6 +152,9 @@ def WriteSurf(surf, output_folder, name, inname):
         os.mkdir(output_folder)
 
     writer = vtk.vtkPolyDataWriter()
+    # Slicer reads a .vtk without a SPACE= header as LPS and warns about it
+    # on every load; saying LPS keeps exactly that reading, without the warning.
+    writer.SetHeader("SPACE=LPS")
     writer.SetFileName(os.path.join(output_folder, f"{name}{inname}{extension}"))
     writer.SetInputData(surf)
     writer.Update()

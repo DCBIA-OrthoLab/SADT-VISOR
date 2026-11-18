@@ -18,13 +18,16 @@ The Slicer envelope is gone entirely: no `<filter-progress>` prints, no
 tree.
 
 **Fully-automated CBCT calls another tool, and calls it from the middle.** The
-landmark tool runs on the RECENTRED scans -- that is what the Slicer chain did,
-`PRE_ASO_CBCT` before `ALI_CBCT` -- so it cannot be run before ASO and its
-result handed in. The recentring is a pure metadata change, so it *ought* to be
-reorderable, and it very nearly is; `ALI`'s `physical_position` takes the
-absolute value of the origin, which does not commute with moving it (see issue
-#11). Rather than bet on that, the order is kept exactly as it was and the
-landmark tool is reached through the supervisor, at the point it always ran.
+landmark tool runs on the ORIGINAL scans and its points are then moved into the
+centred space, exactly as a caller's own landmarks are. The Slicer chain ran it
+on the recentred scans (`PRE_ASO_CBCT` before `ALI_CBCT`) because `ALI`'s
+`physical_position` took the absolute value of the origin and did not commute
+with moving it (issue #11). It maps voxels through the full index-to-physical
+transform now, and recentring only moves the origin, so the two orders agree to
+the micrometre. The original order showed at a stop: a reader reviewing
+`ASO/ALI_CBCT` saw points placed in the centred space drawn over the scan they
+sent, half a field of view away whenever its origin was not already centred --
+and a correction made there was in the wrong frame too.
 
 `sup` is keyword-only and unannotated, which is what marks it as the supervisor
 rather than an argument: `describe.py` keeps it out of the schema, and a client
@@ -37,10 +40,15 @@ import json
 import logging
 import os
 import shutil
+from collections import Counter
+
+import numpy as np
 
 from . import catalogs
 from . import markups
+from . import metrics_table
 from . import progress
+from . import user_metrics
 from sadt_naming import split_extension as split_scan_extension
 from .cbct import dicom
 from .cbct import pipeline as cbct_pipeline
@@ -60,6 +68,13 @@ WORK_DIRNAME = ".aso_work"
 # the call graph stays inspectable, where `sup.ALI(...)` is an AttributeError
 # fifteen minutes into a job.
 LANDMARK_TOOL = "ALI_CBCT"
+
+# The slice of a fully-automated CBCT run's bar the landmark tool fills. Passed
+# to the supervisor as `_progress`, so the server folds that tool's own 0..1
+# into it and the clinician sees one bar instead of ALI's and then ASO's in
+# turn. Recentring occupies the bar up to its start and registration from its
+# end; the landmark walk is the longest single step, hence the widest slice.
+LANDMARK_SPAN = (0.2, 0.6)
 
 
 
@@ -117,17 +132,39 @@ def orient(
     max_triplets: int = 2500,
     seed: int = 0,
     sup=None,
+    frame: str = catalogs.FRAME_FROM_LANDMARKS,
+    data_root=None,
+    outputs=None,
 ) -> OrientationRun:
     """Orient every case under `input_path` onto `reference_path`.
 
+    An empty `reference_path` means this tool's own bundles, under the data
+    root; `frame` then names which one, or the selection decides.
+
     Every cross-argument rule is checked BEFORE any file is read: a request that
     cannot work has to come back in a second, not after minutes of registration.
+
+    `outputs` are the `catalogs.OUTPUT_*` the caller ticked; the oriented scans
+    and the report are written whatever it holds.
     """
     modality, automation = str(modality), str(automation)
+    outputs = set(_selected(outputs, catalogs.OUTPUT_CHOICES, "outputs"))
     occlusion = str(ios_occlusion or catalogs.OCCLUSION_INDEPENDENT)
     suffix = (output_suffix or "Or").strip() or "Or"
     if os.sep in suffix or (os.altsep and os.altsep in suffix):
         raise ToolInputError("'output_suffix' is a name fragment, not a path.")
+
+    frame = str(frame or catalogs.FRAME_FROM_LANDMARKS)
+    if frame not in catalogs.FRAME_CHOICES:
+        raise ToolInputError(
+            f"Unknown 'frame' {frame!r}. Expected one of: "
+            f"{', '.join(catalogs.FRAME_CHOICES)}"
+        )
+    if frame != catalogs.FRAME_FROM_LANDMARKS and modality != catalogs.MODALITY_CBCT:
+        raise ToolInputError(
+            f"'frame' names a CBCT reference frame, and this is a {modality} run. "
+            f"Leave it on '{catalogs.FRAME_FROM_LANDMARKS}'."
+        )
 
     if modality == catalogs.MODALITY_CBCT:
         requested = _selected(cbct_landmarks, catalogs.CBCT_LANDMARK_CHOICES, "cbct_landmarks")
@@ -159,21 +196,63 @@ def orient(
         "reference": os.path.basename(str(reference_path).rstrip(os.sep)),
         "cases": {},
     }
+    if frame != catalogs.FRAME_FROM_LANDMARKS:
+        report["frame"] = frame
+    logger.info("ASO: %s, %s", modality, automation)
 
+    # Patients whose failure was the caller's own input -- an unreadable scan,
+    # no landmarks to register on. Kept apart so that a run where EVERY
+    # patient failed that way is answered as the caller's to fix (422), and
+    # any other total failure as the server's (500).
+    input_faults = set()
     try:
         input_root = _as_directory(input_path, os.path.join(work_dir, "input"))
-        reference_root = _as_directory(reference_path, os.path.join(work_dir, "reference"))
+        if reference_path:
+            reference_root = _as_directory(reference_path, os.path.join(work_dir, "reference"))
+        else:
+            # Nobody named one: this tool's own, which is what a neighbour
+            # calling through the supervisor gets. The folder of bundles, the
+            # same shape the server hands a hidden hosted-model argument.
+            reference_root = _own_models(data_root)
         # Either a bundle, or the folder that HOLDS the bundles. The server
         # fills a hidden hosted-model argument with the whole of
         # `DATA/ASO/models/`, so both shapes arrive here and the difference is
-        # visible: a bundle carries markups, a folder of bundles does not.
+        # visible: a bundle carries markups, a folder of bundles does not. A
+        # bundle named outright wins over a frame named beside it.
         if not _is_reference_bundle(reference_root):
-            reference_root = choose_reference(
-                reference_root,
-                modality,
-                selection["cbct_landmarks"] if modality == catalogs.MODALITY_CBCT else [],
-            )
+            if frame != catalogs.FRAME_FROM_LANDMARKS:
+                reference_root = _frame_bundle(reference_root, frame)
+            else:
+                if modality == catalogs.MODALITY_CBCT and not selection["cbct_landmarks"]:
+                    # Nothing to choose a reference BY: an empty selection
+                    # means "the reference's own", which needs one named.
+                    raise ToolInputError(
+                        "No landmark is selected in 'cbct_landmarks', and no reference "
+                        "or 'frame' says which reference's own landmarks to use. Select "
+                        f"at least {_MIN_CBCT_LANDMARKS}, or name a frame."
+                    )
+                reference_root = choose_reference(
+                    reference_root,
+                    modality,
+                    selection["cbct_landmarks"] if modality == catalogs.MODALITY_CBCT else [],
+                )
             report["reference"] = os.path.basename(reference_root.rstrip(os.sep))
+
+        if modality == catalogs.MODALITY_CBCT and not selection["cbct_landmarks"]:
+            # Sent empty: every landmark the reference defines, which is what a
+            # caller naming a frame wants without restating that frame's set.
+            # Read off the reference itself, so a new reference orients on its
+            # own landmarks without a table here changing.
+            carried = set(_reference_landmarks(reference_root))
+            selection["cbct_landmarks"] = [
+                name for name in catalogs.CBCT_LANDMARKS if name in carried
+            ]
+            if len(selection["cbct_landmarks"]) < _MIN_CBCT_LANDMARKS:
+                raise ToolInputError(
+                    f"CBCT orientation registers on at least {_MIN_CBCT_LANDMARKS} "
+                    f"landmarks, and the reference defines "
+                    f"{len(selection['cbct_landmarks'])} this tool knows."
+                )
 
         if modality == catalogs.MODALITY_CBCT:
             _run_cbct(
@@ -191,6 +270,7 @@ def orient(
                 seed=seed,
                 report=report,
                 sup=sup,
+                input_faults=input_faults,
             )
         else:
             _run_ios(
@@ -213,11 +293,132 @@ def orient(
         # what is left under output_dir is results and nothing else.
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    _summarize(report)
+    _summarize(report, input_faults)
+    if catalogs.OUTPUT_METRICS in outputs:
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
 
     return OrientationRun(output_dir, report)
+
+
+# ---------------------------------------------------------------------------
+# Metrics spreadsheet
+# ---------------------------------------------------------------------------
+
+# Column prefix of each step the engines measure after, in the order they run.
+_STAGE_KEYS = {
+    user_metrics.STEP_OCCLUSAL_PLANE: "occlusal_plane",
+    user_metrics.STEP_THREE_POINT: "three_point_fit",
+    user_metrics.STEP_ORIENTATION: "orientation",
+}
+
+
+def _stage_key(after: str) -> str:
+    """The short column prefix of a stage, a slug of its name if it is new."""
+    if after in _STAGE_KEYS:
+        return _STAGE_KEYS[after]
+    return "_".join("".join(c if c.isalnum() else " " for c in str(after).lower()).split())
+
+
+def _yes_no(value) -> str:
+    # Spelled out rather than left a bool: the .csv would read True/False and
+    # the .xlsx yes/no, and the two are meant to be the same table.
+    return "yes" if value else "no"
+
+
+def _scans(report: dict):
+    """`(patient, jaw or None, scan entry)` for each scan the report holds.
+
+    A CBCT case is one scan; an IOS case is one scan per jaw. An IOS case
+    that failed before any jaw was looked at is one scan with no jaw.
+    """
+    ios = report.get("modality") == catalogs.MODALITY_IOS
+    for patient, entry in sorted((report.get("cases") or {}).items()):
+        jaws = entry.get("jaws") if ios else None
+        if not jaws:
+            yield patient, ("" if ios else None), entry
+            continue
+        for jaw, detail in jaws.items():
+            yield patient, jaw, detail
+
+
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as two tables, read off the report it already wrote.
+
+    `cases`: one row per scan (per jaw for IOS), the numbers the console
+    showed: for each stage the mean, population std and maximum of the point
+    distances to the reference, and which point was furthest.
+    `landmarks`: one row per scan and point -- landmark or tooth centroid --
+    with its distance after each stage, and the points left out of the fit
+    with the reason.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient:
+    this file stays with the caller's own results.
+    """
+    modality = report.get("modality")
+    scans = list(_scans(report))
+    # Every stage any scan was measured after, in the order they run, so the
+    # columns come out in that order whichever scan is first in the table.
+    seen = {_stage_key(stage.get("after"))
+            for _patient, _jaw, detail in scans
+            for stage in (detail.get("metrics") or {}).get("stages") or []}
+    stage_keys = [key for key in _STAGE_KEYS.values() if key in seen]
+    stage_keys += sorted(seen - set(stage_keys))
+
+    cases, points = [], []
+    for patient, jaw, detail in scans:
+        where = {"patient": patient}
+        if jaw is not None:
+            where["jaw"] = jaw
+        row = dict(where, modality=modality, status=detail.get("status"),
+                   error=detail.get("reason") if detail.get("status") == "failed" else None)
+        metrics = detail.get("metrics") or {}
+        if detail.get("status") != "ok" or not metrics:
+            cases.append(row)
+            continue
+
+        labels = list(metrics.get("labels") or [])
+        left_out = dict(metrics.get("left_out") or {})
+        if labels:
+            row["points"] = (metrics.get("points") or user_metrics.POINTS_LANDMARK)[1]
+            row["n_points"] = len(labels)
+        row["left_out"] = ", ".join(sorted(left_out))
+        by_stage = {}
+        for stage in metrics.get("stages") or []:
+            values = stage.get("distances_mm") or []
+            if values and len(values) == len(labels):
+                by_stage[_stage_key(stage.get("after"))] = (values, bool(stage.get("centred")))
+        for key in stage_keys:
+            values = by_stage.get(key, (None,))[0]
+            worst = int(np.argmax(values)) if values else None
+            row[key + "_mean_mm"] = float(np.mean(values)) if values else None
+            row[key + "_std_mm"] = float(np.std(values)) if values else None
+            row[key + "_max_mm"] = float(values[worst]) if values else None
+            row[key + "_max_label"] = labels[worst] if values else None
+        row["centres_matched"] = (_yes_no(any(centred for _v, centred in by_stage.values()))
+                                  if by_stage else None)
+        row["icp_rms_closest_mm"] = (metrics.get("icp") or {}).get("rms_closest_mm")
+        row["rotation_deg"] = metrics.get("rotation_deg")
+        row["translation_mm"] = metrics.get("translation_mm")
+        row["moved_with"] = metrics.get("moved_with")
+        cases.append(row)
+
+        for index, label in enumerate(labels):
+            point = dict(where, point=label)
+            for key in stage_keys:
+                values = by_stage.get(key, (None,))[0]
+                point[key + "_mm"] = float(values[index]) if values else None
+            point["in_fit"] = _yes_no(True)
+            point["left_out_because"] = None
+            points.append(point)
+        for label in sorted(left_out):
+            points.append(dict(where, point=label, in_fit=_yes_no(False),
+                               left_out_because=left_out[label]))
+    return {"cases": cases, "landmarks": points}
 
 
 # ---------------------------------------------------------------------------
@@ -245,10 +446,16 @@ def _selected(value, choices: dict, argument: str) -> list:
     return [name for name in choices if name in wanted]
 
 
+# The fewest landmarks a rigid registration can be fitted on.
+_MIN_CBCT_LANDMARKS = 3
+
+
 def _check_cbct(
     automation: str, landmarks: list, landmarks_path: str, landmark_model: str, sup
 ) -> None:
-    if len(landmarks) < 3:
+    # Empty is not too few: it means "every landmark the reference defines",
+    # counted once the reference is known.
+    if landmarks and len(landmarks) < _MIN_CBCT_LANDMARKS:
         raise ToolInputError(
             f"CBCT orientation registers on at least 3 landmarks; "
             f"{len(landmarks)} are selected in 'cbct_landmarks'."
@@ -299,6 +506,42 @@ def _no_landmarks_reason(key: str, markups_paths: list, orphans: list) -> str:
         "registers on landmarks you provide, so they must travel with the scans -- "
         "send the whole FOLDER rather than the single scan file, pass them in "
         "'landmarks', or use Fully-Automated mode to have them predicted"
+    )
+
+
+# The DATA folder this tool's bundles live in. Written rather than derived, for
+# the reason ALI_CBCT gives about its own: which folder serves which tool is a
+# deployment fact, and a wrong guess is a folder that is simply not there.
+_DATA_NAME = "ASO"
+
+
+def _own_models(data_root) -> str:
+    """`<root>/ASO/models`, or a refusal a caller can act on."""
+    if not data_root:
+        raise ToolInputError(
+            "No 'reference' given and no data root to look in. Name the reference "
+            "bundle, or run this through a server that publishes one."
+        )
+    models_root = os.path.join(str(data_root), _DATA_NAME, "models")
+    if not os.path.isdir(models_root):
+        raise ToolInputError(
+            "No 'reference' given, and this deployment stages no reference bundle "
+            f"for {_DATA_NAME}. Install them with `setup-models.sh --tool "
+            f"{_DATA_NAME}`, or name a reference in 'reference'."
+        )
+    return models_root
+
+
+def _frame_bundle(models_root: str, frame: str) -> str:
+    """The bundle inside `models_root` that defines `frame`, or a refusal."""
+    bundle = catalogs.FRAME_BUNDLES[frame]
+    candidate = os.path.join(models_root, bundle)
+    if os.path.isdir(candidate):
+        return candidate
+    raise ToolInputError(
+        f"The '{frame}' frame is defined by the '{bundle}' reference bundle, and "
+        f"this deployment does not stage it. Install it with `setup-models.sh "
+        f"--tool {_DATA_NAME}`, or name a reference in 'reference'."
     )
 
 
@@ -510,20 +753,34 @@ def _check_ios(automation: str, teeth: list, types: list, jaws: list, occlusion:
 # Calling the landmark tool
 # ---------------------------------------------------------------------------
 
+def _link_scan(scan: str, destination: str) -> None:
+    """Put `scan` at `destination` for the landmark tool, without copying it.
+
+    A link where the filesystem allows one -- a CBCT is hundreds of megabytes
+    -- and a copy where it does not.
+    """
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    try:
+        os.symlink(os.path.abspath(scan), destination)
+    except OSError:
+        shutil.copyfile(scan, destination)
+
+
 def _predict_landmarks(
-    centered_root: str, landmark_model: str, requested: list, work_dir: str, sup
+    scans_root: str, landmark_model: str, requested: list, work_dir: str, sup
 ) -> dict:
-    """Predict landmarks for every centred scan, through the supervisor.
+    """Predict landmarks for every scan under `scans_root`, through the supervisor.
 
     Returns `{patient key: {landmark: position}}`, keyed like
-    `cbct.pipeline.discover`. The results never touch the caller's input tree.
+    `cbct.pipeline.discover`, in the frame of the scans it was given. The
+    results never touch the caller's input tree.
 
     Asked for by NAME, not by region: ASO registers on seven landmarks
     straddling two of the landmark tool's regions, so asking by region would run
     58 agents to use 7 -- and one agent is a full two-scale walk of the volume.
     """
     if sup is not None and hasattr(sup, "progress"):
-        sup.progress(0.2, f"predicting landmarks with {LANDMARK_TOOL}")
+        sup.progress(LANDMARK_SPAN[0], f"predicting landmarks with {LANDMARK_TOOL}")
 
     # Only the landmarks are asked for. Which weights place them is that tool's
     # business, and it finds its own -- this used to compose a path into ALI's
@@ -536,9 +793,10 @@ def _predict_landmarks(
     # keep them -- `keep_intermediate` collects from the supervisor's own folder.
     produced = sup.run(
         LANDMARK_TOOL,
-        input=centered_root,
+        input=scans_root,
         landmarks=list(requested),
         **({"model": landmark_model} if landmark_model else {}),
+        _progress=LANDMARK_SPAN,
     )
     # A tool returns a Path, or a dict of named ones. The landmark tool returns
     # its output directory; a dict is accepted so a future one naming its
@@ -603,7 +861,9 @@ def _collect(output_dir: str) -> dict:
 def _run_cbct(
     input_root, reference_root, automation, requested, landmarks_path, landmark_model,
     dicom_input, output_dir, work_dir, suffix, max_triplets, seed, report, sup,
+    input_faults=None,
 ) -> None:
+    input_faults = input_faults if input_faults is not None else set()
     # Asked of the DATA, not of the caller. DICOM slices routinely carry no
     # extension, so a clinician could not tell from a file name either -- and
     # answering wrong produced a run that failed for a reason nobody could see.
@@ -627,6 +887,19 @@ def _run_cbct(
     # "there are no scans here" is the useful answer, and complaining about the
     # landmark selection first would bury it.
     _check_selection_against_reference(requested, reference_landmarks)
+    logger.info("ASO CBCT: %d patient(s), %d landmark(s) requested",
+                len(patients), len(requested))
+    # Every log line about a patient leads with its position in the whole
+    # cohort, never its key: the key is the scan's name.
+    position = {key: index for index, key in enumerate(sorted(patients), start=1)}
+    total = len(patients)
+
+    def failed(key, step, reason, caller_input=False):
+        logger.warning("patient %d of %d: %s failed (%s)",
+                       position[key], total, step, reason)
+        report["cases"][key] = {"status": "failed", "reason": reason}
+        if caller_input:
+            input_faults.add(key)
 
     # A supplied landmark folder makes a fully-automated run behave like a
     # semi-automated one: the points are the caller's, wherever they came from.
@@ -694,10 +967,12 @@ def _run_cbct(
     report["unmatched_markups"] = orphans
 
     centered_root = os.path.join(work_dir, "centered")
+    # What the landmark tool walks: the ORIGINAL scans, under the patient keys,
+    # so its points are in the frame the reader sent and sees at a stop.
+    scans_root = os.path.join(work_dir, "scans")
 
-    # Phase 1 -- recentre. The landmark tool runs on centred scans (that is what
-    # the Slicer chain did, PRE_ASO_CBCT before ALI_CBCT), so in fully-automated
-    # mode they have to reach disk before it is called.
+    # Phase 1 -- recentre. A predicted patient's centred volume reaches disk,
+    # to be read back for the registration once the landmark tool is done.
     prepared = {}
     # Three phases share the bar, and each is given the slice it occupies so
     # the second does not send it back to zero. The boundaries are where the
@@ -705,20 +980,28 @@ def _run_cbct(
     # landmark tool from there, registration on the tail. What is exact is the
     # counter in the message; the split between phases is a weighting.
     for index, (key, entry) in enumerate(sorted(patients.items()), start=1):
-        progress.report(index, len(patients), "centring scan", end=0.2)
+        progress.report(index, len(patients), "centring scan", end=LANDMARK_SPAN[0])
         _, extension = split_scan_extension(os.path.basename(entry["scan"]))
-        destination = (
-            os.path.join(
-                centered_root,
-                f"{key}{cbct_pipeline.compressed_extension(extension)}",
-            )
-            if key in to_predict
-            else None
-        )
+        # Uncompressed: read by the landmark tool and once more below, then
+        # deleted with the run (see `cbct_pipeline.prepare`).
+        destination = os.path.join(centered_root, f"{key}.nii") if key in to_predict else None
         try:
             image, translation = cbct_pipeline.prepare(entry["scan"], destination)
+            if key in to_predict:
+                # Under the scan's OWN name, in the key's folder: the landmark
+                # tool names its points after the file it read, and a reviewer
+                # pairs points with a scan by that name. Named after the key,
+                # `P1_T1_Or.nii.gz` came back as `P1_T1_lm_Pred` -- the same
+                # patient to `_collect`, which strips both, and no scan at all
+                # to a stop's viewer.
+                _link_scan(entry["scan"], os.path.join(
+                    scans_root, os.path.dirname(key), os.path.basename(entry["scan"])))
         except RuntimeError as exc:
+            # ITK's read error: the scan the caller sent is not one it can open.
+            logger.warning("patient %d of %d: reading the scan failed (%s: %s)",
+                           position[key], total, type(exc).__name__, exc)
             report["cases"][key] = {"status": "failed", "reason": str(exc)}
+            input_faults.add(key)
             continue
         prepared[key] = {
             # Kept in RAM only when it is used next -- a predicted patient's
@@ -730,20 +1013,37 @@ def _run_cbct(
             "landmarks": None,
         }
 
-    # Phase 2 -- landmarks, either the caller's (moved into the centred space)
-    # or predicted ones (already in it, because the tool ran on the centred
-    # scans).
+    # Phase 2 -- landmarks, the caller's or predicted ones, both describing the
+    # ORIGINAL scan and both moved into the centred space.
     # ONE call for every scan that needs predicting, not one per patient: the
     # landmark tool loads its agents once and walks a folder, so a cohort costs
     # what a cohort costs rather than N times a single scan.
     predictions = (
-        _predict_landmarks(centered_root, landmark_model, requested, work_dir, sup)
+        _predict_landmarks(scans_root, landmark_model, requested, work_dir, sup)
         if to_predict else {}
     )
+    if to_predict:
+        # Compared with what was SENT. The nested call succeeds as a whole when
+        # it placed landmarks on any scan at all, so a scan it returned nothing
+        # for -- or a file whose name matched no patient -- is only visible
+        # here.
+        sent = [key for key in prepared if key in to_predict]
+        returned = [key for key in sent if predictions.get(key)]
+        unmatched = sorted(set(predictions) - set(sent))
+        logger.log(
+            logging.WARNING if len(returned) < len(sent) or unmatched else logging.INFO,
+            "%s returned landmarks for %d of %d scan(s); %d predicted file(s) "
+            "matched no scan",
+            LANDMARK_TOOL, len(returned), len(sent), len(unmatched),
+        )
     for key, entry in prepared.items():
         if key in to_predict:
-            # Already in the centred space: the tool ran on the centred scans.
-            entry["landmarks"] = predictions.get(key, {})
+            # Placed on the original scan, like a caller's: moved the same way.
+            entry["landmarks"] = cbct_pipeline.center_landmarks(
+                predictions.get(key, {}), entry["translation"])
+            if not entry["landmarks"]:
+                logger.warning("patient %d of %d: %s returned no landmarks",
+                               position[key], total, LANDMARK_TOOL)
             continue
         # The caller's, moved into the centred space -- they describe the
         # ORIGINAL volume, wherever they came from, and the registration
@@ -751,36 +1051,44 @@ def _run_cbct(
         found = (
             by_patient.get(key, {})
             if by_patient is not None
-            else cbct_pipeline.load_landmarks(patients[key]["markups"])
+            else cbct_pipeline.load_landmarks(
+                patients[key]["markups"], patient=(position[key], total)
+            )
         )
         entry["landmarks"] = cbct_pipeline.center_landmarks(found, entry["translation"])
 
     # Phase 3 -- register and write. It starts where the landmark tool left
     # off, which is only where semi-automated ends its own phase 1: there is no
     # prediction between them, so the bar must not skip the slice it never used.
-    registration_start = 0.6 if fully else 0.2
+    registration_start = LANDMARK_SPAN[1] if fully else LANDMARK_SPAN[0]
     for index, (key, entry) in enumerate(sorted(prepared.items()), start=1):
         progress.report(index, len(prepared), "orienting patient", start=registration_start)
         if not entry["landmarks"]:
-            report["cases"][key] = {
-                "status": "failed",
-                "reason": (
-                    "no predicted landmarks for this scan"
-                    if fully
-                    else _no_landmarks_reason(
-                        key,
-                        [] if supplied else patients[key]["markups"],
-                        orphans,
-                    )
+            predicted = key in to_predict
+            failed(
+                key, "landmark lookup",
+                f"no landmarks predicted by {LANDMARK_TOOL} for this scan"
+                if predicted
+                else _no_landmarks_reason(
+                    key,
+                    [] if supplied else patients[key]["markups"],
+                    orphans,
                 ),
-            }
+                # Landmarks the caller was to send are the caller's to fix;
+                # ones the landmark tool failed to place are not.
+                caller_input=not predicted,
+            )
             continue
-        image = entry["image"]
-        if image is None:
-            import SimpleITK as sitk  # local: only the fully-automated path re-reads
-
-            image = sitk.ReadImage(entry["centered_path"])
+        step = "re-reading the centred scan"
         try:
+            image = entry["image"]
+            if image is None:
+                import SimpleITK as sitk  # local: only the fully-automated path re-reads
+
+                # Inside the per-patient guard: a centred volume that cannot
+                # be read back used to stop the cohort at this patient.
+                image = sitk.ReadImage(entry["centered_path"])
+            step = "registration"
             report["cases"][key] = cbct_pipeline.orient_patient(
                 centered=image,
                 pre_transform=entry["translation"],
@@ -794,8 +1102,13 @@ def _run_cbct(
                 max_triplets=max_triplets,
                 seed=seed,
             )
-        except cbct_pipeline.icp.RegistrationError as exc:
-            report["cases"][key] = {"status": "failed", "reason": str(exc)}
+            # Its position in the cohort, never its key: the key is the scan's name.
+            user_metrics.report_metrics(
+                f"patient {position[key]}/{total}", report["cases"][key].get("metrics")
+            )
+        except (cbct_pipeline.icp.RegistrationError, RuntimeError, OSError) as exc:
+            failed(key, step, f"{type(exc).__name__}: {exc}"
+                   if not isinstance(exc, cbct_pipeline.icp.RegistrationError) else str(exc))
         entry["image"] = None  # a batch must not hold every volume in RAM
 
 
@@ -816,6 +1129,8 @@ def _run_ios(
             f"token says which jaw it is (e.g. 'P1_U_Seg.vtk')."
         )
 
+    logger.info("ASO IOS: %d patient(s), %d tooth/teeth requested",
+                len(patients), len(teeth))
     report["requested_teeth"] = list(teeth)
     # Both are reported: which one a jaw used is decided per jaw, so a cohort
     # can legitimately have registered some on landmarks and some on centroids,
@@ -848,7 +1163,14 @@ def _run_ios(
             max_triplets=max_triplets,
             seed=seed,
             cache=cache,
+            patient=(index, len(patients)),
         )
+        for jaw, outcome in report["cases"][key]["jaws"].items():
+            if outcome.get("status") == "ok":
+                user_metrics.report_metrics(
+                    f"patient {index}/{len(patients)}, {jaw.lower()} jaw",
+                    outcome.get("metrics"),
+                )
 
     # Unconditional now. It only fires when EVERY jaw failed for want of tooth
     # labels, which can only happen on the centroid path -- there is no mode to
@@ -926,17 +1248,50 @@ def _as_directory(path: str, destination: str) -> str:
     return destination
 
 
-def _summarize(report: dict) -> None:
+def _short(text, limit: int = 200) -> str:
+    """The first line of a reason, cut to fit in front of a count.
+
+    The server keeps only the first few hundred characters of a failed run's
+    message, and the count that follows the reason is what says how much of
+    the cohort it cost.
+    """
+    lines = str(text).strip().splitlines()
+    first = lines[0] if lines else ""
+    return first if len(first) <= limit else first[: limit - 3] + "..."
+
+
+def _summarize(report: dict, input_faults=frozenset()) -> None:
+    """Count the outcome, say it, and refuse a run that oriented nobody.
+
+    A run with no patient oriented used to return success with an empty output
+    folder. It raises now, led by the count and the reason most patients
+    failed for -- the report holding the per-patient reasons is deleted with
+    the job directory when a run fails, so this message is all that is left.
+    """
     statuses = [entry.get("status") for entry in report["cases"].values()]
     report["summary"] = {
         "cases": len(statuses),
         "oriented": statuses.count("ok"),
         "failed": statuses.count("failed"),
     }
-    logger.info(
-        "%s %s: %d/%d oriented",
-        report["modality"],
-        report["automation"],
-        report["summary"]["oriented"],
-        report["summary"]["cases"],
+    summary = report["summary"]
+    logger.log(
+        logging.WARNING if summary["failed"] else logging.INFO,
+        "%s %s: %d of %d patients oriented, %d failed",
+        report["modality"], report["automation"],
+        summary["oriented"], summary["cases"], summary["failed"],
     )
+    if summary["cases"] and not summary["oriented"]:
+        reasons = [
+            entry.get("reason") or entry.get("status") or "unknown"
+            for entry in report["cases"].values()
+        ]
+        reason, count = Counter(reasons).most_common(1)[0]
+        message = (
+            f"0 of {summary['cases']} patients oriented; most common failure: "
+            f"{_short(reason)} ({count} of {summary['cases']})"
+        )
+        if set(report["cases"]) <= set(input_faults):
+            # Every patient failed on what the caller sent: their fix, a 422.
+            raise ToolInputError(message)
+        raise RuntimeError(message)

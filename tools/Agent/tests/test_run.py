@@ -6,12 +6,13 @@ reaches the supervisor.
 """
 
 import json
+import logging
 
 import pytest
 
 from sadt_agent import ADVICE_NAME, DECISION_NAME, MODE_ASK, REPORT_NAME, run
 from sadt_agent.errors import (
-    CatalogError,
+    ModelAnswerError,
     SupervisorRequired,
     ToolInputError,
     ToolUnavailableError,
@@ -26,6 +27,31 @@ def decision(output_dir):
 
 def report(output_dir):
     return json.loads((output_dir / REPORT_NAME).read_text(encoding="utf-8"))
+
+
+def cohort(tmp_path):
+    """A folder this request was given, and a scan inside it: the shape a real
+    request has, where every path the model proposes is one of its folders'."""
+    folder = tmp_path / "cohort"
+    folder.mkdir(exist_ok=True)
+    scan = folder / "scan.nii.gz"
+    scan.write_bytes(b"")
+    return folder, scan
+
+
+def proposal(tmp_path, **overrides):
+    """What the stubbed model extracts for Bone_Seg: a scan of the cohort and a
+    hosted model named the way a server names one."""
+    _folder, scan = cohort(tmp_path)
+    values = {"scans": str(scan), "model": "bone_model"}
+    values.update(overrides)
+    return extracted(values)
+
+
+def execute_in_cohort(tmp_path, catalog_file, supervisor, **overrides):
+    folder, _scan = cohort(tmp_path)
+    return invoke(tmp_path, catalog_file, execute=True, sup=supervisor,
+                  folders=[folder], **overrides)
 
 
 def invoke(tmp_path, catalog_file, **overrides):
@@ -172,7 +198,7 @@ def test_a_router_answer_that_is_not_json_is_an_error(
     tmp_path, catalog_file, stub_model
 ):
     stub_model("I would rather not.")
-    with pytest.raises(ToolInputError):
+    with pytest.raises(ModelAnswerError):
         invoke(tmp_path, catalog_file)
 
 
@@ -285,8 +311,8 @@ def test_the_endpoint_is_resolved_once_and_used_for_both_calls(
     tmp_path, catalog_file, stub_model
 ):
     stub = stub_model(routed("Bone_Seg"), extracted({}))
-    invoke(tmp_path, catalog_file, endpoint="http://gpu-box:11434")
-    assert {call["endpoint"] for call in stub.calls} == {"http://gpu-box:11434"}
+    invoke(tmp_path, catalog_file, endpoint="http://127.0.0.1:11435")
+    assert {call["endpoint"] for call in stub.calls} == {"http://127.0.0.1:11435"}
 
 
 # ---------------------------------------------------------------------------
@@ -351,24 +377,39 @@ def test_execute_is_off_by_default(tmp_path, catalog_file, stub_model):
 def test_execute_runs_the_chosen_tool_through_the_supervisor(
     tmp_path, catalog_file, stub_model
 ):
-    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
     supervisor = FakeSup(tmp_path)
-    output_dir = invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+    output_dir = execute_in_cohort(tmp_path, catalog_file, supervisor)
 
     assert len(supervisor.calls) == 1
     name, parameters = supervisor.calls[0]
     assert name == "Bone_Seg"
-    assert parameters["scans"] == "/d" and parameters["model"] == "/m"
+    _folder, scan = cohort(tmp_path)
+    assert parameters["scans"] == str(scan) and parameters["model"] == "bone_model"
     assert decision(output_dir)["executed"] is True
+
+
+def test_the_chosen_tool_fills_the_bar_from_the_waypoint_to_the_end(
+    tmp_path, catalog_file, stub_model
+):
+    """The callee's own 0..1 is folded into the span it is handed, which starts
+    at the waypoint this tool writes before the call and ends the bar."""
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
+    supervisor = FakeSup(tmp_path)
+    execute_in_cohort(tmp_path, catalog_file, supervisor)
+
+    assert supervisor.spans == [("Bone_Seg", (0.1, 1.0))]
+    assert "_progress" not in supervisor.calls[0][1]
+    assert supervisor.messages[-1] == (0.1, "running Bone_Seg")
 
 
 def test_the_supervised_run_writes_inside_this_run_s_own_output(
     tmp_path, catalog_file, stub_model
 ):
     """`output_dir` is ours to give and never the model's to propose."""
-    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
     supervisor = FakeSup(tmp_path)
-    output_dir = invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+    output_dir = execute_in_cohort(tmp_path, catalog_file, supervisor)
 
     _name, parameters = supervisor.calls[0]
     assert parameters["output_dir"] == str(output_dir / "run")
@@ -379,12 +420,9 @@ def test_the_supervised_run_writes_inside_this_run_s_own_output(
 def test_an_output_dir_the_model_proposed_never_reaches_the_supervisor(
     tmp_path, catalog_file, stub_model
 ):
-    stub_model(
-        routed("Bone_Seg"),
-        extracted({"scans": "/d", "model": "/m", "output_dir": "/etc"}),
-    )
+    stub_model(routed("Bone_Seg"), proposal(tmp_path, output_dir="/etc"))
     supervisor = FakeSup(tmp_path)
-    output_dir = invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+    output_dir = execute_in_cohort(tmp_path, catalog_file, supervisor)
     _name, parameters = supervisor.calls[0]
     assert parameters["output_dir"] == str(output_dir / "run")
 
@@ -392,9 +430,10 @@ def test_an_output_dir_the_model_proposed_never_reaches_the_supervisor(
 def test_execute_without_a_supervisor_says_what_to_do_instead(
     tmp_path, catalog_file, stub_model
 ):
-    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
+    folder, _scan = cohort(tmp_path)
     with pytest.raises(SupervisorRequired) as raised:
-        invoke(tmp_path, catalog_file, execute=True)
+        invoke(tmp_path, catalog_file, execute=True, folders=[folder])
     assert "run it yourself" in str(raised.value)
 
 
@@ -446,26 +485,26 @@ def test_a_refusal_to_execute_is_a_warning_in_the_report(
 def test_a_failing_supervised_tool_carries_its_own_failure_up(
     tmp_path, catalog_file, stub_model
 ):
-    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
-    supervisor = FakeSup(tmp_path, fail=FileNotFoundError("No scan found in '/d'."))
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
+    supervisor = FakeSup(tmp_path, fail=FileNotFoundError("No scan found in the cohort."))
     with pytest.raises(FileNotFoundError) as raised:
-        invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+        execute_in_cohort(tmp_path, catalog_file, supervisor)
     assert "No scan found" in str(raised.value)
 
 
 def test_the_supervisor_is_told_what_is_running(tmp_path, catalog_file, stub_model):
-    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
     supervisor = FakeSup(tmp_path)
-    invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+    execute_in_cohort(tmp_path, catalog_file, supervisor)
     assert any("Bone_Seg" in str(message) for _f, message in supervisor.messages)
 
 
 def test_a_dict_of_named_outputs_is_recorded(tmp_path, catalog_file, stub_model):
     """A tool returns a `Path` or a `dict[str, Path]`; both have to survive into
     the decision, because the names are what a later chain would wire on."""
-    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    stub_model(routed("Bone_Seg"), proposal(tmp_path))
     supervisor = FakeSup(tmp_path, result={"mandible": tmp_path / "m.nii.gz"})
-    output_dir = invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+    output_dir = execute_in_cohort(tmp_path, catalog_file, supervisor)
     assert decision(output_dir)["execution"]["returned"] == {
         "mandible": str(tmp_path / "m.nii.gz")
     }
@@ -508,7 +547,7 @@ def test_a_missing_catalogue_is_refused_before_any_model_call(
 ):
     monkeypatch.delenv("SADT_API", raising=False)
     stub = stub_model()
-    with pytest.raises(CatalogError):
+    with pytest.raises(ToolUnavailableError):
         run(prompt="anything", output_dir=tmp_path / "out")
     assert stub.calls == []
 
@@ -528,3 +567,277 @@ def test_the_output_directory_is_created(tmp_path, catalog_file, stub_model):
     stub_model(routed("Bone_Seg"), extracted({}))
     output_dir = invoke(tmp_path, catalog_file, output_dir=tmp_path / "a" / "b" / "c")
     assert output_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# What an operator sees while it runs, and when it stops
+# ---------------------------------------------------------------------------
+
+def progress_messages(path):
+    return [
+        json.loads(line).get("message")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("kind") != "log"
+    ]
+
+
+def test_each_stage_is_announced_before_it_starts(
+    tmp_path, catalog_file, stub_model, monkeypatch
+):
+    """A run stalled on the model has to say WHICH round trip it is waiting on;
+    before, the last progress message was whatever the server wrote at start."""
+    events = tmp_path / "progress.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events))
+    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    invoke(tmp_path, catalog_file)
+    assert progress_messages(events) == [
+        "reading catalogue", "router call", "extraction call (tool Bone_Seg)",
+    ]
+
+
+def test_each_model_call_is_logged_with_its_duration(
+    tmp_path, catalog_file, stub_model, caplog
+):
+    stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        invoke(tmp_path, catalog_file)
+    lines = [record.getMessage() for record in caplog.records]
+    assert any(line.startswith("catalogue read: ") for line in lines)
+    assert any(line.startswith("router call answered in ") for line in lines)
+    assert any(
+        line.startswith("extraction call (tool Bone_Seg) answered in ")
+        for line in lines
+    )
+
+
+def test_a_failed_model_call_is_logged_with_its_duration_and_class(
+    tmp_path, catalog_file, monkeypatch, caplog
+):
+    def unreachable(*args, **kwargs):
+        raise ToolUnavailableError("router call exceeded timeout_seconds=1")
+
+    monkeypatch.setattr("sadt_agent.llm.chat", unreachable)
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        with pytest.raises(ToolUnavailableError):
+            invoke(tmp_path, catalog_file)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        line.startswith("router call failed after ") and "ToolUnavailableError" in line
+        for line in warnings
+    )
+
+
+def test_the_call_name_reaches_the_model_client(tmp_path, catalog_file, stub_model):
+    """So a timeout can say which call ran out of time."""
+    stub = stub_model(routed("Bone_Seg"), extracted({"scans": "/d", "model": "/m"}))
+    invoke(tmp_path, catalog_file)
+    assert [call["kwargs"]["call"] for call in stub.calls] == [
+        "router call", "extraction call (tool Bone_Seg)",
+    ]
+
+
+def test_the_routing_outcome_is_one_info_line(
+    tmp_path, catalog_file, stub_model, caplog
+):
+    stub_model(routed("Bone_Seg", 0.92), extracted({"scans": "/d"}))
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        invoke(tmp_path, catalog_file)
+    outcomes = [
+        record for record in caplog.records
+        if record.getMessage().startswith("routing outcome: ")
+    ]
+    assert len(outcomes) == 1
+    assert outcomes[0].levelno == logging.INFO
+    assert outcomes[0].getMessage() == (
+        "routing outcome: tool=Bone_Seg, confidence=0.92, 0 error(s), "
+        "1 required argument(s) missing"
+    )
+
+
+def test_no_tool_chosen_is_still_summarised(
+    tmp_path, catalog_file, stub_model, caplog
+):
+    stub_model(routed(None, 0.3))
+    with caplog.at_level(logging.INFO, logger="Agent"):
+        invoke(tmp_path, catalog_file)
+    assert (
+        "routing outcome: tool=none, confidence=0.30, 1 error(s), "
+        "0 required argument(s) missing"
+    ) in [record.getMessage() for record in caplog.records]
+
+
+# ---------------------------------------------------------------------------
+# execute -- only on paths inside this request's own folders
+# ---------------------------------------------------------------------------
+#
+# The server refuses a file argument sent as a path: a file has to be uploaded,
+# or a workstation could point a tool at another run's inputs. The model's
+# arguments reach the supervisor without passing that check, so a prompt that
+# names a path -- or a model that invents one -- would have the callee read it.
+
+def _refused(tmp_path, catalog_file, stub_model, values):
+    stub_model(routed("Bone_Seg"), extracted(values))
+    supervisor = FakeSup(tmp_path)
+    output_dir = execute_in_cohort(tmp_path, catalog_file, supervisor)
+    made = decision(output_dir)
+    assert supervisor.calls == [], "the supervisor was reached"
+    assert made["executed"] is False
+    assert any("Not executed" in line for line in report(output_dir)["warnings"])
+    return made["execution_refused"]
+
+
+def test_a_path_outside_the_folders_is_refused_and_never_run(
+    tmp_path, catalog_file, stub_model
+):
+    outside = tmp_path / "another_run" / "scan.nii.gz"
+    outside.parent.mkdir()
+    outside.write_bytes(b"")
+    reason = _refused(tmp_path, catalog_file, stub_model,
+                      {"scans": str(outside), "model": "bone_model"})
+    assert "scans" in reason
+
+
+def test_a_path_climbing_out_of_a_folder_is_refused(tmp_path, catalog_file, stub_model):
+    folder, _scan = cohort(tmp_path)
+    climbing = str(folder / ".." / "catalog.json")
+    reason = _refused(tmp_path, catalog_file, stub_model,
+                      {"scans": climbing, "model": "bone_model"})
+    assert "scans" in reason
+
+
+def test_a_link_inside_a_folder_pointing_outside_is_refused(
+    tmp_path, catalog_file, stub_model
+):
+    folder, _scan = cohort(tmp_path)
+    (folder / "escape").symlink_to(tmp_path / "catalog.json")
+    reason = _refused(tmp_path, catalog_file, stub_model,
+                      {"scans": str(folder / "escape"), "model": "bone_model"})
+    assert "scans" in reason
+
+
+def test_a_relative_path_is_refused(tmp_path, catalog_file, stub_model):
+    """Relative to what the callee runs in, which is none of the folders."""
+    reason = _refused(tmp_path, catalog_file, stub_model,
+                      {"scans": "scan.nii.gz", "model": "bone_model"})
+    assert "scans" in reason
+
+
+def test_no_folder_given_means_no_path_can_be_run(tmp_path, catalog_file, stub_model):
+    _folder, scan = cohort(tmp_path)
+    stub_model(routed("Bone_Seg"), extracted({"scans": str(scan), "model": "bone_model"}))
+    supervisor = FakeSup(tmp_path)
+    output_dir = invoke(tmp_path, catalog_file, execute=True, sup=supervisor)
+    assert supervisor.calls == []
+    assert "scans" in decision(output_dir)["execution_refused"]
+
+
+@pytest.mark.parametrize("named", ["/opt/weights/bone.pth", "../bone_model", "..", "a/b"])
+def test_a_model_named_by_a_path_is_refused(tmp_path, catalog_file, stub_model, named):
+    """A model is the server's to resolve from its own name; a path would load
+    whatever weights sit there -- and weights are pickles."""
+    _folder, scan = cohort(tmp_path)
+    reason = _refused(tmp_path, catalog_file, stub_model,
+                      {"scans": str(scan), "model": named})
+    assert "model" in reason
+
+
+def test_a_model_inside_the_folders_is_still_refused(tmp_path, catalog_file, stub_model):
+    """The folders hold what the request is about, not weights to run."""
+    folder, scan = cohort(tmp_path)
+    reason = _refused(tmp_path, catalog_file, stub_model,
+                      {"scans": str(scan), "model": str(folder / "weights.pth")})
+    assert "model" in reason
+
+
+def test_a_path_inside_a_folder_is_run(tmp_path, catalog_file, stub_model):
+    folder, _scan = cohort(tmp_path)
+    nested = folder / "T1" / "scan.nii.gz"
+    nested.parent.mkdir()
+    nested.write_bytes(b"")
+    stub_model(routed("Bone_Seg"), extracted({"scans": str(nested), "model": "bone_model"}))
+    supervisor = FakeSup(tmp_path)
+    output_dir = execute_in_cohort(tmp_path, catalog_file, supervisor)
+    assert [name for name, _parameters in supervisor.calls] == ["Bone_Seg"]
+    assert decision(output_dir)["executed"] is True
+
+
+def test_the_folder_itself_is_inside_itself(tmp_path, catalog_file, stub_model):
+    folder, _scan = cohort(tmp_path)
+    stub_model(routed("Bone_Seg"), extracted({"scans": str(folder), "model": "bone_model"}))
+    supervisor = FakeSup(tmp_path)
+    execute_in_cohort(tmp_path, catalog_file, supervisor)
+    assert len(supervisor.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# On a server, a folder confines only if it lies inside the run's own job
+# ---------------------------------------------------------------------------
+#
+# `folders` is a list of strings the caller chose, not an upload: a token holder
+# sending `folders=["/"]` would otherwise make every path "inside a folder".
+# On a server the job directory is what the run itself holds, so a folder counts
+# only within it; outside a server the folders are the caller's own machine.
+
+def _on_a_server(tmp_path, monkeypatch):
+    job = tmp_path / "job"
+    (job / "input").mkdir(parents=True)
+    monkeypatch.setenv("SADT_JOB_DIR", str(job))
+    return job
+
+
+def _execute(tmp_path, catalog_file, stub_model, folders, scans):
+    stub_model(routed("Bone_Seg"), extracted({"scans": str(scans), "model": "bone_model"}))
+    supervisor = FakeSup(tmp_path)
+    output_dir = invoke(tmp_path, catalog_file, execute=True, sup=supervisor,
+                        folders=[str(folder) for folder in folders])
+    return supervisor, decision(output_dir)
+
+
+def test_on_a_server_the_root_folder_confines_nothing(
+    tmp_path, catalog_file, stub_model, monkeypatch
+):
+    _on_a_server(tmp_path, monkeypatch)
+    supervisor, made = _execute(tmp_path, catalog_file, stub_model, ["/"], "/etc/passwd")
+    assert supervisor.calls == []
+    assert made["executed"] is False
+    assert "scans" in made["execution_refused"]
+    assert "/etc" not in made["execution_refused"]
+
+
+def test_on_a_server_a_folder_inside_the_job_still_confines(
+    tmp_path, catalog_file, stub_model, monkeypatch
+):
+    job = _on_a_server(tmp_path, monkeypatch)
+    folder = job / "input" / "cohort"
+    folder.mkdir()
+    scan = folder / "scan.nii.gz"
+    scan.write_bytes(b"")
+    supervisor, made = _execute(tmp_path, catalog_file, stub_model, [folder], scan)
+    assert [name for name, _parameters in supervisor.calls] == ["Bone_Seg"]
+    assert made["executed"] is True
+
+
+def test_on_a_server_a_link_in_the_job_pointing_out_is_no_folder(
+    tmp_path, catalog_file, stub_model, monkeypatch
+):
+    job = _on_a_server(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "another_run"
+    elsewhere.mkdir()
+    (elsewhere / "scan.nii.gz").write_bytes(b"")
+    link = job / "input" / "cohort"
+    link.symlink_to(elsewhere, target_is_directory=True)
+    supervisor, made = _execute(tmp_path, catalog_file, stub_model, [link],
+                                link / "scan.nii.gz")
+    assert supervisor.calls == []
+    assert "scans" in made["execution_refused"]
+
+
+def test_outside_a_server_the_folders_are_the_caller_s_own(
+    tmp_path, catalog_file, stub_model, monkeypatch
+):
+    """No job directory, no server: the folders name the caller's own machine,
+    and confine the model to them as before."""
+    monkeypatch.delenv("SADT_JOB_DIR", raising=False)
+    folder, scan = cohort(tmp_path)
+    supervisor, made = _execute(tmp_path, catalog_file, stub_model, [folder], scan)
+    assert made["executed"] is True

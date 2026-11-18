@@ -49,7 +49,13 @@ def correct_histogram(
     The agents were trained on volumes normalized this way, so this is part of
     the model's contract, not a cosmetic step.
     """
-    image = sitk.Cast(sitk.ReadImage(input_path), sitk.sitkFloat32)
+    # Reoriented to the axis order the agents were trained on: they read the
+    # voxel array, so a scan stored with an axis flipped (direction
+    # diag(1, -1, 1) is common) shows them a mirrored head, and they wander
+    # off it. DICOMOrient permutes and flips the grid without resampling, so
+    # every physical point keeps its intensity and the landmarks found here
+    # are valid in the original scan's frame.
+    image = sitk.Cast(sitk.DICOMOrient(sitk.ReadImage(input_path), "LPS"), sitk.sitkFloat32)
     array = sitk.GetArrayFromImage(image)
 
     array_min = float(np.min(array))
@@ -153,7 +159,9 @@ def convert_dicom_series(directory: str, output_path: str) -> str:
     reader = sitk.ImageSeriesReader()
     file_names = reader.GetGDCMSeriesFileNames(directory)
     if not file_names:
-        raise ValueError(f"No DICOM series found in {directory}")
+        # Without the directory: it is named after the patient, and the
+        # caller already knows which series it sent at this position.
+        raise ValueError("GDCM found no slice of a DICOM series in this folder")
 
     reader.SetFileNames(file_names)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # The workflows pin each action to a commit; this keeps those pins current.
+  # Tool dependencies are deliberately left out: a tool's pins move only with
+  # a revalidation of its outputs.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

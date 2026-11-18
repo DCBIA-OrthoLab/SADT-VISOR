@@ -27,7 +27,7 @@ def test_cuda_falls_back_to_cpu_when_no_card_is_visible(no_cuda):
 
 def test_the_fallback_is_logged(no_cuda, caplog):
     """A run that quietly took forty times longer must say why."""
-    with caplog.at_level(logging.WARNING, logger="CLIC"):
+    with caplog.at_level(logging.WARNING, logger="sadt_clic"):
         pipeline.resolve_device("cuda")
 
     assert any("cpu" in record.message for record in caplog.records)

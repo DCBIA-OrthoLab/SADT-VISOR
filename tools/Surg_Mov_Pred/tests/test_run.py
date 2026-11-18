@@ -311,3 +311,48 @@ def test_a_named_model_folder_still_wins(model, measurements, tmp_path):
 def test_no_model_and_no_data_root_says_which_of_the_two_is_missing(measurements, tmp_path):
     with pytest.raises(ValueError, match="no data root"):
         run(measurements=measurements, output_dir=tmp_path / "out")
+
+
+# --- progress ---------------------------------------------------------------
+
+
+def test_progress_records_are_written_when_the_server_names_a_file(
+    tmp_path, monkeypatch
+):
+    """Every stage reports itself, in order, and the bar never goes back.
+
+    Each stage owns a slice of the run, so a later stage's "1 of n" starts
+    where the previous one ended instead of at zero.
+    """
+    import json
+
+    models = tmp_path / "models"
+    make_model(models, "a_Pred")
+    make_model(models, "b_Pred")
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    pd.DataFrame({"PatientID": [1], "f1": [10]}).to_csv(batch / "a.csv", index=False)
+    pd.DataFrame({"PatientID": [2], "f1": [20]}).to_csv(batch / "b.csv", index=False)
+
+    progress_file = tmp_path / "progress.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(progress_file))
+
+    run(measurements=batch, model=models, output_dir=tmp_path / "out")
+
+    records = [json.loads(line) for line in progress_file.read_text().splitlines()]
+    messages = [record["message"] for record in records]
+    assert messages == [
+        "reading table 1 of 2",
+        "reading table 2 of 2",
+        "loading model packages",
+        "package 1 of 2",
+        "package 2 of 2",
+        "predicting target 1 of 2",
+        "predicting target 2 of 2",
+        "writing results",
+    ]
+    fractions = [record["fraction"] for record in records]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    # Position, never a name: nothing the caller called its files reaches it.
+    assert "a.csv" not in progress_file.read_text()

@@ -1,0 +1,53 @@
+[project]
+name = "sadt-vface"
+version = "0.1.0"
+description = "Classify a patient's facial asymmetry from a CBCT, or measure the change between two timepoints."
+# Bound by the stack below rather than left open: nnunetv2 and the torch build
+# publish no wheels past 3.11, and an open-ended ">=3.11" makes uv pick 3.13 and
+# spend a quarter of an hour building from source.
+requires-python = ">=3.11,<3.12"
+# The same stack every sibling locks -- VFACE drives six of them and has to
+# agree with what they produce -- plus the two packages nothing else here needs:
+# `lightgbm` and `joblib`, which are the asymmetry classifier itself.
+dependencies = [
+    "SimpleITK==2.5.6",
+    "numpy==2.3.2",
+    "scipy==1.16.2",
+    "vtk==9.6.2",
+    "pandas==2.3.3",
+    "openpyxl==3.1.5",
+    "lightgbm==4.6.0",
+    "joblib==1.5.2",
+    # Not optional, and upstream does not install it. The three classifier
+    # models are LightGBM's SKLEARN-API wrappers -- they answer to
+    # `feature_name_`, which a plain `lgb.Booster` does not have -- so
+    # unpickling one pulls `lightgbm.sklearn`, which refuses to import without
+    # scikit-learn. Upstream's Slicer happens to have it from another
+    # extension; a tool here has only what it declares.
+    "scikit-learn==1.7.2",
+]
+
+[tool.sadt]
+tool = true
+name = "VFACE"
+
+[dependency-groups]
+dev = ["pytest==8.3.4", "sadt-testkit"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sadt_vface"]
+
+[tool.uv.sources]
+sadt-testkit = { path = "../../testkit", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not gpu and not models'"
+markers = [
+    "gpu: needs a CUDA device. Deselected by default; run it by hand and report the result in the PR.",
+    "models: needs the real bundles the supervised tools run with.",
+]

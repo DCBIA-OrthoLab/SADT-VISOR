@@ -15,7 +15,7 @@ import numpy as np
 import SimpleITK as sitk
 import vtk
 
-from .. import geometry
+from .. import geometry, user_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,9 @@ class Registration:
     landmarks: dict
     used: list = field(default_factory=list)
     dropped: dict = field(default_factory=dict)
+    # What the registration measured, for the user and the report: see
+    # `user_metrics.metric_lines` for what each entry is.
+    metrics: dict = field(default_factory=dict)
 
 
 def landmarks_to_remove(source: dict, target: dict) -> list:
@@ -149,7 +152,12 @@ def register(
         source, target, picks, include_translation=False
     )
 
-    icp_matrix = _icp_matrix(coarse, target)
+    icp_matrix, icp_iterations = _icp_matrix(coarse, target)
+    # Measured on the pose the ICP ended in, translation included: that is the
+    # quantity it minimised, before the translation is dropped below.
+    icp_rms = user_metrics.closest_point_rms(
+        geometry.transform_landmarks(coarse, icp_matrix).values(), target.values()
+    )
     # The ICP translation is dropped for the same reason the coarse one is: the
     # scans share the physical origin already.
     icp_matrix[:3, 3] = 0.0
@@ -169,12 +177,43 @@ def register(
     if pre_transform is not None:
         full.AddTransform(pre_transform)
 
+    landmarks = geometry.transform_landmarks(source_landmarks, icp_matrix @ coarse_matrix)
+    labels = sorted(shared)
+    rotation_deg, translation_mm = user_metrics.rotation_and_translation(
+        icp_matrix @ coarse_matrix @ _matrix_of(pre_transform)
+    )
+    metrics = {
+        "points": list(user_metrics.POINTS_LANDMARK),
+        "labels": labels,
+        "left_out": dict(dropped),
+        # Both steps rotate only, as applied: the scan and the reference are
+        # each centred on the origin, and what is left between the two centred
+        # frames is an offset the orientation never meant to remove. Measured
+        # with the centres matched, so the distance grades the rotation; a raw
+        # distance read 17 mm on a rotation recovered exactly.
+        "stages": [
+            {"after": user_metrics.STEP_THREE_POINT, "centred": True,
+             "distances_mm": user_metrics.distances(
+                 geometry.transform_landmarks(source, coarse_matrix), target, labels,
+                 centred=True)},
+            {"after": user_metrics.STEP_ORIENTATION, "centred": True,
+             "distances_mm": user_metrics.distances(landmarks, target, labels, centred=True)},
+        ],
+        "icp": {"iterations": icp_iterations, "rms_closest_mm": icp_rms,
+                "translation_applied": False},
+        # Of the whole move from the ORIGINAL scan to the oriented one,
+        # recentring included: the translation is the recentring's length.
+        "rotation_deg": rotation_deg,
+        "translation_mm": translation_mm,
+    }
+
     return Registration(
         resample_transform=rotations.GetInverse(),
         full_transform=full.GetInverse(),
-        landmarks=geometry.transform_landmarks(source_landmarks, icp_matrix @ coarse_matrix),
-        used=sorted(shared),
+        landmarks=landmarks,
+        used=labels,
         dropped=dropped,
+        metrics=metrics,
     )
 
 
@@ -196,7 +235,21 @@ def _sitk_steps(steps: list) -> list:
     return transforms
 
 
-def _icp_matrix(source: dict, target: dict) -> np.ndarray:
+def _matrix_of(transform) -> np.ndarray:
+    """The 4x4 of a linear SimpleITK transform (identity for None), read off
+    where it sends the origin and the three unit vectors."""
+    matrix = np.eye(4)
+    if transform is None:
+        return matrix
+    origin = np.array(transform.TransformPoint((0.0, 0.0, 0.0)))
+    for column, unit in enumerate(np.eye(3)):
+        matrix[:3, column] = np.array(transform.TransformPoint(tuple(unit))) - origin
+    matrix[:3, 3] = origin
+    return matrix
+
+
+def _icp_matrix(source: dict, target: dict) -> tuple:
+    """`(4x4 ICP matrix, iterations it ran)`."""
     icp = vtk.vtkIterativeClosestPointTransform()
     icp.SetSource(_to_polydata(source))
     icp.SetTarget(_to_polydata(target))
@@ -209,7 +262,7 @@ def _icp_matrix(source: dict, target: dict) -> np.ndarray:
     matrix = icp.GetMatrix()
     return np.array(
         [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
-    )
+    ), int(icp.GetNumberOfIterations())
 
 
 def _to_polydata(landmarks: dict) -> vtk.vtkPolyData:

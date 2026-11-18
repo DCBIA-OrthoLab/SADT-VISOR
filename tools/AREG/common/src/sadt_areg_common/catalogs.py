@@ -31,13 +31,31 @@ AUTOMATION_ORIENTED = "Oriented + Fully-Automated"
 # Registration" beside it.
 AUTOMATION_REGISTRATION = "Registration"
 
-# Fully-Automated is the default rather than the Slicer module's
-# Or_Auto_CBCT: the oriented mode additionally needs an orientation reference
-# bundle, and a default that cannot run without a file the user has not chosen
-# yet reads as a broken tool rather than as a default.
+# The default, and it names no mode: each engine reads the mode off what the
+# request supplies -- masks, a reference, landmarks -- and this says "do that".
+#
+# It exists because a mode a caller DECLARES can disagree with the folder they
+# sent, and when it did the disagreement was silent, which is the lesson ASO
+# wrote down first: a fully-automated run over landmarks already on disk
+# predicted them again, a semi-automated one over scans with none failed patient
+# by patient. AREG had the same hole, with masks in place of landmarks.
+#
+# Named rather than empty, because it is published: a caller reading the schema
+# sees a value that says what it does, and a report that prints it is readable.
+# An explicit mode beside it is an OVERRIDE and still obeyed -- "segment anyway,
+# I know the masks are there" is a legitimate thing to want, and is now the only
+# thing naming a mode does.
+AUTOMATION_AUTO = "From the data"
+
+# Nothing pre-ticked but the auto value. Fully-Automated used to be the default,
+# chosen over the Slicer module's Or_Auto_CBCT because the oriented mode needs a
+# reference bundle the user has not picked yet -- but a default that names a mode
+# also made "Fully-Automated" indistinguishable from "nobody touched the menu",
+# so the override could not be told from the default. See AUTOMATION_AUTO.
 AUTOMATION_CHOICES = {
+    AUTOMATION_AUTO: True,
     AUTOMATION_SEMI: False,
-    AUTOMATION_FULLY: True,
+    AUTOMATION_FULLY: False,
     AUTOMATION_ORIENTED: False,
     AUTOMATION_REGISTRATION: False,
 }
@@ -46,14 +64,18 @@ AUTOMATION_CHOICES = {
 # "this option only exists for that modality" -- `visible_when` hides an
 # argument, not one option of a choice -- so the pair is checked in
 # AREGLogic.main and answered with a 422 naming what is available.
+# `AUTOMATION_AUTO` is in every one of them: every modality can read its mode
+# off the data, and the engines differ only in what they read.
 AUTOMATION_BY_MODALITY = {
-    MODALITY_CBCT: (AUTOMATION_SEMI, AUTOMATION_FULLY, AUTOMATION_ORIENTED),
-    MODALITY_IOS: (AUTOMATION_SEMI, AUTOMATION_FULLY),
+    MODALITY_CBCT: (AUTOMATION_AUTO, AUTOMATION_SEMI, AUTOMATION_FULLY,
+                    AUTOMATION_ORIENTED),
+    MODALITY_IOS: (AUTOMATION_AUTO, AUTOMATION_SEMI, AUTOMATION_FULLY),
     # No "Oriented + Fully-Automated" here: orienting before registering is a
     # CBCT step, and there is nothing to orient an intraoral scan onto in this
     # mode. Its third value is Registration instead -- landmarks in, no
     # prediction at all.
-    MODALITY_IOSCBCT: (AUTOMATION_SEMI, AUTOMATION_FULLY, AUTOMATION_REGISTRATION),
+    MODALITY_IOSCBCT: (AUTOMATION_AUTO, AUTOMATION_SEMI, AUTOMATION_FULLY,
+                       AUTOMATION_REGISTRATION),
 }
 
 
@@ -106,6 +128,61 @@ SEGMENTATION_CODES = {
 # airway on every patient would add minutes of GPU and gigabytes of output to
 # a run nobody asked to segment.
 SEGMENTATION_CHOICES = {name: False for name in SEGMENTATION_CODES}
+
+# The same grouping AMASSS publishes, in AMASSS's own order, so the two panels
+# read alike: a clinician who ticks structures in AMASSS and then in AREG is
+# looking at one list, not two spellings of it.
+#
+# Restated rather than imported, for the reason AREG's own copy of the DICOM
+# conversion gives: importing another tool's module at load time makes one
+# tool's missing dependency take BOTH out of the registry, and the two live in
+# different virtualenvs. `SEGMENTATION_CODES` above already restates the same
+# table; this adds only the headings.
+#
+# AMASSS's third group, "Masks", is deliberately absent. Those are the volumes
+# the registration is confined to, this tool asks AMASSS for them itself
+# (`REGION_MASK_STRUCTURES`), and offering them here would let a clinician tick
+# a mask as though it were something to look at.
+SEGMENTATION_GROUPS = {
+    "Bones": ["Mandible", "Maxilla", "Cranial base", "Cervical vertebra"],
+    "Soft tissue": ["Upper airway", "Skin"],
+}
+
+# ---------------------------------------------------------------------------
+# The frame a CBCT is oriented into before registering
+# ---------------------------------------------------------------------------
+# Two published bundles, two different definitions of "straight", and the choice
+# is clinical rather than technical: they carry DISJOINT landmark sets --
+# Frankfurt Horizontal + Midsagittal has Ba/S/N/RPo/LPo/ROr/LOr, Occlusal +
+# Midsagittal has ANS/IF/PNS/UL6O/UR1O/UR6O (see ASO's `choose_reference`, and
+# `AREG_Method/CBCT.py:622-630` in the extension this was ported from). Someone
+# studying the cranial base and someone studying the occlusion do not want the
+# same one, and the measurement made afterwards does not say the same thing.
+#
+# This replaced a boolean, `orient_t1_first`, which was a two-valued control over
+# a three-valued question -- the same defect as the three-valued `automation` it
+# was introduced to fix, where two values were facts and one was a preference.
+#
+# Spelled "Frankfurt" rather than the anatomical "Frankfort" because that is what
+# the published bundle is called and what the rest of this repository says: a
+# panel and a folder disagreeing by a letter is a support question.
+ORIENTATION_NONE = "Leave as scanned"
+ORIENTATION_FRANKFURT = "Frankfurt horizontal"
+ORIENTATION_OCCLUSAL = "Occlusal plane"
+
+# Frankfurt horizontal by default, the frame the lab measures in. It costs an ASO
+# chain and a landmark prediction per patient; "Leave as scanned" is one click
+# away for a cohort that should come back in the frame it arrived in.
+ORIENTATION_CHOICES = {
+    ORIENTATION_NONE: False,
+    ORIENTATION_FRANKFURT: True,
+    ORIENTATION_OCCLUSAL: False,
+}
+
+# Which reference bundle defines each frame is ASO's to know: AREG asks ASO for
+# the frame by name (`AREG_CBCT.dispatch.ASO_FRAMES`) and ASO resolves the
+# bundle from its own data folder.
+
 
 # Tokens that name a region inside a mask's file name, matched as WHOLE tokens
 # of the stem rather than as substrings.
@@ -160,6 +237,13 @@ PATIENT_SUFFIXES = (
     "_scan", "_Scan", "_Seg", "_seg", "_Or", "_OR", "_lm",
 )
 
+# Which of those say "this scan was ORIENTED", and so may carry the frame it
+# was oriented into just before them. ASO appends no bare marker: its caller
+# names the suffix, and VFACE names it `CB_Or` and `MAX_Or`, so the frame ends
+# up inside the name -- `C_0002_T1_CB_Or.nii.gz`. See
+# `pairing._frame_aligned_index` for why a subject's key must not keep it.
+ORIENTATION_SUFFIXES = ("_SegOr", "_Or", "_OR")
+
 
 # ---------------------------------------------------------------------------
 # Jaws (IOS)
@@ -195,3 +279,117 @@ PATCH_CHOICES = {PATCH_PALATE: True, PATCH_MGL: False}
 
 # The jaw each patch registers.
 PATCH_JAW = {PATCH_PALATE: JAW_UPPER, PATCH_MGL: JAW_LOWER}
+
+
+# ---------------------------------------------------------------------------
+# Input layout
+# ---------------------------------------------------------------------------
+# How the caller's files are organised. A cohort kept as one folder per type
+# (`T1/` and `T2/`, or `IOS/` and `CBCT/`) is the layout every engine reads;
+# one kept as one folder per patient (`<patient>/T1/`, `<patient>/CBCT/`, or
+# the files side by side) is sorted into it first, by `patient_folders`.
+
+LAYOUT_BY_TYPE = "One folder per type"
+LAYOUT_BY_PATIENT = "One folder per patient"
+
+LAYOUT_CHOICES = {LAYOUT_BY_TYPE: True, LAYOUT_BY_PATIENT: False}
+
+# What each layout looks like on disk, shown when the pointer rests on that
+# option. One text for the three engines: the facade publishes one help per
+# option whatever the mode, so each tree shows both the T1/T2 and the IOS/CBCT
+# shape. Plain text, line breaks kept.
+LAYOUT_HELP = {
+    LAYOUT_BY_TYPE: (
+        "One folder for each type of file, every patient inside it.\n"
+        "Patients are matched across the two folders by their file names.\n"
+        "\n"
+        "CBCT or IOS registration (T1 and T2):\n"
+        "    T1/\n"
+        "        patient001_T1.nii.gz\n"
+        "        patient002_T1.nii.gz\n"
+        "    T2/\n"
+        "        patient001_T2.nii.gz\n"
+        "        patient002_T2.nii.gz\n"
+        "\n"
+        "IOS to CBCT:\n"
+        "    IOS/\n"
+        "        patient001_U.stl\n"
+        "        patient001_L.stl\n"
+        "    CBCT/\n"
+        "        patient001_CBCT.nii.gz"
+    ),
+    LAYOUT_BY_PATIENT: (
+        "One folder for each patient, holding all of that patient's files.\n"
+        "The folder's name is the patient's name, and names the results.\n"
+        "\n"
+        "CBCT or IOS registration (T1 and T2):\n"
+        "    patients/\n"
+        "        patient001/\n"
+        "            T1/  scan.nii.gz\n"
+        "            T2/  scan.nii.gz\n"
+        "        patient002/\n"
+        "            patient002_T1.nii.gz\n"
+        "            patient002_T2.nii.gz\n"
+        "\n"
+        "IOS to CBCT (sub-folders optional):\n"
+        "    patients/\n"
+        "        patient001/\n"
+        "            IOS/   upper.stl  lower.stl\n"
+        "            CBCT/  scan.nii.gz"
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# What a run hands back beyond its result, asked as `outputs`
+# ---------------------------------------------------------------------------
+
+# One argument with the same name in every engine, so the AREG facade merges
+# it into one box whose options follow the mode. Every option names a kind of
+# file, never a step: whatever is ticked is written in the space of the
+# result, so it opens on top of it. Each label says the file a reader gets,
+# and the scan is named after what it is in that mode: a facade shows the
+# options of the mode chosen, so the two never sit side by side.
+# The landmarks are split by what they were FOR: the ones the registration
+# paired, and the ones ASO oriented the CBCT on. "Moved landmarks" said
+# neither, and a reader could not tell which set a file was.
+OUTPUT_LANDMARKS = "Registration landmarks (IOS + CBCT)"
+OUTPUT_ORIENTATION_LANDMARKS = "Orientation landmarks (ASO)"
+OUTPUT_CBCT_SCAN = "CBCT scan"
+OUTPUT_T1_SCAN = "T1 scan (oriented when orientation is on)"
+OUTPUT_TRANSFORMS = "Transform (.tfm)"
+# Not a 3D file: the numbers the registration measured, for a cohort's table.
+OUTPUT_METRICS = "Metrics spreadsheet (.xlsx + .csv)"
+METRICS_STEM = "AREG_metrics"
+
+OUTPUT_LABEL = "Extra outputs"
+# Drawn under the label, always visible: the one thing a reader needs before
+# ticking anything is what comes back anyway, and where the rest lands.
+OUTPUT_NOTE = ("Saved beside the result, in the same 3D space. The result "
+               "and its scene.json are always written.")
+
+OUTPUT_HELP = {
+    OUTPUT_LANDMARKS: "The landmarks the registration paired: each arch's, "
+                      "moved with it onto the CBCT, and the CBCT's own.",
+    OUTPUT_ORIENTATION_LANDMARKS: "The landmarks ASO oriented the CBCT on, in "
+                                  "the oriented CBCT's space. Only when the "
+                                  "run oriented it.",
+    OUTPUT_CBCT_SCAN: "The CBCT the meshes were registered onto, copied beside "
+                      "them (the oriented one when the chain oriented it first).",
+    OUTPUT_T1_SCAN: "The T1 the T2 was registered onto. Oriented, it is the "
+                    "copy already under T1_Oriented/; otherwise it is copied "
+                    "beside the result.",
+    OUTPUT_TRANSFORMS: "Each registration as a .tfm that 3D Slicer opens.",
+    OUTPUT_METRICS: "What each registration measured, one row per case and one "
+                    "per landmark, as AREG_metrics.xlsx and as .csv files beside "
+                    "the report: the numbers the console shows, kept for a "
+                    "cohort's statistics.",
+}
+
+
+def outputs_layout(section, *options) -> dict:
+    """The `outputs` layout entry of an engine offering `options`."""
+    return {
+        "section": section, "label": OUTPUT_LABEL, "note": OUTPUT_NOTE,
+        "option_help": {option: OUTPUT_HELP[option] for option in options},
+    }

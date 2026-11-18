@@ -21,9 +21,16 @@ import tempfile
 
 import SimpleITK as sitk
 
+from .. import progress
+from ..errors import ToolInputError
 from ..markups import is_markups_file
 
 logger = logging.getLogger(__name__)
+
+
+class DicomStackMissing(RuntimeError):
+    """The deployment lacks the fallback reader: the server's fault, never the
+    caller's, so it must not be turned into an input error below."""
 
 _INSTALL_HINT = (
     "Reading this DICOM series needs the dicom2nifti package. Install it with "
@@ -69,8 +76,11 @@ def convert_tree(input_root: str, output_root: str) -> str:
     Returns `output_root`. Raises RuntimeError when the tree holds no series.
     """
     os.makedirs(output_root, exist_ok=True)
-    converted = 0
 
+    # Listed first and converted second, so each series can be logged as
+    # "i of n": one unreadable export among forty used to stop the batch with
+    # whatever GDCM said and no hint of which series, or how far it had got.
+    found = []
     for directory, _, file_names in os.walk(input_root):
         relative = os.path.relpath(directory, input_root)
         for file_name in file_names:
@@ -80,22 +90,41 @@ def convert_tree(input_root: str, output_root: str) -> str:
                 shutil.copy2(os.path.join(directory, file_name), destination)
 
         series = _series_in(directory)
-        if not series:
-            continue
+        if series:
+            found.append((directory, relative, series))
+
+    if not found:
+        raise RuntimeError(
+            "No DICOM series found in the input. Send a zip of one folder per "
+            "patient, or turn dicom_input off if the input is already NIfTI/NRRD/GIPL."
+        )
+
+    progress.emit(None, f"converting {len(found)} DICOM series")
+    for index, (directory, relative, series) in enumerate(found, start=1):
         name = os.path.basename(directory) if relative != "." else "scan"
         destination = os.path.join(
             output_root, os.path.dirname(relative) if relative != "." else "", f"{name}.nii.gz"
         )
         os.makedirs(os.path.dirname(destination), exist_ok=True)
-        _convert_series(directory, series, destination)
-        converted += 1
-
-    if converted == 0:
-        raise RuntimeError(
-            "No DICOM series found in the input. Send a zip of one folder per "
-            "patient, or turn dicom_input off if the input is already NIfTI/NRRD/GIPL."
-        )
-    logger.info("Converted %d DICOM series", converted)
+        logger.info("DICOM series %d of %d: converting %d slice(s)",
+                    index, len(found), len(series))
+        try:
+            _convert_series(directory, series, destination)
+        except DicomStackMissing:
+            raise
+        except Exception as exc:
+            # Both readers refused the series the caller sent, so the fix is
+            # theirs: the position says which, the cause says why. The folder
+            # is never named -- it is the patient.
+            logger.warning(
+                "DICOM series %d of %d: conversion failed (%s: %s)",
+                index, len(found), type(exc).__name__, exc,
+            )
+            raise ToolInputError(
+                f"DICOM series {index} of {len(found)} could not be converted "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+    logger.info("Converted %d DICOM series", len(found))
     return output_root
 
 
@@ -134,7 +163,7 @@ def _convert_with_dicom2nifti(directory: str, destination: str) -> None:
     try:
         import dicom2nifti
     except ImportError as exc:  # pragma: no cover - depends on the deployment
-        raise RuntimeError(f"{_INSTALL_HINT} (missing: dicom2nifti)") from exc
+        raise DicomStackMissing(f"{_INSTALL_HINT} (missing: dicom2nifti)") from exc
 
     staging = tempfile.mkdtemp(prefix="dicom2nifti_", dir=os.path.dirname(destination))
     try:
@@ -143,9 +172,7 @@ def _convert_with_dicom2nifti(directory: str, destination: str) -> None:
             name for name in os.listdir(staging) if name.lower().endswith(".nii.gz")
         )
         if not produced:
-            raise RuntimeError(
-                f"Could not read the DICOM series in '{os.path.basename(directory)}'."
-            )
+            raise RuntimeError("dicom2nifti wrote no volume for this series")
         shutil.move(os.path.join(staging, produced[0]), destination)
     finally:
         shutil.rmtree(staging, ignore_errors=True)

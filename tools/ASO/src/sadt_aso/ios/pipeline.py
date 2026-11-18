@@ -20,7 +20,7 @@ import numpy as np
 import SimpleITK as sitk
 import sadt_naming
 
-from .. import catalogs, markups
+from .. import catalogs, markups, user_metrics
 from . import icp as ios_icp
 from . import pre_icp, surfaces
 
@@ -214,9 +214,12 @@ def load_reference(reference_dir: str, need_surfaces=None) -> dict:
     else:
         wanted, what = ("markups",), "landmark file"
     if not any(entry[key] for entry in merged.values() for key in wanted):
-        raise ValueError(
-            f"The reference bundle holds no {what} whose name says which jaw it "
-            f"is (e.g. 'Gold_Upper.vtk')."
+        # A RuntimeError, not a ValueError: the reference is a bundle this
+        # server hosts, and a 422 would send the caller to fix a request that
+        # is fine.
+        raise RuntimeError(
+            f"reference bundle unreadable: it holds no {what} whose name says "
+            f"which jaw it is (e.g. 'Gold_Upper.vtk')."
         )
     return merged
 
@@ -293,8 +296,13 @@ def orient_patient(
     max_triplets: int,
     seed: int,
     cache: "FileCache" = None,
+    patient=None,
 ) -> dict:
     """Orient one patient's jaws. Returns a report entry.
+
+    `patient`, when given, is `(index, total)`: a jaw that fails is logged
+    with it, since the report that also records the failure is deleted with
+    the job directory when the whole run fails.
 
     With `driving_jaw` set, that jaw's transform is applied to the other one as
     well -- occlusion is preserved by moving both halves rigidly together, which
@@ -318,6 +326,7 @@ def orient_patient(
                     "reason": "no mesh for this jaw",
                 }
                 continue
+            measured: dict = {}
             try:
                 matrices[jaw] = _matrix_for(
                     jaw,
@@ -331,8 +340,14 @@ def orient_patient(
                     max_triplets,
                     seed,
                     cache,
+                    measured,
                 )
             except (ios_icp.RegistrationError, surfaces.SurfaceError, ValueError) as exc:
+                logger.warning(
+                    "%s%s jaw: registration failed (%s: %s)",
+                    f"patient {patient[0]} of {patient[1]}: " if patient else "",
+                    jaw, type(exc).__name__, exc,
+                )
                 entry["jaws"][jaw] = {"status": "failed", "reason": str(exc)}
                 continue
 
@@ -347,6 +362,7 @@ def orient_patient(
                     else ("tooth centroids" if automation == catalogs.AUTOMATION_FULLY
                           else "landmarks")
                 ),
+                "metrics": _with_orientation(measured, matrices[jaw]),
             }
             entry["produced"].extend(written)
     finally:
@@ -406,12 +422,17 @@ def _matrix_for(
     max_triplets: int,
     seed: int,
     cache: FileCache,
+    measured: dict = None,
 ) -> np.ndarray:
+    """This jaw's 4x4. `measured`, when given, is filled with what the fit
+    measured (see `user_metrics.metric_lines`)."""
+    measured = measured if measured is not None else {}
     if driving_jaw and jaw != driving_jaw:
         if driving_jaw not in matrices:
             raise ios_icp.RegistrationError(
                 f"the {driving_jaw} jaw, which drives this one, was not oriented"
             )
+        measured["moved_with"] = driving_jaw
         return matrices[driving_jaw]
 
     reference_entry = reference.get(jaw)
@@ -432,11 +453,41 @@ def _matrix_for(
     forced = automation == catalogs.AUTOMATION_FULLY
     if forced or not available["markups"]:
         return _fully_automated_matrix(
-            available, reference_entry, selected_teeth[jaw], max_triplets, seed, cache
+            available, reference_entry, _centroid_teeth(jaw, selected_teeth[jaw], forced),
+            max_triplets, seed, cache, measured,
         )
     return _semi_automated_matrix(
-        available, reference_entry, landmark_keys[jaw], max_triplets, seed, cache
+        available, reference_entry, landmark_keys[jaw], max_triplets, seed, cache, measured,
     )
+
+
+def _with_orientation(measured: dict, matrix: np.ndarray) -> dict:
+    """`measured` plus the rotation and translation `matrix` applies."""
+    rotation_deg, translation_mm = user_metrics.rotation_and_translation(matrix)
+    return dict(measured, rotation_deg=rotation_deg, translation_mm=translation_mm)
+
+
+def _centroid_teeth(jaw: str, selected: list, forced: bool) -> list:
+    """The teeth the coarse alignment of a jaw without landmarks runs on.
+
+    A Fully-Automated request is validated to 3 or 4 teeth per jaw before any
+    mesh is read, so its selection is used as given. A Semi-Automated one is
+    not: its teeth only multiply landmark types, and a clinician who ticks the
+    whole arch to register on every crown landmark is right to. When such a
+    jaw turns out to carry no landmarks, it falls back to tooth centroids --
+    and handing those sixteen teeth to an alignment built on three failed the
+    jaw outright. The selection is kept when it fits; otherwise the jaw's
+    default triplet, the same one the Fully-Automated form starts from.
+    """
+    if forced or len(selected) in (3, 4):
+        return list(selected)
+    default = [name for name in catalogs.DEFAULT_TEETH if catalogs.split_by_jaw([name])[jaw]]
+    logger.info(
+        "%s jaw has no landmarks: aligning on its tooth centroids with %s "
+        "(the %d teeth selected suit landmarks, not the 3-or-4-tooth alignment)",
+        jaw, ", ".join(default), len(selected),
+    )
+    return default
 
 
 def _fully_automated_matrix(
@@ -446,6 +497,7 @@ def _fully_automated_matrix(
     max_triplets: int,
     seed: int,
     cache: FileCache,
+    measured: dict = None,
 ) -> np.ndarray:
     if not reference_entry["surface"]:
         raise ios_icp.RegistrationError("the reference has no mesh for this jaw")
@@ -467,12 +519,19 @@ def _fully_automated_matrix(
     aligned = surfaces.transform_surface(source, coarse)
 
     tooth_ids = catalogs.teeth_to_ids(teeth)
-    fine = ios_icp.register(
-        ios_icp.mean_teeth(aligned, tooth_ids, array_name),
-        ios_icp.mean_teeth(target, tooth_ids, reference_array),
-        max_triplets=max_triplets,
-        seed=seed,
-    )
+    moving = ios_icp.mean_teeth(aligned, tooth_ids, array_name)
+    fixed = ios_icp.mean_teeth(target, tooth_ids, reference_array)
+    stats: dict = {}
+    fine = ios_icp.register(moving, fixed, max_triplets=max_triplets, seed=seed, stats=stats)
+    if measured is not None:
+        # The centroids handed to the fit are those of the plane-aligned mesh,
+        # so their distances are what that first step left.
+        stats["stages"].insert(0, {
+            "after": user_metrics.STEP_OCCLUSAL_PLANE,
+            "distances_mm": user_metrics.distances(moving, fixed, stats["labels"]),
+        })
+        stats["labels"] = [catalogs.TOOTH_NAMES[int(label)] for label in stats["labels"]]
+        measured.update(stats, points=list(user_metrics.POINTS_CENTROID))
     return fine @ coarse
 
 
@@ -483,6 +542,7 @@ def _semi_automated_matrix(
     max_triplets: int,
     seed: int,
     cache: FileCache,
+    measured: dict = None,
 ) -> np.ndarray:
     if not available["markups"]:
         raise ios_icp.RegistrationError(
@@ -496,7 +556,11 @@ def _semi_automated_matrix(
     target = ios_icp.select_keys(
         cache.landmarks(reference_entry["markups"], keep=True), keys
     )
-    return ios_icp.register(source, target, max_triplets=max_triplets, seed=seed)
+    stats: dict = {}
+    matrix = ios_icp.register(source, target, max_triplets=max_triplets, seed=seed, stats=stats)
+    if measured is not None:
+        measured.update(stats, points=list(user_metrics.POINTS_LANDMARK))
+    return matrix
 
 
 def _write_jaw(

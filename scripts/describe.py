@@ -117,6 +117,13 @@ DOC_ARGUMENTS = "Args:"
 # an option the signature does not publish, which is what makes that hold.
 LAYOUT_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
                "hidden",
+               # {other argument: value(s)}: the argument is required whenever
+               # those hold. For an input that is needed in one layout of the
+               # request and absent from another -- AREG's T1 and T2, required
+               # with one folder per type and unused with one per patient -- so
+               # the panel neither marks it optional nor lets Apply go without
+               # it. The tool still refuses what is missing; this is the panel.
+               "required_when",
                # A vec2's two axes, low end first (or high end first to mirror
                # the axis). Declared here with the other layout keys because a
                # tool writes them in the same place, but they are NOT
@@ -144,6 +151,9 @@ LAYOUT_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label
                # label alone tells a clinician nothing, and the argument's own
                # description covers all of them at once.
                "option_help",
+               # One short line under the label, always visible: what is
+               # written whatever is ticked, where the rest lands.
+               "note",
                # How few options a multichoice may be left with; absent means
                # none is a meaningful answer.
                "min_selected")
@@ -938,6 +948,7 @@ def layout_for(package, arguments):
         if name in arguments:
             _check_groups(where, hints, arguments[name])
         _check_visible_when(where, hints, arguments)
+        _check_visible_when(where, hints, arguments, key="required_when")
     return declared
 
 
@@ -966,17 +977,21 @@ def _check_groups(where, hints, argument):
             )
 
 
-def _check_visible_when(where, hints, arguments):
-    """A condition must name a real argument, and a value it can actually take."""
-    conditions = hints.get("visible_when")
+def _check_visible_when(where, hints, arguments, key="visible_when"):
+    """A condition must name a real argument, and a value it can actually take.
+
+    `key` is the hint holding the condition: `visible_when`, or `required_when`,
+    which is written the same way and goes wrong the same way.
+    """
+    conditions = hints.get(key)
     if conditions is None:
         return
     if not isinstance(conditions, dict):
-        raise SchemaError("{}: 'visible_when' must be a dict of argument -> value.".format(where))
+        raise SchemaError("{}: '{}' must be a dict of argument -> value.".format(where, key))
     for other, expected in conditions.items():
         if other not in arguments:
             raise SchemaError(
-                "{}: 'visible_when' names '{}', which run() does not take.".format(where, other)
+                "{}: '{}' names '{}', which run() does not take.".format(where, key, other)
             )
         offered = arguments[other].get("choices")
         if not offered:
@@ -985,9 +1000,9 @@ def _check_visible_when(where, hints, arguments):
         missing = [value for value in wanted if value not in offered]
         if missing:
             raise SchemaError(
-                "{}: 'visible_when' expects '{}' to be {}, which it never is. It "
+                "{}: '{}' expects '{}' to be {}, which it never is. It "
                 "offers: {}.".format(
-                    where, other, ", ".join(str(m) for m in missing), ", ".join(offered)
+                    where, key, other, ", ".join(str(m) for m in missing), ", ".join(offered)
                 )
             )
 
@@ -1069,6 +1084,10 @@ def describe_run(run, package=None):
     if injected_layout:
         described["injected_layout"] = injected_layout
 
+    paired = paired_for(inspect.getmodule(run), arguments)
+    if paired:
+        described["paired"] = paired
+
     if supervisor:
         # Published so the server can tell, before accepting a job, that this
         # tool needs something to be injected. A deployment whose runner cannot
@@ -1076,6 +1095,48 @@ def describe_run(run, package=None):
         # call fail halfway through.
         described["supervisor"] = True
     return described
+
+
+# Which path inputs hold the same patients, declared beside `run()`:
+# `PAIRED = {"axes": ["t1", "t2"]}`, with a `pairs(**{axis: [names]})` that
+# says which listed files go together. Published so a client splitting a
+# cohort into batches splits every axis by the SAME patients -- the server
+# relays the question to `pairs()` and knows nothing of how a tool pairs.
+PAIRED_NAME = "PAIRED"
+PAIRS_FUNCTION = "pairs"
+
+
+def paired_for(module, arguments):
+    """`{"axes": [...]}` from the tool's own `PAIRED`, checked, or None."""
+    declared = getattr(module, PAIRED_NAME, None)
+    if declared is None:
+        return None
+    if not isinstance(declared, dict) or set(declared) - {"axes"}:
+        raise SchemaError("{} must be {{'axes': [argument, ...]}}.".format(PAIRED_NAME))
+    axes = declared.get("axes")
+    if not isinstance(axes, (list, tuple)) or len(axes) < 2 or len(set(axes)) != len(axes):
+        raise SchemaError("{}['axes'] must name two or more distinct arguments.".format(PAIRED_NAME))
+    for axis in axes:
+        spec = arguments.get(axis)
+        if spec is None:
+            raise SchemaError("{}: run() has no argument '{}'.".format(PAIRED_NAME, axis))
+        # A path, but not necessarily a required one: AREG's `t1`/`t2` are
+        # optional since the same cohort may arrive as one folder per patient
+        # instead, and a run in that layout fills neither. A client splits the
+        # axes a request fills.
+        if spec.get("type") != "path":
+            raise SchemaError(
+                "{}: '{}' must be a path argument to be split.".format(PAIRED_NAME, axis))
+    pairs = getattr(module, PAIRS_FUNCTION, None)
+    if not inspect.isfunction(pairs):
+        raise SchemaError(
+            "{} is declared but the module defines no {}() to answer which files "
+            "go together.".format(PAIRED_NAME, PAIRS_FUNCTION))
+    missing = [axis for axis in axes if axis not in inspect.signature(pairs).parameters]
+    if missing:
+        raise SchemaError("{}() must take every axis; it lacks {}.".format(
+            PAIRS_FUNCTION, ", ".join(missing)))
+    return {"axes": list(axes)}
 
 
 def source_hash(src_dir):

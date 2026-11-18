@@ -12,11 +12,15 @@ not this tool's vocabulary, and when a tool renames one this file is what
 breaks. `test_schema_seam.py` checks those names against the real schemas.
 """
 
+import logging
+import json
 import os
 
 import pytest
 
-from conftest import FakeSup, cohort, read_report, write_markups, UPPER_LABELS, moved
+from conftest import (
+    FakeSup, cohort, read_report, write_markups, write_mesh, write_volume, UPPER_LABELS, moved,
+)
 from sadt_areg_ioscbct import dispatch, tools
 from sadt_areg_common import catalogs
 from sadt_areg_common.errors import SupervisorRequired, ToolInputError
@@ -140,15 +144,16 @@ def test_the_twelve_cbct_landmarks_are_three_per_quadrant():
     assert all(name.endswith("O") for name in tools.CBCT_LANDMARKS)
 
 
-def test_the_intraoral_request_asks_for_the_occlusal_family_alone(tmp_path):
-    """The cross-modality alignment matches crown points against their CBCT
-    counterparts; the cervical and mucogingival passes would cost a run over
-    every mesh for points nothing here reads."""
+def test_the_intraoral_request_names_the_matched_landmarks_alone(tmp_path):
+    """The alignment matches the twelve crown points both modalities share;
+    asking for a whole family would hand the user some eighty points of which
+    only those twelve are used."""
     sup = FakeSup(tmp_path, {"ALI_IOS": lambda params: planted(tmp_path, "lm")})
     tools.predict_ios_landmarks(sup, str(tmp_path / "seg"), "")
 
     params = sup.asked("ALI_IOS")
-    assert params["networks"] == ["Occlusal"]
+    assert params["landmarks"] == list(tools.CBCT_LANDMARKS)
+    assert "networks" not in params
     assert "model" not in params
     assert "prediction_ID" not in params
 
@@ -165,6 +170,17 @@ def test_the_orientation_request_is_asos_fully_automated_cbct_mode(tmp_path):
     assert params["automation"] == "Fully-Automated"
     assert params["reference"] == "/models/gold"
     assert params["landmark_model"] == "/models/ali"
+
+
+def test_with_no_reference_named_aso_is_asked_for_the_frame(tmp_path):
+    """The reference bundles are ASO's own: this engine names the frame and
+    hands over none of them."""
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted(tmp_path, "or")})
+    tools.orient_cbct(sup, str(tmp_path / "cbct"), "", frame="Frankfurt horizontal")
+
+    params = sup.asked("ASO")
+    assert params["frame"] == "Frankfurt horizontal"
+    assert "reference" not in params
 
 
 def test_no_callee_is_told_where_to_write(tmp_path):
@@ -257,7 +273,7 @@ def test_semi_automated_labels_the_crowns_and_predicts_both_landmark_sets(tmp_pa
     dispatch.main(**arguments)
 
     assert [name for name, _params in sup.calls] == ["Crown_Seg", "ALI_IOS", "ALI_CBCT"]
-    assert read_report(tmp_path / "out")["patients"]["1"]["status"] == "ok"
+    assert read_report(tmp_path / "out")["patients"]["P001"]["status"] == "ok"
 
 
 def test_semi_automated_does_not_orient_anything(tmp_path):
@@ -303,11 +319,68 @@ def test_fully_automated_orients_the_cbct_first(tmp_path):
     assert sup.asked("ALI_CBCT")["input"] == str(tmp_path / "cbct")
 
 
-def test_fully_automated_without_a_reference_is_refused_before_anything_runs(tmp_path):
+def test_fully_automated_asks_aso_for_its_frame_and_no_bundle(tmp_path):
+    """Every tool owns its model. With no reference named, ASO is asked for
+    the Frankfurt horizontal frame by name and resolves its own bundle; this
+    engine no longer refuses for a bundle it was never meant to hold."""
     sup, arguments = semi_automated(tmp_path, automation=catalogs.AUTOMATION_FULLY)
-    with pytest.raises(ToolInputError, match="cbct_reference"):
-        dispatch.main(**arguments)
-    assert sup.calls == []
+    dispatch.main(**arguments)
+
+    params = sup.asked("ASO")
+    assert params["frame"] == "Frankfurt horizontal"
+    assert "reference" not in params
+
+
+def test_fully_automated_hands_back_the_cbct_the_meshes_were_registered_onto(tmp_path):
+    """The meshes are in the frame of ASO's oriented scan. Without it beside
+    them they were opened over the original CBCT, off by ASO's whole rotation,
+    and the only copy had gone with the job's work directory."""
+    oriented = tmp_path / "oriented"
+    write_volume(oriented / "P_0001_T2_Or.nii.gz")
+    (oriented / "P_0001_T2_Or_transform.tfm").write_text("#Insight Transform File V1.0\n")
+    _sup, arguments = semi_automated(
+        tmp_path,
+        automation=catalogs.AUTOMATION_FULLY,
+        outputs={"ASO": lambda params: oriented},
+    )
+    dispatch.main(**arguments)
+
+    folder = tmp_path / "out" / "P001"
+    assert (folder / "P_0001_T2_Or.nii.gz").is_file()
+    assert (folder / "P_0001_T2_Or_transform.tfm").is_file()
+    patient = read_report(tmp_path / "out")["patients"]["P001"]
+    assert patient["oriented_cbct"] == os.path.join("P001", "P_0001_T2_Or.nii.gz")
+    assert patient["cbct_transform"] == os.path.join("P001", "P_0001_T2_Or_transform.tfm")
+
+
+def test_the_same_space_scene_is_built_on_the_oriented_cbct(tmp_path):
+    """Fully-Automated registers onto ASO's scan, so that is the scene's CBCT."""
+    oriented = tmp_path / "oriented"
+    write_volume(oriented / "P_0001_T2_Or.nii.gz")
+    (oriented / "P_0001_T2_Or_transform.tfm").write_text("#Insight Transform File V1.0\n")
+    _sup, arguments = semi_automated(
+        tmp_path,
+        automation=catalogs.AUTOMATION_FULLY,
+        outputs={"ASO": lambda params: oriented},
+    )
+    dispatch.main(**arguments, outputs=[catalogs.OUTPUT_LANDMARKS])
+
+    scene = json.loads((tmp_path / "out" / "P001" / "scene.json").read_text())
+    roles = {entry["role"]: entry["path"] for entry in scene["files"]}
+    assert scene["space"] == "the oriented CBCT"
+    assert roles["reference"] == "P_0001_T2_Or.nii.gz"
+    assert roles["orientation"] == "P_0001_T2_Or_transform.tfm"
+    assert "moved landmarks" in roles
+
+
+def test_a_cbct_the_caller_sent_is_not_sent_back(tmp_path):
+    """Semi-Automated registers onto the caller's own scan: copying it back
+    would only double the archive."""
+    _sup, arguments = semi_automated(tmp_path)
+    dispatch.main(**arguments)
+
+    assert not (tmp_path / "out" / "P001" / "P_0001_T2.nii.gz").exists()
+    assert "oriented_cbct" not in read_report(tmp_path / "out")["patients"]["P001"]
 
 
 def test_a_sibling_tool_failing_takes_the_run_with_it(tmp_path):
@@ -321,17 +394,22 @@ def test_a_sibling_tool_failing_takes_the_run_with_it(tmp_path):
         dispatch.main(**arguments)
 
 
-def test_a_sibling_producing_nothing_usable_is_a_422_not_a_crash(tmp_path):
-    """Crown_Seg returning an empty folder is a real outcome -- and the message
-    has to say which side came back empty."""
+def test_a_sibling_producing_nothing_usable_is_a_server_fault_naming_it(tmp_path, caplog):
+    """ALI_IOS returning an empty folder is a real outcome -- but not the
+    caller's fault, so not a 422, and the message has to say which tool's
+    output came back empty. The shortfall is logged as soon as it returns."""
     empty = tmp_path / "empty"
     empty.mkdir()
     sup, arguments = semi_automated(
         tmp_path, outputs={"ALI_IOS": lambda params: empty}
     )
-    with pytest.raises(ToolInputError) as raised:
-        dispatch.main(**arguments)
-    assert "0 intraoral and 1 CBCT" in str(raised.value)
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        with pytest.raises(RuntimeError) as raised:
+            dispatch.main(**arguments)
+    assert not isinstance(raised.value, ValueError)
+    assert "No intraoral landmark could be read from ALI_IOS's output" in str(raised.value)
+    assert any("ALI_IOS returned 0 landmark file(s) for 1 sent" in r.getMessage()
+               and r.levelno == logging.WARNING for r in caplog.records)
 
 
 def test_a_supervised_run_leaves_no_working_directory_behind(tmp_path):
@@ -352,5 +430,22 @@ def test_the_predicted_landmarks_really_reach_the_registration(tmp_path):
 
     import numpy as np
 
-    matrix = np.load(str(tmp_path / "out" / "1" / "P001_T2_U_Reg_matrix.npy"))
+    matrix = np.load(str(tmp_path / "out" / "P001" / "P001_T2_U_Reg_matrix.npy"))
     assert matrix[0, 3] == pytest.approx(7.0, abs=1e-5)
+
+
+def test_a_sibling_returning_fewer_files_than_it_was_sent_is_warned_about(tmp_path, caplog):
+    """The tool ran to the end, so nothing raised: the shortfall would only show
+    later, as a patient with nothing to register."""
+    sup, arguments = semi_automated(tmp_path)
+    # Two meshes sent, Crown_Seg hands back a folder holding one.
+    write_mesh(tmp_path / "ios" / "P001_T2_L.vtk")
+    labelled = tmp_path / "labelled"
+    write_mesh(labelled / "P001_T2_U.vtk")
+    sup.outputs["Crown_Seg"] = lambda params: labelled
+
+    with caplog.at_level(logging.INFO, logger="sadt_areg_ioscbct"):
+        dispatch.main(**arguments)
+    shortfall = [r for r in caplog.records
+                 if r.getMessage() == "Crown_Seg returned 1 labelled mesh(es) for 2 sent"]
+    assert shortfall and shortfall[0].levelno == logging.WARNING

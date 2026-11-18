@@ -12,6 +12,7 @@ That progression is why this tool has no engine of its own: each step it does
 not do itself is a `sup.run()` into a tool that has one.
 """
 
+import collections
 import json
 import logging
 import os
@@ -20,12 +21,13 @@ import time
 
 import numpy as np
 
-from sadt_areg_common import catalogs
+from sadt_areg_common import catalogs, metrics_table, pairing, scene
 from sadt_areg_common.errors import ToolInputError
 
-from . import geometry, pipeline, progress, tools
+from . import geometry, pipeline, progress, tools, where
 
-logger = logging.getLogger(__name__)
+# Prefixed with the patient and arch the batch loop is on: see `where`.
+logger = where.attach(logging.getLogger(__name__))
 
 MODALITY = catalogs.MODALITY_IOSCBCT
 REPORT_NAME = "AREG_report.json"
@@ -48,10 +50,22 @@ def _read_mesh(path: str):
 
 
 def _write_mesh(mesh, path: str) -> None:
+    import vtk
+
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Through the VTK writer rather than `mesh.save`, which cannot set the
+    # header: Slicer reads a .vtk without a SPACE= line as LPS and warns about
+    # it on every load, and saying LPS keeps exactly that reading.
+    writer = vtk.vtkPolyDataWriter()
+    writer.SetHeader("SPACE=LPS")
     # Binary, not ASCII: it round-trips float32 exactly, while ASCII prints six
     # significant digits, and it parses far faster.
-    mesh.save(path, binary=True)
+    writer.SetFileTypeToBinary()
+    writer.SetFileName(path)
+    writer.SetInputData(mesh)
+    if writer.Write() != 1:
+        raise RuntimeError(f"VTK could not write the registered mesh (error code "
+                           f"{writer.GetErrorCode()})")
 
 
 def _cbct_surface(scan_path: str, landmark_sets: dict):
@@ -76,15 +90,32 @@ def _cbct_surface(scan_path: str, landmark_sets: dict):
     try:
         surface, on_enamel = volume.read(scan_path, merged)
     except Exception as exc:  # noqa: BLE001 - a landmark-only run is still a run
-        # The class name, not `str(exc)`: readers carry the server's own paths in
-        # their messages, and the report goes back to the client. The full
-        # traceback stays in the log, where paths belong.
-        logger.exception("Could not contour the CBCT of %s", scan_path)
+        # The class name, not `str(exc)`, in the report: readers carry the
+        # server's own paths in their messages, and the report goes back to the
+        # client. The log line has the message too -- the server redacts paths
+        # there -- and `where` puts the patient's position in front of it.
+        logger.warning(
+            "CBCT contouring failed (%s: %s); registering on the landmarks alone, "
+            "without ICP", type(exc).__name__, exc)
+        logger.debug("CBCT contouring traceback", exc_info=True)
         return None, {}, f"the CBCT could not be contoured ({type(exc).__name__})"
     return surface, on_enamel, None
 
 
-def _landmarks_by_jaw(directory: str) -> dict:
+def _landmark_files(directory: str) -> list:
+    """Every landmark file under `directory`, in a stable order."""
+    paths = []
+    if not directory or not os.path.isdir(directory):
+        return paths
+    for root, directories, files in os.walk(directory):
+        directories.sort()
+        for name in sorted(files):
+            if name.lower().endswith(pipeline.LANDMARK_EXTENSIONS):
+                paths.append(os.path.join(root, name))
+    return paths
+
+
+def _landmarks_by_jaw(directory: str, side: str = "landmark") -> dict:
     """`{relative path: {label: position}}` for every landmark file in a folder.
 
     Keyed by the path relative to the folder, not by the base name: ALI writes
@@ -92,23 +123,29 @@ def _landmarks_by_jaw(directory: str) -> dict:
     Pred.mrk.json` are two files. Keyed by base name the second silently
     replaced the first, which then made `len(candidates) == 1` -- the "one file
     covers every jaw" fallback -- fire on a folder that held two.
+
+    A file that cannot be read is skipped with a warning rather than taking the
+    batch with it: one truncated JSON among forty used to abort the run with a
+    bare JSONDecodeError and no word of which side it was on. `side` ("intraoral"
+    or "CBCT") is what that warning names, with the file's position -- never its
+    name.
     """
     found = {}
-    if not directory or not os.path.isdir(directory):
-        return found
-    for root, directories, files in os.walk(directory):
-        directories.sort()
-        for name in sorted(files):
-            if not name.lower().endswith(pipeline.LANDMARK_EXTENSIONS):
-                continue
-            path = os.path.join(root, name)
+    paths = _landmark_files(directory)
+    for index, path in enumerate(paths, start=1):
+        try:
             points = pipeline.read_landmarks(path)
-            if points:
-                found[os.path.relpath(path, directory)] = points
+        except Exception as exc:  # noqa: BLE001 - one bad file must not cost the batch
+            logger.warning("%s landmark file %d of %d unreadable (%s: %s)",
+                           side, index, len(paths), type(exc).__name__, exc)
+            continue
+        if points:
+            found[os.path.relpath(path, directory)] = points
     return found
 
 
-def _for_patient(candidates: dict, patient: str, sole_patient: bool) -> dict:
+def _for_patient(candidates: dict, patient: str, sole_patient: bool,
+                 timepoint=None) -> dict:
     """The landmark files that belong to one patient.
 
     Matching on the jaw token ALONE is what made a two-patient batch register
@@ -124,11 +161,17 @@ def _for_patient(candidates: dict, patient: str, sole_patient: bool) -> dict:
     `patient_key` cannot read -- one with no digits in it at all, which is what
     the published reference files look like -- would otherwise stop matching
     anything at all.
+
+    `timepoint` narrows it to the files of one timepoint of that patient: a
+    file naming another timepoint is not this one's, a file naming none may
+    be. A side that names no timepoint is not narrowed. Without it a batch holding a T1 and a T2 gave each arch two CBCT
+    landmark files and no way to choose.
     """
     own = {
         name: points
         for name, points in candidates.items()
         if pipeline.patient_key(os.path.basename(name)) == patient
+        and (timepoint is None or pipeline.timepoint_of(name) in (None, timepoint))
     }
     if own:
         return own
@@ -136,6 +179,198 @@ def _for_patient(candidates: dict, patient: str, sole_patient: bool) -> dict:
 
 
 _JAW_TOKENS = {"u", "upper", "l", "lower"}
+
+
+def _arch(mesh_path: str):
+    """"U" or "L" from the mesh's jaw token, or None when its name has none."""
+    from sadt_areg_common import pairing
+
+    found = set(pairing.tokens(os.path.basename(mesh_path)))
+    if found & {"u", "upper"}:
+        return "U"
+    if found & {"l", "lower"}:
+        return "L"
+    return None
+
+
+def _spread(values) -> str:
+    """`mean ± std mm` for a list of distances (the population std)."""
+    values = np.asarray(values, dtype=float)
+    return "{:.2f} ± {:.2f} mm".format(float(np.mean(values)), float(np.std(values)))
+
+
+def metric_lines(detail: dict) -> list:
+    """What the registration measured, one quantity per line, for the user.
+
+    - Every landmark the rigid fit left out, and why: not on a tooth in the
+      CBCT, too far from where the others put it, or missing on one side.
+    - The landmark pairs, IOS to CBCT, after the rigid landmark fit and after
+      the ICP: mean ± standard deviation of the Euclidean distances, and the
+      pair furthest apart. This is the check the surface fit does not grade
+      itself on.
+    - The ICP's own cost, the mean squared point-to-plane distance in mm^2,
+      at the iterations where it fell: the quantity it minimises.
+    - Where the crowns ended up: the distance from each crown point kept to
+      the CBCT surface, mean ± standard deviation, and the share kept.
+
+    Numbers and landmark names only, never a file name.
+    """
+    lines = []
+    icp = detail.get("icp") or {}
+    gaps = icp.get("landmark_gaps") or {}
+    if not gaps and rigid_gaps(detail):
+        # No ICP: the per-pair distances after the rigid fit are all there is.
+        gaps = {"labels": detail["rigid_fit_gaps"]["labels"],
+                "before_mm": detail["rigid_fit_gaps"]["mm"]}
+    labels = gaps.get("labels") or []
+    pre = detail.get("prealignment") or {}
+    # What the fit was not made on, first: it is what the next lines exclude.
+    for label, why in sorted((pre.get("landmarks_excluded") or {}).items()):
+        lines.append("{} left out of the rigid fit: {}".format(label, why))
+    for label, side in sorted((detail.get("landmarks_missing") or {}).items()):
+        lines.append("{} left out of the rigid fit: not found on the {} side".format(label, side))
+    if labels:
+        for when, key in (("rigid landmark fit", "before_mm"), ("ICP", "after_mm")):
+            values = gaps.get(key) or []
+            if not values:
+                continue
+            worst = int(np.argmax(values))
+            lines.append("landmark distance after the {}: {}, max {:.2f} mm ({}), {} pairs".format(
+                when, _spread(values), values[worst], labels[worst], len(values)))
+    elif pre.get("residual_mm") is not None:
+        fitted = len(pre.get("landmarks_fitted") or [])
+        lines.append("landmark distance after the rigid landmark fit: {:.2f} mm RMS, "
+                     "{} pairs{}".format(pre["residual_mm"], fitted,
+                                         "" if pre.get("accepted") else ", too far apart to be used"))
+    milestones = icp.get("cost_milestones") or []
+    if milestones:
+        lines.append("ICP cost, mean squared {} distance: {} mm², {} iterations".format(
+            icp.get("cost", "point-to-plane"),
+            " > ".join("{:.4f}".format(cost) for _i, cost in milestones),
+            milestones[-1][0] + 1))
+    mean, std = icp.get("surface_mean_mm"), icp.get("surface_std_mm")
+    if mean is not None and np.isfinite(mean):
+        lines.append("crown to CBCT surface distance: {:.2f} ± {:.2f} mm, over {:.0%} "
+                     "of the crown points".format(mean, std, icp.get("fitness", 0.0)))
+    return lines
+
+
+def _stats(values) -> dict:
+    values = np.asarray(values, dtype=float)
+    return {"mean_mm": float(np.mean(values)), "std_mm": float(np.std(values)),
+            "max_mm": float(np.max(values))}
+
+
+def rigid_gaps(detail: dict) -> bool:
+    return bool((detail.get("rigid_fit_gaps") or {}).get("mm"))
+
+
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as two tables, read off the report it already wrote.
+
+    `cases`: one row per patient and arch, the numbers the console showed.
+    `landmarks`: one row per patient, arch and landmark, for the statistics
+    per landmark -- used or left out of the rigid fit, and its distance to
+    its CBCT counterpart after the fit and after the ICP.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient:
+    this file stays with the caller's own results.
+    """
+    cases, landmarks = [], []
+    for patient, entry in (report.get("patients") or {}).items():
+        for mesh, detail in (entry.get("meshes") or {}).items():
+            arch = _arch(mesh) or ""
+            row = {"patient": patient, "arch": arch, "status": detail.get("status")}
+            if detail.get("status") == "failed":
+                row["error"] = detail.get("error")
+                cases.append(row)
+                continue
+            pre = detail.get("prealignment") or {}
+            icp = detail.get("icp") or {}
+            gaps = icp.get("landmark_gaps") or {}
+            excluded = dict(pre.get("landmarks_excluded") or {})
+            for label, side in (detail.get("landmarks_missing") or {}).items():
+                excluded[label] = "not found on the {} side".format(side)
+            row["landmarks_in_fit"] = len(pre.get("landmarks_fitted") or [])
+            row["landmarks_left_out"] = ", ".join(sorted(excluded))
+            if not gaps and rigid_gaps(detail):
+                gaps = {"labels": detail["rigid_fit_gaps"]["labels"],
+                        "before_mm": detail["rigid_fit_gaps"]["mm"]}
+            for prefix, key in (("rigid_fit", "before_mm"), ("after_icp", "after_mm")):
+                if gaps.get(key):
+                    stats = _stats(gaps[key])
+                    row[prefix + "_landmark_mean_mm"] = stats["mean_mm"]
+                    row[prefix + "_landmark_std_mm"] = stats["std_mm"]
+                    row[prefix + "_landmark_max_mm"] = stats["max_mm"]
+                    row[prefix + "_landmark_max_label"] = gaps["labels"][int(np.argmax(gaps[key]))]
+            if not gaps and pre.get("residual_mm") is not None:
+                row["rigid_fit_landmark_rms_mm"] = pre["residual_mm"]
+            milestones = icp.get("cost_milestones") or []
+            if milestones:
+                row["icp_cost"] = icp.get("cost")
+                row["icp_cost_start_mm2"] = milestones[0][1]
+                row["icp_cost_end_mm2"] = milestones[-1][1]
+                row["icp_iterations"] = milestones[-1][0] + 1
+            if icp:
+                row["surface_mean_mm"] = icp.get("surface_mean_mm")
+                row["surface_std_mm"] = icp.get("surface_std_mm")
+                row["crown_points_matched_pct"] = 100.0 * float(icp.get("fitness") or 0.0)
+            if detail.get("review"):
+                row["review"] = detail["review"]
+            cases.append(row)
+
+            rigid = detail.get("rigid_fit_gaps") or {}
+            fitted = gaps.get("labels") or rigid.get("labels") or []
+            before = gaps.get("before_mm") or rigid.get("mm") or [None] * len(fitted)
+            after = gaps.get("after_mm") or [None] * len(fitted)
+            for index, label in enumerate(fitted):
+                landmarks.append({
+                    "patient": patient, "arch": arch, "landmark": label, "in_fit": True,
+                    "after_rigid_fit_mm": before[index], "after_icp_mm": after[index],
+                })
+            for label in sorted(excluded):
+                landmarks.append({"patient": patient, "arch": arch, "landmark": label,
+                                  "in_fit": False, "left_out_because": excluded[label]})
+    return {"cases": cases, "landmarks": landmarks}
+
+
+def report_metrics(here: str, detail: dict) -> None:
+    """Send `metric_lines` to the user, under one line saying which arch."""
+    lines = metric_lines(detail)
+    if lines:
+        progress.log(here, level="metric", user=True)
+    for line in lines:
+        progress.log(line, level="metric", user=True)
+
+
+def _needs_review(detail: dict) -> str:
+    """Why a written registration should not be trusted as is, or "".
+
+    The ICP grades itself on the surface only, and on a smooth occlusal
+    surface a fit that slid along the arch scores as well as the right one.
+    The landmarks are the independent check: still further apart after the
+    ICP than the pre-alignment would ever accept, the arch is not where its
+    landmarks say it is, whatever the surface fit reports.
+    """
+    after = (detail.get("icp") or {}).get("landmark_rms_after_mm")
+    if after is None or after <= geometry.MAX_LANDMARK_RESIDUAL_MM:
+        return ""
+    return (f"the landmarks are still {after:.1f} mm from their CBCT counterparts "
+            f"after the ICP (more than {geometry.MAX_LANDMARK_RESIDUAL_MM:.0f} mm)")
+
+
+def _most_common(failures: list) -> tuple:
+    """`(first exception of the commonest kind, how many share it)`.
+
+    Grouped on class AND message, so "share only 1 landmark(s)" on five arches
+    and an ICP refusal on one read as two kinds, the larger first.
+    """
+    kinds = collections.Counter((type(exc).__name__, str(exc)) for exc in failures)
+    (name, message), count = kinds.most_common(1)[0]
+    first = next(exc for exc in failures
+                 if (type(exc).__name__, str(exc)) == (name, message))
+    return first, count
 
 
 def _match_landmarks(mesh_path: str, candidates: dict) -> dict:
@@ -157,130 +392,461 @@ def _match_landmarks(mesh_path: str, candidates: dict) -> dict:
     So a jaw match wins when there is one, and a single unlabelled file is
     accepted as covering every jaw rather than refused.
     """
+    name = _matched_file(mesh_path, candidates)
+    return candidates[name] if name is not None else {}
+
+
+def _matched_file(mesh_path: str, candidates: dict):
+    """The key in `candidates` of the file `_match_landmarks` reads, or None.
+
+    Kept apart so the same-space outputs can copy or move THAT file, the one
+    the registration actually used, rather than finding it again by a second
+    rule that could disagree.
+    """
     from sadt_areg_common import pairing
 
     mesh_tokens = set(pairing.tokens(os.path.basename(mesh_path)))
-    for name, points in sorted(candidates.items()):
+    for name in sorted(candidates):
         if mesh_tokens & set(pairing.tokens(os.path.basename(name))) & _JAW_TOKENS:
-            return points
+            return name
 
     unlabelled = [
-        points for name, points in sorted(candidates.items())
+        name for name in sorted(candidates)
         if not (set(pairing.tokens(os.path.basename(name))) & _JAW_TOKENS)
     ]
     if len(unlabelled) == 1:
         return unlabelled[0]
     if len(candidates) == 1:
-        return next(iter(candidates.values()))
-    return {}
+        return next(iter(candidates))
+    return None
 
 
-# The DATA folder this engine's bundles live in, and the orientation reference
-# inside it. Written rather than derived, as AREG_CBCT writes its own: which
-# folder serves which engine is a deployment fact (the three AREG engines share
-# `DATA/AREG/`), and the bundle name is the one the manifest unpacks that
-# archive to.
+# The frame the CBCT is oriented into, in ASO's own words. ASO owns the
+# reference bundles that define its frames and resolves the one this names from
+# its own data folder; this engine holds no copy.
 #
-# Frankfurt rather than Occlusal, and this is a CHOICE a deployment can
-# reverse by naming the other in `cbct_reference`: the two planes carry
-# DISJOINT landmark sets, Frankfurt is the frame the shipped test data is
-# oriented into, and it is the anatomical convention a CBCT is read in. What it
-# must not be is a question asked of a clinician who has no way to know which
-# one the rest of the chain expects.
-_DATA_NAME = "AREG"
-_ORIENTATION_REFERENCE = "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane"
+# Frankfurt rather than Occlusal, and this is a CHOICE a caller can override by
+# naming a reference bundle in `cbct_reference`: the two planes carry DISJOINT
+# landmark sets, Frankfurt is the frame the shipped test data is oriented into,
+# and it is the anatomical convention a CBCT is read in. What it must not be is
+# a question asked of a clinician who has no way to know which one the rest of
+# the chain expects. ASO's default landmark selection is this frame's set, so
+# nothing else needs naming.
+_ORIENTATION_FRAME = "Frankfurt horizontal"
 
 
-def _own_reference(data_root):
-    """The orientation reference this deployment publishes, or ""."""
-    if not data_root:
-        return ""
-    candidate = os.path.join(str(data_root), _DATA_NAME, "models", _ORIENTATION_REFERENCE)
-    return candidate if os.path.isdir(candidate) else ""
+# How a run shares its bar, as fractions of the whole, per supervised call.
+# The calls come first because they run first -- in that order: ASO orients the
+# CBCT, Crown_Seg labels the crowns, ALI_IOS and then ALI_CBCT place the
+# landmarks -- and the registration takes what is left. ASO's CBCT mode runs
+# ALI_CBCT inside it, and an ALI_CBCT agent is a full two-scale walk of the
+# volume, so those two get the larger slices; the intraoral networks run on a
+# mesh and cost less. A weighting, not a measurement: what is exact is the
+# counter in each message.
+ORIENT_SHARE = 0.25
+CROWN_SHARE = 0.1
+IOS_LANDMARK_SHARE = 0.1
+CBCT_LANDMARK_SHARE = 0.2
+
+
+def _spans(automation: str, predict_ios: bool, predict_cbct: bool) -> dict:
+    """{step: (start, end)} for the steps this run makes, in the order it makes
+    them, ending with "register" on whatever is left.
+
+    The waypoints used to be fixed numbers in `tools.py` -- 0.5 for ASO, 0.1
+    for ALI_CBCT -- while the calls ran ASO first and ALI_CBCT last, so the bar
+    went backwards twice in a fully-automated run. Deriving them from the call
+    order is what makes that impossible; a step a mode skips takes no slice.
+    """
+    steps = []
+    if automation != catalogs.AUTOMATION_REGISTRATION:
+        if automation == catalogs.AUTOMATION_FULLY:
+            steps.append(("orient", ORIENT_SHARE))
+        steps.append(("crowns", CROWN_SHARE))
+        if predict_ios:
+            steps.append(("ios_landmarks", IOS_LANDMARK_SHARE))
+        if predict_cbct:
+            steps.append(("cbct_landmarks", CBCT_LANDMARK_SHARE))
+    spans, position = {}, 0.0
+    for name, share in steps:
+        spans[name] = (round(position, 6), round(position + share, 6))
+        position += share
+    spans["register"] = (round(position, 6), 1.0)
+    return spans
+
+
+def _carry_cbct(cbct_path: str, folder: str, output_dir: str,
+                with_transform: bool = True) -> dict:
+    """Copy the CBCT the meshes were registered onto into the patient's folder.
+
+    In the Fully-Automated mode that is ASO's oriented scan, not the caller's:
+    every arch is written in its frame, and it lived only in the job's work
+    directory. Opened over the original scan, the meshes were off by the whole
+    rotation ASO applied, with nothing in the results to put them back on. Its
+    transform (original scan to oriented one, ASO's `<scan>_transform.tfm`)
+    comes too, for a reader who wants the meshes on the original scan instead.
+
+    `with_transform` is False for a scan nobody oriented -- the caller's own,
+    copied for the same-space outputs -- which has no such transform beside it.
+
+    Returns the report fields naming what was copied, relative to `output_dir`.
+    """
+    os.makedirs(folder, exist_ok=True)
+    copied = {}
+    stem = pairing.split_scan_extension(os.path.basename(cbct_path))[0]
+    transform = os.path.join(os.path.dirname(cbct_path), f"{stem}_transform.tfm")
+    sources = [("oriented_cbct" if with_transform else "cbct_copy", cbct_path)]
+    if with_transform:
+        sources.append(("cbct_transform", transform))
+    for field, source in sources:
+        if not os.path.isfile(source):
+            logger.warning("No %s to copy beside the registered meshes", field.replace("_", " "))
+            continue
+        destination = os.path.join(folder, os.path.basename(source))
+        shutil.copy2(source, destination)
+        copied[field] = os.path.relpath(destination, output_dir)
+    return copied
+
+
+def _write_transform(matrix: np.ndarray, path: str) -> str:
+    """The registration as a `.tfm` Slicer opens, written as AREG_IOS writes
+    its own (`sadt_areg_ios.icp.write_transform`).
+
+    `matrix` moves the mesh's points onto the CBCT. A `.tfm` is consumed the
+    other way round -- it maps a point of the result back to where to sample
+    it -- so the inverse is what is written. The `.npy` beside it stays the
+    point-moving matrix, as before.
+    """
+    import SimpleITK as sitk
+
+    inverted = np.linalg.inv(matrix)
+    transform = sitk.AffineTransform(3)
+    transform.SetMatrix(inverted[:3, :3].flatten().tolist())
+    transform.SetTranslation(inverted[:3, 3].tolist())
+    sitk.WriteTransform(transform, path)
+    return path
 
 
 def register(ios_dir: str, cbct_dir: str, ios_landmark_dir: str, cbct_landmark_dir: str,
              output_dir: str, suffix: str, report: dict, max_dist: float,
-             progress_start: float = 0.0) -> None:
+             progress_span: tuple = (0.0, 1.0), produced_by: dict = None,
+             carry_cbct: bool = False, outputs=()) -> None:
     """The registration proper, once every landmark exists.
 
-    `progress_start` is where this phase begins on the run's progress bar. It
-    is 0 in the Registration mode, which predicts nothing, and follows the
-    waypoints in `tools.py` in the two modes that do -- otherwise a run that
-    called no other tool would report itself as more than half done before it
-    had registered anything.
+    `progress_span` is the slice of the run's progress bar this phase fills.
+    It is the whole bar in the Registration mode, which predicts nothing, and
+    what the supervised calls left (see `_spans`) in the two modes that make
+    them -- otherwise a run that called no other tool would report itself as
+    more than half done before it had registered anything.
+
+    `produced_by` maps "ios", "cbct", "ios_landmarks" and "cbct_landmarks" to
+    the supervised tool that wrote that folder; one left out is the caller's
+    own argument of that name. It decides two things about a refusal: which
+    source the message names, and its class -- an empty folder the caller sent
+    is theirs to fix (ToolInputError), one a tool returned is a fault on this
+    side (RuntimeError).
+
+    `carry_cbct` copies each patient's CBCT, and the transform beside it, into
+    that patient's folder: see `_carry_cbct`.
+
+    `outputs` are the `catalogs.OUTPUT_*` the caller ticked, all written in
+    the CBCT's space beside the meshes: the landmarks (each mesh's moved by
+    its matrix, the CBCT's as they are), the CBCT itself, and each matrix as
+    a `.tfm`. Whatever is written, each patient's `scene.json` lists it.
     """
-    paired, unpaired = pipeline.discover(ios_dir, cbct_dir)
+    outputs = set(outputs or ())
+    produced_by = produced_by or {}
+
+    def source(role):
+        tool = produced_by.get(role)
+        return f"{tool}'s output" if tool else f"'{role}'"
+
+    def error_for(*roles):
+        return RuntimeError if any(produced_by.get(r) for r in roles) else ToolInputError
+
+    # Before the first file is read: walking and parsing every landmark file
+    # takes a while on a large batch, and the last stage a watcher saw was the
+    # previous tool's.
+    progress.emit(progress_span[0], "reading landmarks")
+    paired, unpaired = pipeline.discover(
+        ios_dir, cbct_dir,
+        ios_source=source("ios"), cbct_source=source("cbct"),
+        ios_error=error_for("ios"), cbct_error=error_for("cbct"),
+    )
     report["unpaired"] = unpaired
 
-    ios_landmarks = _landmarks_by_jaw(ios_landmark_dir)
-    cbct_landmarks = _landmarks_by_jaw(cbct_landmark_dir)
-    if not ios_landmarks or not cbct_landmarks:
-        raise ToolInputError(
-            "Both landmark folders must hold at least one file: found "
-            f"{len(ios_landmarks)} intraoral and {len(cbct_landmarks)} CBCT."
-        )
+    ios_landmarks = _landmarks_by_jaw(ios_landmark_dir, "intraoral")
+    cbct_landmarks = _landmarks_by_jaw(cbct_landmark_dir, "CBCT")
+    for found, role, side, directory in (
+        (ios_landmarks, "ios_landmarks", "intraoral", ios_landmark_dir),
+        (cbct_landmarks, "cbct_landmarks", "CBCT", cbct_landmark_dir),
+    ):
+        if not found:
+            files = len(_landmark_files(directory))
+            raise error_for(role)(
+                f"No {side} landmark could be read from {source(role)}: "
+                f"{files} landmark file(s) (.json or .mrk.json) found, none "
+                "readable with points in it."
+            )
 
     sole_patient = len(paired) == 1
+    failures = []
+    to_review = 0
+    total_meshes = sum(len(data["ios"]) for data in paired.values())
     for index, (patient, data) in enumerate(paired.items(), start=1):
         # Per patient, not per mesh: the inner loop is one or two arches, and
         # the counter is what a watcher can act on. The patient key is built
         # from the caller's file names and never travels in a message.
-        progress.report(index, len(paired), "patient", start=progress_start)
+        progress.report(index, len(paired), "patient",
+                        start=progress_span[0], end=progress_span[1])
+        position = f"patient {index}/{len(paired)}"
+        folder = os.path.join(output_dir, data["name"])
         entry = {"cbct": os.path.basename(data["cbct"]), "meshes": {}}
         # Narrowed to this patient BEFORE the jaw is looked at: see _for_patient.
-        own_ios = _for_patient(ios_landmarks, patient, sole_patient)
-        own_cbct = _for_patient(cbct_landmarks, patient, sole_patient)
-        cbct_surface, on_enamel, surface_error = _cbct_surface(data["cbct"], own_cbct)
+        own_ios = _for_patient(ios_landmarks, data["patient"], sole_patient,
+                               data["ios_timepoint"])
+        own_cbct = _for_patient(cbct_landmarks, data["patient"], sole_patient,
+                                data["cbct_timepoint"])
+        # The CBCT landmark files the registration read, for the same-space
+        # outputs to copy once per patient whichever mesh used them.
+        used_cbct = set()
+        with where.at(position):
+            cbct_surface, on_enamel, surface_error = _cbct_surface(data["cbct"], own_cbct)
         if surface_error:
             entry["cbct_surface_error"] = surface_error
-        for mesh_path in data["ios"]:
+        for mesh_index, mesh_path in enumerate(data["ios"], start=1):
             name = os.path.basename(mesh_path)
+            arch = _arch(mesh_path)
+            here = (f"{position}, arch {arch}" if arch
+                    else f"{position}, mesh {mesh_index}/{len(data['ios'])}")
             try:
-                moving = _match_landmarks(mesh_path, own_ios)
-                fixed = _match_landmarks(mesh_path, own_cbct)
-                if not moving or not fixed:
-                    raise ToolInputError(
-                        f"No landmark file matches patient '{patient}' and this mesh's "
-                        f"jaw on {'the intraoral' if not moving else 'the CBCT'} side."
+                with where.at(here):
+                    moving = _match_landmarks(mesh_path, own_ios)
+                    fixed = _match_landmarks(mesh_path, own_cbct)
+                    if not moving or not fixed:
+                        role = "ios_landmarks" if not moving else "cbct_landmarks"
+                        raise error_for(role)(
+                            "No landmark file matches this patient and this mesh's "
+                            f"jaw on {'the intraoral' if not moving else 'the CBCT'} "
+                            f"side, in {source(role)}."
+                        )
+                    mesh = _read_mesh(mesh_path)
+                    matrix, detail = pipeline.register_one(
+                        mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
                     )
-                mesh = _read_mesh(mesh_path)
-                matrix, detail = pipeline.register_one(
-                    mesh, moving, fixed, cbct_surface, on_enamel, max_dist=max_dist
-                )
-                destination = os.path.join(
-                    output_dir, patient, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
-                )
-                _write_mesh(mesh.transform(matrix, inplace=False), destination)
-                # splitext, not `destination.replace(".vtk", ...)`: str.replace
-                # rewrites EVERY occurrence, so a mesh whose own stem carries
-                # `.vtk` produced a mangled matrix name beside a correct mesh.
-                np.save(os.path.splitext(destination)[0] + "_matrix.npy", matrix)
+                    report_metrics(here, detail)
+                    destination = os.path.join(
+                        folder, f"{os.path.splitext(name)[0]}_{suffix}.vtk"
+                    )
+                    _write_mesh(mesh.transform(matrix, inplace=False), destination)
+                    # splitext, not `destination.replace(".vtk", ...)`: str.replace
+                    # rewrites EVERY occurrence, so a mesh whose own stem carries
+                    # `.vtk` produced a mangled matrix name beside a correct mesh.
+                    np.save(os.path.splitext(destination)[0] + "_matrix.npy", matrix)
+                    extra = _mesh_outputs(
+                        mesh_path, destination, matrix, own_ios, own_cbct,
+                        ios_landmark_dir, output_dir, used_cbct, outputs,
+                    )
+                review = _needs_review(detail)
+                if review:
+                    logger.warning("%s: written, but to be checked before use: %s",
+                                   here, review)
+                    to_review += 1
                 entry["meshes"][name] = dict(
-                    detail, status="ok", output=os.path.relpath(destination, output_dir)
+                    detail, status="review" if review else "ok",
+                    output=os.path.relpath(destination, output_dir),
+                    **({"review": review} if review else {}),
+                    **extra,
                 )
             except Exception as exc:  # noqa: BLE001 - one mesh must not cost the batch
-                logger.exception("AREG_IOSCBCT failed on one mesh")
+                # Position, class and message: the report naming the mesh is
+                # deleted with the job when the run fails, so this line is what
+                # an operator has left.
+                logger.warning("%s: registration failed (%s: %s)",
+                               here, type(exc).__name__, exc)
+                logger.debug("Registration traceback", exc_info=True)
+                failures.append(exc)
                 entry["meshes"][name] = {"status": "failed", "error": str(exc)}
-        registered = [m for m in entry["meshes"].values() if m["status"] == "ok"]
-        entry["status"] = "ok" if registered else "failed"
-        report["patients"][patient] = entry
+        statuses = [m["status"] for m in entry["meshes"].values()]
+        entry["status"] = ("ok" if "ok" in statuses
+                           else "review" if "review" in statuses else "failed")
+        if entry["status"] != "failed":
+            if carry_cbct or catalogs.OUTPUT_CBCT_SCAN in outputs:
+                entry.update(_carry_cbct(data["cbct"], folder, output_dir,
+                                         with_transform=carry_cbct))
+            if catalogs.OUTPUT_LANDMARKS in outputs:
+                entry["cbct_landmarks"] = _copy_cbct_landmarks(
+                    used_cbct, cbct_landmark_dir, folder, output_dir)
+            if carry_cbct and catalogs.OUTPUT_ORIENTATION_LANDMARKS in outputs:
+                entry.update(_copy_orientation_landmarks(data["cbct"], folder, output_dir))
+            _write_scene(folder, entry, output_dir, oriented=carry_cbct)
+        # Under the name the files carry, never the matching key: see
+        # pipeline.patient_name.
+        report["patients"][data["name"]] = entry
 
-    produced = [p for p in report["patients"].values() if p["status"] == "ok"]
-    if not produced:
-        raise RuntimeError(
-            "AREG_IOSCBCT registered no mesh for any patient. The per-mesh errors "
-            "are in the report."
-        )
+    report["meshes_registered"] = total_meshes - len(failures)
+    report["meshes_failed"] = len(failures)
+    report["meshes_to_review"] = to_review
+    if failures and len(failures) == total_meshes:
+        first, count = _most_common(failures)
+        # Self-contained: the report is deleted with a failed job, so pointing
+        # at it sends the operator nowhere. Kept as the caller's error when
+        # every arch failed on the caller's own input; anything else is ours.
+        every_input = all(isinstance(exc, ToolInputError) for exc in failures)
+        raise (ToolInputError if every_input else RuntimeError)(
+            f"0 of {total_meshes} mesh(es) registered; most common failure: "
+            f"{type(first).__name__}: {first} ({count} of {total_meshes})"
+        ) from first
+
+
+def _mesh_outputs(mesh_path: str, destination: str, matrix: np.ndarray,
+                  own_ios: dict, own_cbct: dict, ios_landmark_dir: str,
+                  output_dir: str, used_cbct: set, outputs: set) -> dict:
+    """What one mesh adds beside its registered copy. Returns report fields.
+
+    Records in `used_cbct` the CBCT landmark file this mesh was registered on,
+    the same file `_match_landmarks` read, for the patient's copy of them.
+    """
+    written = {}
+    stem = os.path.splitext(destination)[0]
+    fixed = _matched_file(mesh_path, own_cbct)
+    if fixed is not None:
+        used_cbct.add(fixed)
+    if catalogs.OUTPUT_LANDMARKS in outputs:
+        moving = _matched_file(mesh_path, own_ios)
+        if moving is not None:
+            source = os.path.join(ios_landmark_dir, moving)
+            landmarks = scene.move_landmarks(
+                source, matrix, stem + "_lm" + scene.landmark_extension(source))
+            written["landmarks"] = os.path.relpath(landmarks, output_dir)
+    if catalogs.OUTPUT_TRANSFORMS in outputs:
+        written["transform"] = os.path.relpath(
+            _write_transform(matrix, stem + "_transform.tfm"), output_dir)
+    return written
+
+
+def _copy_orientation_landmarks(oriented_cbct: str, folder: str, output_dir: str) -> dict:
+    """Copy the landmarks ASO oriented this CBCT on beside it. They are in the
+    oriented scan's space already, the space every mesh was registered into."""
+    source = pairing.oriented_landmarks(oriented_cbct)
+    if not os.path.isfile(source):
+        logger.warning("ASO left no landmarks beside %s", os.path.basename(oriented_cbct))
+        return {}
+    os.makedirs(folder, exist_ok=True)
+    destination = os.path.join(folder, os.path.basename(source))
+    shutil.copy2(source, destination)
+    return {"orientation_landmarks": os.path.relpath(destination, output_dir)}
+
+
+def _copy_cbct_landmarks(used: set, cbct_landmark_dir: str, folder: str,
+                         output_dir: str) -> list:
+    """Copy the CBCT landmark files the registration used, as they are: they
+    were placed on the very CBCT the meshes are now in, so they need no move."""
+    copied = []
+    for name in sorted(used):
+        destination = os.path.join(folder, os.path.basename(name))
+        shutil.copy2(os.path.join(cbct_landmark_dir, name), destination)
+        copied.append(os.path.relpath(destination, output_dir))
+    return copied
+
+
+def _write_scene(folder: str, entry: dict, output_dir: str, oriented: bool) -> None:
+    """The patient's `scene.json`: every file written for it, all in the
+    CBCT's space (see `sadt_areg_common.scene`)."""
+    def here(path):
+        return os.path.join(output_dir, path)
+
+    files = []
+    for field, role in (("oriented_cbct", "reference"), ("cbct_copy", "reference"),
+                        ("cbct_transform", "orientation")):
+        if entry.get(field):
+            files.append((here(entry[field]), role))
+    if entry.get("orientation_landmarks"):
+        files.append((here(entry["orientation_landmarks"]), "orientation landmarks"))
+    files += [(here(path), "reference landmarks") for path in entry.get("cbct_landmarks", [])]
+    for mesh in entry["meshes"].values():
+        if mesh["status"] == "failed":
+            continue
+        files.append((here(mesh["output"]), "registered"))
+        if mesh.get("landmarks"):
+            files.append((here(mesh["landmarks"]), "moved landmarks"))
+        if mesh.get("transform"):
+            files.append((here(mesh["transform"]), "registration"))
+    scene.write(folder, "the oriented CBCT" if oriented else "the CBCT", files)
+
+
+def _count(directory, keep) -> int:
+    """How many files under `directory` `keep(name)` accepts; 0 when absent."""
+    if not directory or not os.path.isdir(str(directory)):
+        return 0
+    return sum(1 for _root, _dirs, files in os.walk(str(directory))
+               for name in files if keep(name))
+
+
+def _is_mesh(name: str) -> bool:
+    return name.lower().endswith(pipeline.SURFACE_EXTENSIONS)
+
+
+def _is_landmark(name: str) -> bool:
+    return name.lower().endswith(pipeline.LANDMARK_EXTENSIONS)
+
+
+def _is_scan(name: str) -> bool:
+    from sadt_areg_common import pairing
+
+    return pairing.is_scan_file(name)
+
+
+def _compare(tool: str, what: str, sent: int, returned: int) -> None:
+    """Say so when a supervised tool hands back fewer files than it was sent.
+
+    The tool itself ran to the end, so nothing raised: the shortfall shows up
+    only later, as patients the registration silently has nothing for. Counted
+    here, where it is still clear whose output it was. Fewer is a warning, not
+    a refusal -- the rest of the batch is still worth registering, and an
+    empty return is refused downstream, naming the tool.
+    """
+    if returned < sent:
+        logger.warning("%s returned %d %s for %d sent", tool, returned, what, sent)
+    else:
+        logger.info("%s returned %d %s for %d sent", tool, returned, what, sent)
+
+
+def derive_automation(automation: str, ios_landmarks, cbct_landmarks,
+                     orient_cbct_first: bool = True) -> tuple:
+    """The mode this request really is. Returns `(mode, source)`.
+
+    `source` is "from the data" or "requested". See the note at the call site
+    for why only two of the three modes can be read off a folder.
+    """
+    if automation and automation != catalogs.AUTOMATION_AUTO:
+        return automation, "requested"
+    if ios_landmarks and cbct_landmarks:
+        return catalogs.AUTOMATION_REGISTRATION, "from the data"
+    return (catalogs.AUTOMATION_FULLY if orient_cbct_first
+            else catalogs.AUTOMATION_SEMI), "from the data"
 
 
 def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landmarks=None,
          cbct_reference=None, landmark_model=None, ios_landmark_model=None,
-         crown_model=None, max_dist=None, output_suffix="Reg", sup=None,
-         data_root=None):
+         crown_model=None, max_dist=None, output_suffix="Reg",
+         orient_cbct_first=True, outputs=(), sup=None):
     """Validate, fetch whatever the mode does not supply, then register."""
     started_at = time.monotonic()
-    automation = str(automation or catalogs.AUTOMATION_REGISTRATION)
+    # Two of the three modes are written in the request; the third is a choice.
+    #
+    # `Registration` is: both landmark sets supplied means predict nothing, there
+    # being nothing left to predict. What separates `Fully-Automated` from
+    # `Semi-Automated` is NOT in the data -- it is "orient the CBCT first", which
+    # nothing in a folder can answer -- so that one is asked as
+    # `orient_cbct_first`, a box that says what it does, instead of being hidden
+    # inside a three-valued mode nobody could map onto their own files.
+    #
+    # `cbct_reference` cannot stand in for it either: it is an override, and
+    # left empty ASO orients into `_ORIENTATION_FRAME` with its own bundle.
+    automation, automation_source = derive_automation(
+        automation, ios_landmarks, cbct_landmarks, orient_cbct_first
+    )
     allowed = catalogs.AUTOMATION_BY_MODALITY[MODALITY]
     if automation not in allowed:
         raise ToolInputError(
@@ -299,6 +865,9 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
     report = {
         "modality": MODALITY,
         "automation": automation,
+        # Which of the two it was: a mode name in a report does not say whether
+        # anybody chose it.
+        "automation_source": automation_source,
         "output_suffix": suffix,
         "patients": {},
     }
@@ -308,6 +877,11 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
         ios_lm = str(ios_landmarks) if ios_landmarks else None
         cbct_lm = str(cbct_landmarks) if cbct_landmarks else None
 
+        spans = _spans(automation, predict_ios=not ios_lm, predict_cbct=not cbct_lm)
+        # Which folders a supervised tool wrote, for `register` to name in a
+        # refusal -- and to tell the caller's fault from this side's.
+        produced_by = {}
+
         if automation != catalogs.AUTOMATION_REGISTRATION:
             # Everything the caller did not supply is fetched from the tool that
             # produces it. Checked up front so a request that cannot work comes
@@ -316,26 +890,37 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
                 tools.require(sup, name, f"{automation} IOSCBCT registration")
             if automation == catalogs.AUTOMATION_FULLY:
                 tools.require(sup, "ASO", "Fully-Automated IOSCBCT registration")
-                # Resolved here rather than asked for: there is one frame the
-                # rest of this chain expects, and picking the other silently
-                # changes what the landmarks mean.
-                cbct_reference = cbct_reference or _own_reference(data_root)
-                if not cbct_reference:
-                    raise ToolInputError(
-                        "Fully-Automated orients the CBCT first, which needs an "
-                        f"orientation reference. This deployment publishes none: "
-                        f"no '{_ORIENTATION_REFERENCE}' under "
-                        f"DATA/{_DATA_NAME}/models/. Add it "
-                        "(scripts/setup-models.sh --tool AREG), or name another "
-                        "in 'cbct_reference'."
-                    )
-                cbct_root = tools.orient_cbct(sup, cbct_root, cbct_reference, landmark_model)
+                # The frame, not a bundle: there is one frame the rest of this
+                # chain expects, and ASO resolves the reference that defines it.
+                scans_sent = _count(cbct_root, _is_scan)
+                cbct_root = tools.orient_cbct(
+                    sup, cbct_root, str(cbct_reference or ""), landmark_model,
+                    span=spans["orient"], frame=_ORIENTATION_FRAME,
+                )
+                _compare("ASO", "oriented CBCT(s)", scans_sent, _count(cbct_root, _is_scan))
+                produced_by["cbct"] = "ASO"
 
-            labelled = tools.label_crowns(sup, ios_root, crown_model or "")
+            meshes_sent = _count(ios_root, _is_mesh)
+            labelled = tools.label_crowns(sup, ios_root, crown_model or "", span=spans["crowns"])
+            meshes_labelled = _count(labelled, _is_mesh)
+            _compare("Crown_Seg", "labelled mesh(es)", meshes_sent, meshes_labelled)
+            produced_by["ios"] = "Crown_Seg"
             if not ios_lm:
-                ios_lm = tools.predict_ios_landmarks(sup, labelled, ios_landmark_model or "")
+                ios_lm = tools.predict_ios_landmarks(
+                    sup, labelled, ios_landmark_model or "", span=spans["ios_landmarks"]
+                )
+                # One landmark file per mesh is what ALI_IOS writes.
+                _compare("ALI_IOS", "landmark file(s)", meshes_labelled,
+                         _count(ios_lm, _is_landmark))
+                produced_by["ios_landmarks"] = "ALI_IOS"
             if not cbct_lm:
-                cbct_lm = tools.predict_cbct_landmarks(sup, cbct_root, landmark_model or "")
+                scans = _count(cbct_root, _is_scan)
+                cbct_lm = tools.predict_cbct_landmarks(
+                    sup, cbct_root, landmark_model or "", span=spans["cbct_landmarks"]
+                )
+                # And one per scan from ALI_CBCT.
+                _compare("ALI_CBCT", "landmark file(s)", scans, _count(cbct_lm, _is_landmark))
+                produced_by["cbct_landmarks"] = "ALI_CBCT"
             ios_root = labelled
 
         if not ios_lm or not cbct_lm:
@@ -350,16 +935,41 @@ def main(ios, cbct, output_dir, automation=None, ios_landmarks=None, cbct_landma
             ios_landmark_dir=ios_lm, cbct_landmark_dir=cbct_lm,
             output_dir=output_dir, suffix=suffix, report=report,
             max_dist=float(max_dist) if max_dist else geometry.ICP_MAX_DIST_MM,
-            # The last waypoint `tools.py` writes is 0.5; the registration has
-            # the rest. Registration mode wrote none of them and starts at 0.
-            progress_start=0.0 if automation == catalogs.AUTOMATION_REGISTRATION else 0.6,
+            # Whatever the supervised calls left; the whole bar in the
+            # Registration mode, which makes none of them.
+            progress_span=spans["register"],
+            produced_by=produced_by,
+            # The meshes are registered onto the CBCT ASO oriented, a volume
+            # the caller never had: without it beside them, they sit nowhere
+            # near the scan the caller opens them over.
+            carry_cbct=produced_by.get("cbct") == "ASO",
+            outputs=outputs,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     report["duration_seconds"] = round(time.monotonic() - started_at, 2)
+    if catalogs.OUTPUT_METRICS in set(outputs or ()):
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
-    logger.info("AREG_IOSCBCT: %d patient(s) in %.1fs",
-                len(report["patients"]), report["duration_seconds"])
+    failed = report.get("meshes_failed", 0)
+    total = report.get("meshes_registered", 0) + failed
+    to_review = report.get("meshes_to_review", 0)
+    unpaired = len(report.get("unpaired", {}))
+    # WARNING when partial: a batch that registered 30 of 40 arches finishes
+    # "successfully", and this line is where the other ten show -- along with
+    # the arches written but far from their landmarks, and the patients never
+    # registered at all because one modality was missing. "4 of 4 registered"
+    # once summed up a batch of six patients of which two were paired, both
+    # wrong.
+    logger.log(
+        logging.WARNING if failed or to_review or unpaired else logging.INFO,
+        "AREG_IOSCBCT: %d of %d mesh(es) registered, %d failed, %d to review, over "
+        "%d patient(s) in %.1fs%s", total - failed, total, failed, to_review,
+        len(report["patients"]), report["duration_seconds"],
+        f"; {unpaired} patient(s) not registered, one modality missing"
+        if unpaired else "")
     return output_dir

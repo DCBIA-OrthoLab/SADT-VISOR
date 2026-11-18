@@ -75,29 +75,53 @@ def _events(path) -> list:
 
 
 def test_each_step_says_which_tool_the_run_is_inside(tmp_path):
-    """The three waypoints, which `FakeSup.messages` has recorded and nothing
-    read until now.
+    """The waypoints, in the order a fully-automated run makes its calls.
 
     They are what a watcher has instead of a frozen bar: a fully-automated run
     spends most of its time inside ALI and ASO, and without them the panel
-    cannot say which. They rise, and none of them names a file.
+    cannot say which. They rise, and none of them names a file. They used to be
+    fixed numbers that fell in call order -- ASO at 0.5, then ALI_CBCT at 0.1.
     """
     planted = tmp_path / "planted"
     planted.mkdir()
     sup = FakeSup(tmp_path, {name: (lambda params: planted) for name in
-                             ("ALI_CBCT", "ALI_IOS", "ASO")})
+                             ("ALI_CBCT", "ALI_IOS", "ASO", "Crown_Seg")})
+    spans = dispatch._spans(catalogs.AUTOMATION_FULLY, predict_ios=True, predict_cbct=True)
 
-    tools.predict_cbct_landmarks(sup, str(tmp_path), "")
-    tools.predict_ios_landmarks(sup, str(tmp_path), "")
-    tools.orient_cbct(sup, str(tmp_path), str(tmp_path), "")
+    tools.orient_cbct(sup, str(tmp_path), str(tmp_path), "", span=spans["orient"])
+    tools.label_crowns(sup, str(tmp_path), "", span=spans["crowns"])
+    tools.predict_ios_landmarks(sup, str(tmp_path), "", span=spans["ios_landmarks"])
+    tools.predict_cbct_landmarks(sup, str(tmp_path), "", span=spans["cbct_landmarks"])
 
     fractions = [fraction for fraction, _message in sup.messages]
-    assert fractions == [0.1, 0.3, 0.5]
+    assert fractions == sorted(fractions)
+    assert fractions == [0.0, 0.25, 0.35, 0.45]
     assert [message for _fraction, message in sup.messages] == [
-        "predicting CBCT landmarks with ALI_CBCT",
-        "predicting intraoral landmarks with ALI_IOS",
         "orienting the CBCT with ASO",
+        "labelling the intraoral crowns with Crown_Seg",
+        "predicting intraoral landmarks with ALI_IOS",
+        "predicting CBCT landmarks with ALI_CBCT",
     ]
+    # Each call is handed exactly its own slice, and never as an argument.
+    assert sup.spans == [
+        ("ASO", (0.0, 0.25)), ("Crown_Seg", (0.25, 0.35)),
+        ("ALI_IOS", (0.35, 0.45)), ("ALI_CBCT", (0.45, 0.65)),
+    ]
+    assert all("_progress" not in params for _tool, params in sup.calls)
+
+
+def test_the_spans_tile_the_bar_in_every_mode():
+    """Each step starts where the one before ended, and registration ends it."""
+    for automation in (catalogs.AUTOMATION_FULLY, catalogs.AUTOMATION_SEMI):
+        for predict_ios in (True, False):
+            for predict_cbct in (True, False):
+                spans = list(dispatch._spans(automation, predict_ios, predict_cbct).values())
+                assert spans[0][0] == 0.0
+                assert spans[-1][1] == 1.0
+                for (_s0, e0), (s1, _e1) in zip(spans, spans[1:]):
+                    assert e0 == s1
+    assert dispatch._spans(catalogs.AUTOMATION_REGISTRATION, True, True) == {
+        "register": (0.0, 1.0)}
 
 
 def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monkeypatch):
@@ -125,7 +149,7 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
     # landmarks, silently and with an "ok" in the report.
     monkeypatch.setattr(
         dispatch, "_landmarks_by_jaw",
-        lambda root: {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
+        lambda root, side="": {f"{name}_U.json": {"A": [0.0, 0.0, 0.0]}
                       for name in ("P1", "P2")},
     )
     # A stand-in that answers the one call the loop makes on a mesh. Returning
@@ -151,18 +175,21 @@ def test_the_registration_loop_starts_where_the_waypoints_stopped(tmp_path, monk
         ),
     )
 
-    for start, expected in ((0.0, [0.0, 0.5]), (0.6, [0.6, 0.8])):
+    for span, expected in (((0.0, 1.0), [0.0, 0.5]), ((0.6, 1.0), [0.6, 0.8])):
         events_file.write_text("")
         report = {"patients": {}}
         dispatch.register(
             ios_dir=str(tmp_path / "ios"), cbct_dir=str(tmp_path / "cbct"),
             ios_landmark_dir=str(tmp_path), cbct_landmark_dir=str(tmp_path),
             output_dir=str(tmp_path / "out"), suffix="Reg", report=report,
-            max_dist=1.0, progress_start=start,
+            max_dist=1.0, progress_span=span,
         )
         events = _events(events_file)
-        assert [event["message"] for event in events] == ["patient 1 of 2", "patient 2 of 2"]
-        assert [event["fraction"] for event in events] == expected
+        # "reading landmarks" first, at the start of the span: walking and
+        # parsing every landmark file is not instant on a large batch.
+        assert [event["message"] for event in events] == [
+            "reading landmarks", "patient 1 of 2", "patient 2 of 2"]
+        assert [event["fraction"] for event in events] == [expected[0]] + expected
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +225,21 @@ def test_the_unpaired_patients_are_counted_in_the_log_not_named(tmp_path, caplog
 # The modes
 # ---------------------------------------------------------------------------
 
-def test_the_default_mode_is_the_one_that_needs_no_other_tool():
-    """A default that cannot run without a supervisor and three model bundles
-    reads as a broken tool rather than as a default."""
+def test_the_default_mode_names_no_mode_at_all():
+    """It used to be `Registration` -- the one that needs no other tool -- so a
+    default would not read as a broken tool. But a mode a caller DECLARES can
+    disagree with the folder they sent, and a request holding only scans was
+    then refused for missing the landmarks `Registration` requires.
+
+    The default now says "read it off the request", and naming a mode is an
+    override. See `catalogs.AUTOMATION_AUTO`."""
     assert inspect.signature(run).parameters["automation"].default == (
-        catalogs.AUTOMATION_REGISTRATION
+        catalogs.AUTOMATION_AUTO
+    )
+    assert catalogs.AUTOMATION_AUTO not in (
+        catalogs.AUTOMATION_REGISTRATION,
+        catalogs.AUTOMATION_SEMI,
+        catalogs.AUTOMATION_FULLY,
     )
 
 
@@ -212,12 +249,12 @@ def test_the_published_modes_are_the_catalog_s_own_for_this_modality():
     produces 422s; one `main` accepts and the signature omits is a mode no
     client can reach.
 
-    The ORDER differs on purpose -- the signature leads with the default, so
-    a client's picker opens on the mode that needs nothing."""
+    The ORDER differs on purpose -- the signature leads with the default, so a
+    client's picker opens on the value that asks nothing of the reader."""
     assert set(_choices("automation")) == set(
         catalogs.AUTOMATION_BY_MODALITY[catalogs.MODALITY_IOSCBCT]
     )
-    assert _choices("automation")[0] == catalogs.AUTOMATION_REGISTRATION
+    assert _choices("automation")[0] == catalogs.AUTOMATION_AUTO
 
 
 def test_the_oriented_mode_belongs_to_the_cbct_tool_alone(tmp_path):
@@ -240,11 +277,58 @@ def test_an_unknown_mode_names_the_value_and_what_is_offered(tmp_path):
         assert mode in message
 
 
-def test_an_omitted_mode_falls_back_to_registration(tmp_path):
+def test_an_omitted_mode_is_read_off_the_request(tmp_path):
     """`main` is also called directly by tests and by another tool, where the
-    signature's default does not apply."""
-    with pytest.raises(ToolInputError, match="Registration mode takes"):
+    signature's default does not apply -- so `None` has to mean the same thing
+    the default means.
+
+    It used to fall back to `Registration`, which then refused a request holding
+    only scans for missing the landmarks it requires. A request holding only
+    scans is now what it looks like: one with everything still to predict."""
+    assert dispatch.derive_automation(None, None, None) == (
+        catalogs.AUTOMATION_FULLY, "from the data"
+    )
+    with pytest.raises(ToolInputError) as raised:
         _main(tmp_path, automation=None)
+    assert "Registration mode takes" not in str(raised.value)
+
+
+def test_both_landmark_sets_mean_there_is_nothing_left_to_predict():
+    mode, source = dispatch.derive_automation(None, "/ios/lm", "/cbct/lm")
+
+    assert mode == catalogs.AUTOMATION_REGISTRATION
+    assert source == "from the data"
+
+
+def test_one_landmark_set_alone_is_not_registration_mode():
+    """Half of the pair is not a smaller answer, it is no answer: the
+    cross-modality registration needs points on both sides."""
+    assert dispatch.derive_automation(None, "/ios/lm", None)[0] != (
+        catalogs.AUTOMATION_REGISTRATION
+    )
+    assert dispatch.derive_automation(None, None, "/cbct/lm")[0] != (
+        catalogs.AUTOMATION_REGISTRATION
+    )
+
+
+def test_orienting_the_cbct_first_is_what_separates_the_two_predicted_modes():
+    """The one thing here no folder can answer, so it is asked as itself rather
+    than hidden inside a three-valued mode."""
+    assert dispatch.derive_automation(None, None, None, orient_cbct_first=True)[0] == (
+        catalogs.AUTOMATION_FULLY
+    )
+    assert dispatch.derive_automation(None, None, None, orient_cbct_first=False)[0] == (
+        catalogs.AUTOMATION_SEMI
+    )
+
+
+def test_a_named_mode_overrides_what_the_request_looks_like():
+    mode, source = dispatch.derive_automation(
+        catalogs.AUTOMATION_SEMI, "/ios/lm", "/cbct/lm"
+    )
+
+    assert mode == catalogs.AUTOMATION_SEMI
+    assert source == "requested"
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +375,9 @@ def test_the_rules_run_before_anything_is_read():
 
 def test_an_unreadable_input_is_reported_rather_than_crashing_the_batch(tmp_path):
     """`discover` walks a folder that is not there without complaining, so the
-    refusal is the pairing one -- which names what it was looking for."""
+    refusal is the empty-side one -- which names the argument it looked in."""
     cohort(tmp_path)
-    with pytest.raises(ToolInputError, match="No patient has both"):
+    with pytest.raises(ToolInputError, match="No CBCT scan found in 'cbct'"):
         run_registration(tmp_path, cbct="/nonexistent/cbct")
 
 
@@ -373,24 +457,57 @@ def test_every_layout_condition_names_a_mode_this_tool_has():
         if not condition:
             continue
         assert set(condition) <= set(inspect.signature(run).parameters), argument
-        wanted = condition["automation"]
-        for mode in (wanted if isinstance(wanted, list) else [wanted]):
-            assert mode in offered, (argument, mode)
+        # Every condition's values, and not only automation's: a misspelt
+        # layout hides a field just as surely as a misspelt mode.
+        values = {"automation": offered, "input_layout": set(catalogs.LAYOUT_CHOICES)}
+        for name, wanted in condition.items():
+            for value in (wanted if isinstance(wanted, list) else [wanted]):
+                assert value in values[name], (argument, name, value)
 
 
 def test_the_landmark_folders_are_hidden_in_the_modes_that_overwrite_them():
     """Showing them in a mode that predicts its own is how a user comes to
-    believe their files were used."""
+    believe their files were used.
+
+    The auto value is in the condition beside Registration, and has to be: it is
+    the default now, and filling these folders is HOW Registration is selected.
+    A condition naming Registration alone would have hidden the two fields that
+    select Registration."""
     for argument in ("ios_landmarks", "cbct_landmarks"):
-        assert LAYOUT[argument]["visible_when"] == {
-            "automation": catalogs.AUTOMATION_REGISTRATION
-        }
+        shown_in = LAYOUT[argument]["visible_when"]["automation"]
+        assert catalogs.AUTOMATION_REGISTRATION in shown_in
+        assert catalogs.AUTOMATION_AUTO in shown_in
+        assert catalogs.AUTOMATION_SEMI not in shown_in
+        assert catalogs.AUTOMATION_FULLY not in shown_in
 
 
 def test_the_orientation_reference_is_shown_only_in_the_mode_that_orients():
-    assert LAYOUT["cbct_reference"]["visible_when"] == {
-        "automation": catalogs.AUTOMATION_FULLY
-    }
+    shown_in = LAYOUT["cbct_reference"]["visible_when"]["automation"]
+
+    assert catalogs.AUTOMATION_FULLY in shown_in
+    assert catalogs.AUTOMATION_AUTO in shown_in
+    assert catalogs.AUTOMATION_REGISTRATION not in shown_in
+
+
+def test_the_one_choice_no_folder_can_answer_is_asked_as_itself():
+    """`orient_cbct_first` replaces what used to be the difference between two
+    values of `automation`. A three-valued mode was the wrong shape: two of its
+    values were facts about the files, the third was a preference."""
+    # The label names the FRAME: "orient first" said what the tool does, not
+    # what the reader gets, and a clinician cannot act on the difference.
+    label = LAYOUT["orient_cbct_first"]["label"]
+    assert "Frankfurt" in label
+    # Spelled like the bundle and like the rest of the repository, never the
+    # anatomical "Frankfort" -- a panel and a folder differing by a letter is a
+    # support question.
+    assert "Frankfort" not in label
+    assert not LAYOUT["orient_cbct_first"].get("hidden")
+    shown_in = LAYOUT["orient_cbct_first"]["visible_when"]["automation"]
+    assert catalogs.AUTOMATION_REGISTRATION not in shown_in
+
+
+def test_the_mode_itself_is_not_put_to_the_reader():
+    assert LAYOUT["automation"]["hidden"] is True
 
 
 def test_every_published_argument_has_a_label(tmp_path):
@@ -436,3 +553,60 @@ def test_a_supervisor_is_accepted_and_unused_in_registration_mode(tmp_path):
     sup = FakeSup(tmp_path)
     run_registration(tmp_path, sup=sup)
     assert sup.calls == []
+
+
+def test_the_raw_step_folders_are_not_offered():
+    """`keep_intermediate` is injected by the server from the tools this one
+    calls. Hidden in every engine of the facade: what a reader wanted from it
+    comes back as an Extra output, in the result's space. Its wording stays,
+    for the day it is shown again."""
+    from sadt_areg_ioscbct.layout import LAYOUT
+
+    hints = LAYOUT["keep_intermediate"]
+    assert hints.get("hidden") is True
+    assert hints["label"] == "Raw intermediate files"
+    assert set(hints["option_help"]) == {"ALI_CBCT", "ALI_IOS", "ASO", "Crown_Seg"}
+
+
+# ---------------------------------------------------------------------------
+# A registration written but not to be trusted
+# ---------------------------------------------------------------------------
+
+def test_an_arch_left_far_from_its_landmarks_is_written_but_flagged(tmp_path, monkeypatch, caplog):
+    """A batch reported "ok" for arches the ICP had left 45 mm from their
+    landmarks: the surface fit scored well because it had slid along the
+    occlusal surface. Still written -- a reader may want to see it -- but
+    marked, counted, and said in the closing line."""
+    real = pipeline.register_one
+
+    def drifted(*args, **kwargs):
+        matrix, detail = real(*args, **kwargs)
+        detail["icp"] = dict(detail.get("icp") or {}, landmark_rms_after_mm=47.5)
+        return matrix, detail
+
+    monkeypatch.setattr(dispatch.pipeline, "register_one", drifted)
+    cohort(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        run_registration(tmp_path)
+    report = json.loads((tmp_path / "out" / "AREG_report.json").read_text())
+
+    patient = report["patients"]["P001"]
+    assert patient["status"] == "review"
+    for mesh in patient["meshes"].values():
+        assert mesh["status"] == "review"
+        assert "47.5 mm" in mesh["review"]
+        assert os.path.isfile(tmp_path / "out" / mesh["output"])
+    assert report["meshes_to_review"] == len(patient["meshes"])
+    assert report["meshes_failed"] == 0
+    assert any("to review" in r.getMessage() and r.levelno == logging.WARNING
+               for r in caplog.records)
+
+
+def test_an_arch_close_to_its_landmarks_stays_ok(tmp_path):
+    cohort(tmp_path)
+    run_registration(tmp_path)
+    report = json.loads((tmp_path / "out" / "AREG_report.json").read_text())
+
+    assert report["patients"]["P001"]["status"] == "ok"
+    assert report["meshes_to_review"] == 0
+    assert all("review" not in mesh for mesh in report["patients"]["P001"]["meshes"].values())

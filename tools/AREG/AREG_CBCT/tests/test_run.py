@@ -198,8 +198,9 @@ class TestSemiAutomatedCBCT:
         )
         assert produced == [
             "AREG_report.json",
-            os.path.join("CB", "P1_CB_Reg.nii.gz"),
-            os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+            os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+            os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
+            os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
         ]
 
         with open(os.path.join(run.output_dir, "AREG_report.json")) as handle:
@@ -227,16 +228,16 @@ class TestSemiAutomatedCBCT:
             output_dir=str(tmp_path / "out"),
         )
         transform = sitk.ReadTransform(
-            os.path.join(run.output_dir, "CB", "P1_CB_Reg_transform.tfm")
+            os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_transform.tfm")
         )
-        registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"))
+        registered = sitk.ReadImage(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg.nii.gz"))
         moving = sitk.ReadImage(str(tmp_path / "T2" / "P1_T2_scan.nii.gz"))
 
-        # Resampling the ORIGINAL T2 with the written transform reproduces the
-        # registered volume the archive holds. It could only do that if the
-        # transform lives in the space of the file the caller sent.
+        # Resampling the ORIGINAL T2 with the written transform, onto the grid
+        # the registered file carries, reproduces that file. It could only do
+        # that if the transform lives in the space of the file the caller sent.
         resampler = sitk.ResampleImageFilter()
-        resampler.SetReferenceImage(moving)
+        resampler.SetReferenceImage(registered)
         resampler.SetTransform(transform)
         resampler.SetInterpolator(sitk.sitkLinear)
         reproduced = sitk.Cast(resampler.Execute(moving), sitk.sitkInt16)
@@ -407,6 +408,44 @@ def test_the_orientation_request_is_the_nested_one(tmp_path):
     assert params["output_suffix"] == "Or"
 
 
+def test_aso_is_asked_for_the_landmarks_the_reference_defines(tmp_path):
+    """Left out, ASO used its own defaults -- the Frankfurt set -- and every
+    run oriented on the occlusal reference was refused before ALI was asked."""
+    import json as _json
+    reference = tmp_path / "CBCT_Gold_Occlusal_Midsagittal_Plane"
+    reference.mkdir()
+    (reference / "UP01_Or.mrk.json").write_text(_json.dumps({"markups": [{"controlPoints": [
+        {"label": label} for label in ("IF", "ANS", "UR6O", "UL6O", "UR1O", "PNS")]}]}))
+    planted = tmp_path / "oriented"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
+
+    tools.orient_scans(sup, str(tmp_path / "scans"), str(reference), "CBCT")
+
+    assert sup.calls[0][1]["cbct_landmarks"] == ["IF", "ANS", "UR6O", "UL6O", "UR1O", "PNS"]
+
+
+def test_a_reference_without_markups_leaves_aso_its_own_choice(tmp_path):
+    planted = tmp_path / "oriented"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
+    tools.orient_scans(sup, str(tmp_path / "scans"), str(tmp_path / "nothing"), "CBCT")
+    assert "cbct_landmarks" not in sup.calls[0][1]
+
+
+def test_the_real_shipped_references_name_their_own_landmarks():
+    """Read from the bundles this deployment stages, when they are here."""
+    import os as _os
+    root = _os.environ.get("AREG_REFERENCE_ROOT", "/home/luciacev/code/VISOR-serve/DATA/ASO/models")
+    occlusal = _os.path.join(root, "CBCT_Gold_Occlusal_Midsagittal_Plane")
+    frankfurt = _os.path.join(root, "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane")
+    if not (_os.path.isdir(occlusal) and _os.path.isdir(frankfurt)):
+        import pytest
+        pytest.skip("the reference bundles are not staged here")
+    assert set(tools.reference_landmarks(occlusal)) == {"ANS", "IF", "PNS", "UL6O", "UR1O", "UR6O"}
+    assert set(tools.reference_landmarks(frankfurt)) == {"Ba", "S", "N", "RPo", "LPo", "ROr", "LOr"}
+
+
 # Moved from the single AREG suite when AREG became three tools. These drive
 # `main()` with t1/t2, which is this tool's signature, not the orchestrator's;
 # they were sitting in AREG_IOSCBCT's file only because the three used to share
@@ -439,8 +478,8 @@ class TestArgumentRules:
             with pytest.raises(ToolInputError, match="masks you provide"):
                 self._main()
 
-    def test_the_oriented_mode_without_a_reference_is_refused(self):
-            with pytest.raises(ToolInputError, match="orientation reference"):
+    def test_the_oriented_mode_without_a_frame_is_refused(self):
+            with pytest.raises(ToolInputError, match="needs a frame to orient into"):
                 self._main(automation=catalogs.AUTOMATION_ORIENTED)
 
     def test_a_suffix_that_is_a_path_is_refused(self):
@@ -472,62 +511,45 @@ class TestArgumentRules:
 
 
 
-def test_fully_automated_without_segmentation_weights_is_refused_up_front():
-    """AMASSS receives None otherwise, and fails on
+def test_amasss_is_asked_for_masks_without_naming_its_model(tmp_path):
+    """There is one AMASSS model and AMASSS resolves it from its own data
+    folder. AREG naming it meant keeping a copy under DATA/AREG/."""
+    planted = tmp_path / "masks"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted})
 
-        TypeError: expected str, bytes or os.PathLike object, not NoneType
+    tools.segment_masks(sup, str(tmp_path / "scans"), "", ["CBMASK"])
 
-    fifteen seconds in, inside a child process, reaching the caller as "Tool
-    execution failed". The tool is reachable; what is missing is which weights.
-    """
-    with pytest.raises(ToolInputError, match="segmentation_model"):
-        dispatch._check_cbct(
-            automation=catalogs.AUTOMATION_FULLY,
-            regions=["Cranial base"],
-            t1_masks=None,
-            reference=None,
-            segmentation_model=None,
-            sup=FakeSup("/tmp/areg-rules"),
-        )
+    tool, params = sup.calls[0]
+    assert tool == "AMASSS"
+    assert "model" not in params
+    assert params["structures"] == ["CBMASK"]
 
 
-def test_the_segmentation_bundle_is_found_without_anybody_naming_it(tmp_path):
-    """The modes that segment segment with AMASSS, and one bundle answers.
+def test_a_segmentation_model_the_caller_named_is_forwarded(tmp_path):
+    planted = tmp_path / "masks"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted})
 
-    Asking a clinician which folder to use was asking a question with a single
-    possible answer, in a panel where getting it wrong surfaces fifteen seconds
-    into a child process. So the tool looks where the deployment puts it.
-    """
-    bundle = tmp_path / "AREG" / "models" / "AMASSS_Models"
-    (bundle / "MAND").mkdir(parents=True)
-    assert dispatch._own_segmentation(tmp_path) == str(bundle)
+    tools.segment_masks(sup, str(tmp_path / "scans"), "/models/AMASSS", ["CBMASK"])
+
+    assert sup.calls[0][1]["model"] == "/models/AMASSS"
 
 
-def test_a_data_root_without_the_bundle_resolves_to_nothing(tmp_path):
-    """Not an exception: the ONE refusal below is what tells the caller what is
-    missing, and two places saying it is two places to keep in step."""
-    (tmp_path / "AREG" / "models").mkdir(parents=True)
-    assert dispatch._own_segmentation(tmp_path) == ""
+def test_aso_is_asked_for_a_frame_by_name_when_no_reference_is_named(tmp_path):
+    """The reference bundles are ASO's own. An empty `cbct_landmarks` asks
+    for every landmark the frame's reference defines, which only ASO can read."""
+    planted = tmp_path / "oriented"
+    planted.mkdir()
+    sup = FakeSup(tmp_path, {"ASO": lambda params: planted})
 
+    tools.orient_scans(sup, str(tmp_path / "scans"), "", "CBCT",
+                       frame="Occlusal plane")
 
-def test_no_data_root_resolves_to_nothing_rather_than_guessing():
-    """A tool run from a checkout has no data root at all; it must not turn
-    that into a path relative to the working directory."""
-    assert dispatch._own_segmentation(None) == ""
-
-
-def test_the_refusal_says_which_bundle_is_missing_and_where():
-    """"Name a bundle" is unactionable when the panel no longer offers the
-    field: what the operator needs is the folder to populate."""
-    with pytest.raises(ToolInputError, match="AMASSS_Models"):
-        dispatch._check_cbct(
-            automation=catalogs.AUTOMATION_FULLY,
-            regions=["Cranial base"],
-            t1_masks=None,
-            reference=None,
-            segmentation_model=None,
-            sup=FakeSup("/tmp/areg-rules"),
-        )
+    params = sup.calls[0][1]
+    assert params["frame"] == "Occlusal plane"
+    assert "reference" not in params
+    assert params["cbct_landmarks"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -538,13 +560,14 @@ def _events(path) -> list:
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line]
 
 
-def test_progress_names_the_region_and_counts_the_subjects(tmp_path, monkeypatch):
-    """Two loops, nested, and the bar has to cross them once rather than twice.
+def test_progress_counts_the_registrations_as_they_finish(tmp_path, monkeypatch):
+    """One bar across every registration, moved as each one FINISHES.
 
-    Each region is given its own slice of the run: without that the second
-    region sends the fraction back to zero, which a watcher reads as a run
-    starting over. The region is named because it is anatomy; the subject is
-    only ever a number, the key being built from the caller's file names.
+    The registrations run side by side, so "subject 2 of 2" would name one that
+    may already be done or not yet started; a count of finished ones is the
+    only thing true at every instant, and it never goes back. A region with no
+    mask is not a registration and moves nothing. No subject is named: the key
+    is built from the caller's file names.
     """
     events_file = tmp_path / "events.jsonl"
     monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
@@ -556,17 +579,26 @@ def test_progress_names_the_region_and_counts_the_subjects(tmp_path, monkeypatch
         t1_masks_path=str(tmp_path / "masks"),
         automation=catalogs.AUTOMATION_SEMI,
         # Only the cranial base has a mask here, so the mandible costs no
-        # registration -- the events still have to be there for it.
+        # registration.
         regions=["Cranial base", "Mandible"],
         output_dir=str(tmp_path / "out"),
     )
 
-    events = _events(events_file)
+    records = _events(events_file)
+    events = [record for record in records if record.get("kind") != "log"]
     assert [event["message"] for event in events] == [
-        "Cranial base: subject 1 of 2", "Cranial base: subject 2 of 2",
-        "Mandible: subject 1 of 2", "Mandible: subject 2 of 2",
+        "pairing timepoints",
+        "registering 2 region(s) of 2 subject(s)",
+        "registration 1 of 2", "registration 2 of 2",
     ]
-    assert [event["fraction"] for event in events] == [0.0, 0.25, 0.5, 0.75]
+    assert [event["fraction"] for event in events] == [0.0, 0.0, 0.5, 1.0]
+    # The region no subject has a mask for is said once, to the clinician, at
+    # warning level -- with no supervisor, through the progress file's log.
+    # The registrations' own metric lines are test_metrics.py's.
+    logs = [record for record in records
+            if record.get("kind") == "log" and record.get("level") != "metric"]
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert "Mandible" in logs[0]["message"]
 
 
 def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
@@ -595,6 +627,125 @@ def test_progress_does_not_travel_through_the_supervisor(tmp_path, monkeypatch):
     )
 
     assert sup.messages == []
-    assert [event["message"] for event in _events(events_file)] == [
-        "Cranial base: subject 1 of 1",
+    assert [event["message"] for event in _events(events_file)
+            if event.get("level") != "metric"] == [
+        "pairing timepoints", "registering 1 region(s) of 1 subject(s)",
+        "registration 1 of 1",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Registrations side by side
+# ---------------------------------------------------------------------------
+
+def _register_cohort(root, out, **extra):
+    return dispatch.register(
+        t1_path=str(root / "T1"), t2_path=str(root / "T2"),
+        t1_masks_path=str(root / "masks"), automation=catalogs.AUTOMATION_SEMI,
+        regions=["Cranial base"], output_dir=str(out), **extra)
+
+
+def test_registrations_side_by_side_produce_exactly_what_one_at_a_time_does(tmp_path, monkeypatch):
+    """Each registration is the same one-thread-optimised elastix run whichever
+    process it lands in. Its preprocessing sums in an order set by ITK's thread
+    count, so both paths pin that count -- in SimpleITK and in elastix's itk --
+    to what the server granted one registration. Same count, same bits: the
+    first version of this test compared a serial run on the machine's default
+    against workers on half of it, and failed on a four-core CI runner.
+    """
+    monkeypatch.setenv("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "2")
+    TestSemiAutomatedCBCT._cohort(tmp_path, subjects=("P1", "P2"))
+    serial = _register_cohort(tmp_path, tmp_path / "serial", num_workers=1)
+    wide = _register_cohort(tmp_path, tmp_path / "wide", num_workers=2)
+
+    assert serial.report["patients"] == wide.report["patients"]
+    for subject in ("P1", "P2"):
+        for name in (f"{subject}_T2_CB_Reg.nii.gz", f"{subject}_T2_CB_Reg_transform.tfm"):
+            a = tmp_path / "serial" / "T2_Registered" / name
+            b = tmp_path / "wide" / "T2_Registered" / name
+            if name.endswith(".tfm"):
+                assert a.read_text() == b.read_text()
+            else:
+                assert np.array_equal(sitk.GetArrayFromImage(sitk.ReadImage(str(a))),
+                                      sitk.GetArrayFromImage(sitk.ReadImage(str(b))))
+
+
+def test_the_width_is_asked_of_the_supervisor_and_capped_by_the_caller():
+    asked = []
+
+    class Sup:
+        def channels(self, wanted):
+            asked.append(wanted)
+            return 3
+
+    assert dispatch._registration_width(Sup(), 6) == 3
+    assert asked == [6]
+    assert dispatch._registration_width(Sup(), 6, declared=2) == 2
+    assert dispatch._registration_width(None, 6) == 1
+    assert dispatch._registration_width(None, 6, declared=4) == 4
+
+
+# ---------------------------------------------------------------------------
+# Progress -- the supervised steps and the registration share one bar
+# ---------------------------------------------------------------------------
+
+class TestSpans:
+    def test_each_mode_tiles_the_bar_in_the_order_its_steps_run(self):
+        assert dispatch._cbct_spans(orient=False, segment=False) == (None, None, (0.0, 1.0))
+        assert dispatch._cbct_spans(orient=False, segment=True) == (
+            None, (0.0, 0.25), (0.25, 1.0))
+        assert dispatch._cbct_spans(orient=True, segment=True) == (
+            (0.0, 0.25), (0.25, 0.5), (0.5, 1.0))
+
+    def test_the_supervised_calls_carry_their_span(self, tmp_path):
+        """`_progress` reaches the supervisor and never the callee's parameters."""
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted,
+                                 "ASO": lambda params: planted})
+
+        tools.segment_masks(sup, str(tmp_path), "/models", ["CBMASK"], span=(0.25, 0.5))
+        tools.orient_scans(sup, str(tmp_path), str(tmp_path), "CBCT", span=(0.0, 0.25))
+
+        assert sup.spans == [("AMASSS", (0.25, 0.5)), ("ASO", (0.0, 0.25))]
+        assert all("_progress" not in params for _tool, params in sup.calls)
+
+    def test_without_a_span_the_call_is_unchanged(self, tmp_path):
+        planted = tmp_path / "planted"
+        planted.mkdir()
+        sup = FakeSup(tmp_path, {"AMASSS": lambda params: planted})
+
+        tools.segment_masks(sup, str(tmp_path), "/models", ["CBMASK"])
+
+        assert sup.spans == [("AMASSS", None)]
+
+
+def test_the_raw_step_folders_are_not_offered():
+    """`keep_intermediate` is injected by the server from the tools this one
+    calls. Hidden in every engine of the facade: what a reader wanted from it
+    comes back as an Extra output, in the result's space. Its wording stays,
+    for the day it is shown again."""
+    from sadt_areg_cbct.layout import LAYOUT
+
+    hints = LAYOUT["keep_intermediate"]
+    assert hints.get("hidden") is True
+    assert hints["label"] == "Raw intermediate files"
+    assert set(hints["option_help"]) == {"AMASSS", "ASO"}
+
+
+def test_both_timepoints_keep_their_ticked_anatomy_in_the_report(tmp_path):
+    """The T2 is segmented for the ticked anatomy too, so its files land in the
+    same folder and the second collection adds to the first instead of
+    replacing it."""
+    t1_dir, t2_dir = tmp_path / "t1_seg", tmp_path / "t2_seg"
+    _seg_out(t1_dir, "P1_T1", ["MAND"])
+    _seg_out(t2_dir, "P1_T2", ["MAND"])
+    output = tmp_path / "out"
+    output.mkdir()
+    report = {}
+
+    dispatch._collect_segmentations(str(t1_dir), ["MAND"], str(output), report)
+    dispatch._collect_segmentations(str(t2_dir), ["MAND"], str(output), report)
+
+    got = sorted(pathlib.Path(p).name for p in report["segmentations"])
+    assert got == ["P1_T1_Seg_MAND.nii.gz", "P1_T2_Seg_MAND.nii.gz"]

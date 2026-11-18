@@ -206,6 +206,7 @@ def test_the_published_options_are_the_catalogs_own():
     assert _choices("ios_occlusion") == list(catalogs.OCCLUSION_CHOICES)
     assert _choices("modality") == list(catalogs.MODALITY_CHOICES)
     assert _choices("automation") == list(catalogs.AUTOMATION_CHOICES)
+    assert _choices("frame") == list(catalogs.FRAME_CHOICES)
 
 
 def test_the_published_defaults_are_the_catalogs_own():
@@ -233,11 +234,14 @@ def test_mode_specific_arguments_are_optional():
     optional = (
         "modality", "automation", "landmarks", "landmark_model", "cbct_landmarks",
         "ios_teeth", "ios_landmark_types", "ios_jaws", "ios_occlusion", "dicom_input",
-        "output_suffix",
+        "output_suffix", "frame",
+        # Optional so a neighbour can ask for a frame without naming one of
+        # this tool's bundles; empty means "my own".
+        "reference",
     )
     for name in optional:
         assert parameters[name].default is not inspect.Parameter.empty, name
-    for name in ("input", "reference", "output_dir"):
+    for name in ("input", "output_dir"):
         assert parameters[name].default is inspect.Parameter.empty, name
 
 
@@ -372,6 +376,9 @@ def test_the_run_report_names_the_unmatched_landmark_files(tmp_path):
     root = tmp_path / "input"
     _write_scan(root / "P1_CBCT.nii.gz")
     _write_markups(str(root / "P1.mrk.json"), _REFERENCE_POINTS)
+    # A second, well-formed patient, so the run succeeds and keeps its report:
+    # a run that orients nobody now raises, and its report is not kept.
+    _cbct_case(root, key="patient2")
 
     report = dispatch.orient(
         input_path=str(root),
@@ -382,7 +389,8 @@ def test_the_run_report_names_the_unmatched_landmark_files(tmp_path):
         output_dir=str(tmp_path / "out"),
     ).report
 
-    assert report["summary"]["oriented"] == 0
+    assert report["summary"]["oriented"] == 1
+    assert report["cases"]["P1_CBCT"]["status"] == "failed"
     assert report["unmatched_markups"] == ["P1.mrk.json"]
     reason = report["cases"]["P1_CBCT"]["reason"]
     # The file is NAMED, and so is the rule that would have paired it.
@@ -560,6 +568,45 @@ def test_the_transform_file_maps_the_result_back_to_the_original(tmp_path):
         ), name
 
 
+def test_the_cbct_transform_is_one_affine_that_slicer_reads(tmp_path):
+    """SimpleITK writes a chain as a CompositeTransform of
+    `MatrixOffsetTransformBase` members, which 3D Slicer cannot read: every
+    review that loaded the file logged "Failed to read transform"."""
+    root = tmp_path / "input"
+    original = _rotate(_REFERENCE_POINTS, (0.2, 1.0, 0.3), 17.0, offset=(12.0, -8.0, 5.0))
+    _write_scan(root / "p1_scan.nii.gz", size=(24, 24, 24), spacing=(0.4, 0.4, 0.4))
+    _write_markups(root / "p1_lm.mrk.json", original)
+
+    run = dispatch.orient(
+        input_path=str(root),
+        reference_path=_cbct_reference(tmp_path),
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(_REFERENCE_POINTS),
+        output_dir=str(tmp_path / "out"),
+    )
+    with open(os.path.join(run.output_dir, "p1_Or_transform.tfm"), encoding="utf-8") as handle:
+        written = handle.read()
+
+    assert "AffineTransform_double_3_3" in written
+    assert "MatrixOffsetTransformBase" not in written
+    assert "CompositeTransform" not in written
+
+
+def test_a_transform_that_is_not_linear_is_written_unchanged():
+    """Approximating a deformation by an affine would move every point it
+    carries; refusing to flatten it keeps what was computed."""
+    bspline = sitk.BSplineTransform(3)
+    bspline.SetTransformDomainMeshSize([2, 2, 2])
+    bspline.SetTransformDomainPhysicalDimensions([300.0, 300.0, 300.0])
+    bspline.SetTransformDomainOrigin([-150.0, -150.0, -150.0])
+    parameters = list(bspline.GetParameters())
+    parameters[len(parameters) // 2] = 5.0
+    bspline.SetParameters(parameters)
+
+    assert cbct_pipeline.as_one_affine(bspline) is bspline
+
+
 def test_landmarks_follow_the_recentring(tmp_path):
     """Recentring the volume without moving the landmarks compares a centred
     scan against uncentred points -- the state the semi-automated CLI ran in,
@@ -718,10 +765,15 @@ class FakeSup:
         self.out = tmp_path
         self.tmp = tmp_path
         self.calls = []
+        self.spans = []
         self.messages = []
         self.call_index = 0
 
     def run(self, tool, **params):
+        # `_progress` is the caller's span of its own bar, and the supervisor
+        # removes it before the callee sees it -- so it is recorded apart and
+        # never left among the parameters a tool would be handed.
+        self.spans.append((tool, params.pop("_progress", None)))
         # The input is captured HERE, not after the run: it lives in the
         # working directory, which is removed before `orient` returns.
         self.calls.append((tool, params))
@@ -729,6 +781,11 @@ class FakeSup:
         # directory, which is removed before `orient` returns.
         self.sent = [
             sitk.ReadImage(os.path.join(root, name))
+            for root, _dirs, files in os.walk(str(params["input"]))
+            for name in sorted(files)
+        ]
+        self.sent_names = [
+            os.path.relpath(os.path.join(root, name), str(params["input"]))
             for root, _dirs, files in os.walk(str(params["input"]))
             for name in sorted(files)
         ]
@@ -752,7 +809,7 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
 
 
@@ -860,16 +917,18 @@ def test_the_landmark_tool_is_asked_by_name_for_the_points_aso_needs(tmp_path):
     assert "cbct_regions" not in params
 
 
-def test_the_landmark_tool_is_run_on_the_recentred_scans(tmp_path):
-    """The ordering that made the supervisor necessary at all.
+def test_the_landmark_tool_is_run_on_the_scans_the_caller_sent(tmp_path):
+    """The ORIGINAL scans, not the recentred ones the Slicer chain used.
 
-    The Slicer chain ran PRE_ASO_CBCT before ALI_CBCT, so the landmark tool has
-    always seen centred volumes. Recentring is a pure metadata change and this
-    *ought* to be reorderable -- but ALI takes the absolute value of the origin
-    (issue #11), so it is kept exactly as it was rather than bet on.
+    A stop after `ASO/ALI_CBCT` shows the points the tool placed on the scan
+    the reader sent; placed on a recentred copy they were drawn half a field
+    of view away from it whenever its origin was not already centred, and a
+    correction made there was in the wrong frame. Still never the caller's own
+    folder: the tool walks one ASO built.
     """
     root = tmp_path / "input"
     _write_scan(root / "patient1_scan.nii.gz")
+    image = sitk.ReadImage(str(root / "patient1_scan.nii.gz"))
     sup = FakeSup({"patient1": _predicted()}, tmp_path)
 
     _run_aso(
@@ -880,15 +939,53 @@ def test_the_landmark_tool_is_run_on_the_recentred_scans(tmp_path):
 
     _tool, params = sup.calls[0]
     assert len(sup.sent) == 1
-    sent = sup.sent[0]
-    centre = np.array(
-        sent.TransformContinuousIndexToPhysicalPoint(
-            (np.array(sent.GetSize()) / 2.0).tolist()
-        )
-    )
-    # What it was handed is centred on the physical origin, not the original.
-    assert np.allclose(centre, 0.0, atol=1e-6)
+    assert sup.sent[0].GetOrigin() == image.GetOrigin()
+    assert sup.sent[0].GetSize() == image.GetSize()
     assert str(params["input"]) != str(root)
+
+
+def test_the_landmark_tool_reads_each_scan_under_its_own_name(tmp_path):
+    """It names its points after the file it read, and a stop's viewer pairs
+    points with a scan by that name. Handed `patient1_T1_Or` as `patient1_T1`
+    (the key, `_Or` stripped), its points could not be drawn on any scan."""
+    root = tmp_path / "input"
+    _write_scan(root / "site" / "patient1_T1_Or.nii.gz")
+    sup = FakeSup({"site/patient1_T1": _predicted()}, tmp_path)
+
+    _run_aso(
+        tmp_path, input=str(root), reference=_cbct_reference(tmp_path),
+        modality="CBCT", automation="Fully-Automated",
+        landmark_model="Bundle", cbct_landmarks=list(_REFERENCE_POINTS), sup=sup,
+    )
+
+    assert sup.sent_names == [os.path.join("site", "patient1_T1_Or.nii.gz")]
+
+
+def test_predicted_landmarks_are_moved_into_the_centred_space_like_supplied_ones(tmp_path):
+    """Both describe the original scan now, so the same points must orient it
+    the same way whether the landmark tool placed them or the caller did."""
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    supplied = tmp_path / "landmarks"
+    _write_markups(supplied / "patient1_lm_Pred.mrk.json", _predicted())
+    reference = _cbct_reference(tmp_path)
+
+    by_tool = _run_aso(
+        tmp_path, input=str(root), reference=reference, output_dir=tmp_path / "by_tool",
+        modality="CBCT", automation="Fully-Automated", landmark_model="Bundle",
+        cbct_landmarks=list(_REFERENCE_POINTS), sup=FakeSup({"patient1": _predicted()}, tmp_path),
+    )
+    by_caller = _run_aso(
+        tmp_path, input=str(root), reference=reference, output_dir=tmp_path / "by_caller",
+        modality="CBCT", automation="Fully-Automated", landmarks=str(supplied),
+        cbct_landmarks=list(_REFERENCE_POINTS),
+    )
+
+    oriented = [markups.load_landmarks(os.path.join(out, "patient1_lm_Or.mrk.json"))
+                for out in (by_tool, by_caller)]
+    assert sorted(oriented[0]) == sorted(oriented[1])
+    for name in oriented[0]:
+        np.testing.assert_allclose(oriented[0][name], oriented[1][name], atol=1e-6)
 
 
 def test_supplied_landmarks_need_no_supervisor(tmp_path):
@@ -1537,7 +1634,10 @@ def test_arguments_naming_hosted_weights_end_in_model_or_reference():
 # ---------------------------------------------------------------------------
 
 def _events(path) -> list:
-    return [json.loads(line) for line in Path(path).read_text().splitlines() if line]
+    """The progress events only: the user's metric lines share the stream as
+    log records and are tested in test_metrics.py."""
+    records = [json.loads(line) for line in Path(path).read_text().splitlines() if line]
+    return [record for record in records if record.get("kind") != "log"]
 
 
 def test_the_cbct_phases_report_where_they_have_got_to(tmp_path, monkeypatch):
@@ -1609,6 +1709,34 @@ def test_the_landmark_waypoint_reaches_the_supervisor(tmp_path):
     )
 
     assert (0.2, f"predicting landmarks with {dispatch.LANDMARK_TOOL}") in sup.messages
+
+
+def test_the_landmark_tool_is_given_the_slice_between_the_phases(tmp_path, monkeypatch):
+    """The landmark tool fills 0.2..0.6 of ASO's bar, exactly the gap its own
+    phases leave: recentring ends where the span starts, registration starts
+    where it ends. Anything else and the folded bar steps back or jumps."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "patient2": _predicted()}, tmp_path)
+
+    _run_aso(
+        tmp_path, input=str(root), reference=_cbct_reference(tmp_path),
+        modality="CBCT", automation="Fully-Automated",
+        landmark_model="Bundle", cbct_landmarks=list(_REFERENCE_POINTS), sup=sup,
+    )
+
+    assert sup.spans == [(dispatch.LANDMARK_TOOL, (0.2, 0.6))]
+    _tool, params = sup.calls[0]
+    assert "_progress" not in params
+    fractions = [event["fraction"] for event in _events(events_file)]
+    centring = [f for f in fractions if f < 0.2 + 1e-9]
+    registering = [f for f in fractions if f > 0.2 + 1e-9]
+    assert fractions == sorted(fractions)
+    assert max(centring) <= 0.2
+    assert min(registering) >= 0.6
 
 
 # ---------------------------------------------------------------------------
@@ -1839,3 +1967,447 @@ def test_landmarks_rewritten_from_a_callers_file_are_drawn_too(tmp_path):
     assert node["display"]["color"] == [1.0, 0.0, 0.0], (
         "the caller's own colour is theirs to keep"
     )
+
+
+# ---------------------------------------------------------------------------
+# What an operator can read when a run fails
+# ---------------------------------------------------------------------------
+#
+# The server keeps the exception's class and message and this package's log
+# lines -- no traceback, and no report: the job directory is deleted when a
+# run fails.
+
+def _aso_messages(caplog, level):
+    return [record.getMessage() for record in caplog.records
+            if record.name.startswith("sadt_aso") and record.levelname == level]
+
+
+def _orient_cbct(tmp_path, root, **kwargs):
+    return dispatch.orient(
+        input_path=str(root),
+        reference_path=kwargs.pop("reference", None) or _cbct_reference(tmp_path),
+        modality=catalogs.MODALITY_CBCT,
+        automation=kwargs.pop("automation", catalogs.AUTOMATION_SEMI),
+        cbct_landmarks=list(_REFERENCE_POINTS),
+        output_dir=str(tmp_path / "out"),
+        **kwargs,
+    )
+
+
+def test_a_run_that_oriented_nobody_for_want_of_landmarks_is_the_callers(tmp_path, caplog):
+    """It used to return success with an empty output folder."""
+    root = tmp_path / "input"
+    _write_scan(root / "Smith_John_scan.nii.gz")
+
+    with caplog.at_level(logging.INFO), pytest.raises(ToolInputError) as raised:
+        _orient_cbct(tmp_path, root)
+
+    assert str(raised.value).startswith(
+        "0 of 1 patients oriented; most common failure: no landmark file (.mrk.json)"
+    )
+    assert str(raised.value).endswith("(1 of 1)")
+    warnings = _aso_messages(caplog, "WARNING")
+    assert any(line.startswith("patient 1 of 1: landmark lookup failed (no landmark file")
+               for line in warnings)
+    assert not any("Smith" in line for line in warnings)
+
+
+def test_a_run_whose_every_registration_failed_is_the_servers(tmp_path, monkeypatch, caplog):
+    root = tmp_path / "input"
+    _cbct_case(root, key="patient1")
+    _cbct_case(root, key="patient2")
+
+    def refuse(**kwargs):
+        raise cbct_pipeline.icp.RegistrationError("no landmark triplet is well conditioned")
+
+    monkeypatch.setattr(cbct_pipeline, "orient_patient", refuse)
+    with caplog.at_level(logging.INFO), pytest.raises(RuntimeError) as raised:
+        _orient_cbct(tmp_path, root)
+
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value) == (
+        "0 of 2 patients oriented; most common failure: no landmark triplet is "
+        "well conditioned (2 of 2)"
+    )
+    assert "patient 2 of 2: registration failed (no landmark triplet is well conditioned)" in (
+        _aso_messages(caplog, "WARNING")
+    )
+    assert "CBCT Semi-Automated: 0 of 2 patients oriented, 2 failed" in (
+        _aso_messages(caplog, "WARNING")
+    )
+
+
+def test_a_scan_that_cannot_be_read_back_costs_only_its_patient(tmp_path, monkeypatch, caplog):
+    """`sitk.ReadImage` sat outside the per-patient guard, so one bad volume
+    stopped the cohort."""
+    import SimpleITK as sitk
+
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "patient2": _predicted()}, tmp_path)
+    real_read = sitk.ReadImage
+
+    def read(path, *args, **kwargs):
+        # Only once the landmark tool has read the scans: the fake reads them
+        # with this same function, and that read must succeed.
+        if hasattr(sup, "sent") and "centered" in str(path) and "patient1" in str(path):
+            raise RuntimeError("ITK ERROR: ImageFileReader: could not read the file")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(sitk, "ReadImage", read)
+    with caplog.at_level(logging.INFO):
+        oriented = _orient_cbct(tmp_path, root, automation=catalogs.AUTOMATION_FULLY,
+                                landmark_model="Bundle", sup=sup)
+
+    assert oriented.report["summary"] == {"cases": 2, "oriented": 1, "failed": 1}
+    assert any(line.startswith("patient 1 of 2: re-reading the centred scan failed "
+                               "(RuntimeError: ITK ERROR")
+               for line in _aso_messages(caplog, "WARNING"))
+
+
+def test_what_the_landmark_tool_returned_is_compared_with_what_was_sent(tmp_path, caplog):
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+    _write_scan(root / "patient2_scan.nii.gz")
+    sup = FakeSup({"patient1": _predicted(), "stranger": _predicted()}, tmp_path)
+
+    with caplog.at_level(logging.INFO):
+        _orient_cbct(tmp_path, root, automation=catalogs.AUTOMATION_FULLY,
+                     landmark_model="Bundle", sup=sup)
+
+    warnings = _aso_messages(caplog, "WARNING")
+    assert (f"{dispatch.LANDMARK_TOOL} returned landmarks for 1 of 2 scan(s); "
+            "1 predicted file(s) matched no scan") in warnings
+    assert f"patient 2 of 2: {dispatch.LANDMARK_TOOL} returned no landmarks" in warnings
+
+
+def test_an_unreadable_reference_bundle_is_the_servers_fault(tmp_path):
+    root = tmp_path / "input"
+    _cbct_case(root)
+    reference = tmp_path / "gold"
+    reference.mkdir()
+    (reference / "reference_lm.mrk.json").write_text("{not json")
+
+    with pytest.raises(RuntimeError, match=r"^reference bundle unreadable: ") as raised:
+        _orient_cbct(tmp_path, root, reference=str(reference))
+    assert not isinstance(raised.value, ValueError)
+
+
+def test_an_ios_reference_with_nothing_usable_is_the_servers_fault(tmp_path):
+    empty = tmp_path / "gold_ios"
+    empty.mkdir()
+    with pytest.raises(RuntimeError, match=r"^reference bundle unreadable: ") as raised:
+        ios_pipeline.load_reference(str(empty))
+    assert not isinstance(raised.value, ValueError)
+
+
+def test_a_dicom_series_that_cannot_be_converted_is_named_by_position(
+    tmp_path, monkeypatch, caplog
+):
+    dicom = dicom_module()
+    root = tmp_path / "input"
+    _write_dicom_series(root / "Smith_John")
+    _write_dicom_series(root / "Jones_Mary")
+    converted = []
+
+    def convert(directory, series, destination):
+        if converted:
+            raise RuntimeError("GDCM could not assemble the slices")
+        converted.append(directory)
+
+    monkeypatch.setattr(dicom, "_convert_series", convert)
+    with caplog.at_level(logging.INFO), pytest.raises(ToolInputError) as raised:
+        dicom.convert_tree(str(root), str(tmp_path / "nifti"))
+
+    assert str(raised.value) == (
+        "DICOM series 2 of 2 could not be converted "
+        "(RuntimeError: GDCM could not assemble the slices)"
+    )
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    lines = _aso_messages(caplog, "WARNING") + _aso_messages(caplog, "INFO")
+    assert "DICOM series 2 of 2: conversion failed (RuntimeError: GDCM could not " \
+           "assemble the slices)" in lines
+    assert not any("Smith" in line or "Jones" in line for line in lines)
+
+
+def test_a_failed_ios_jaw_is_logged_with_its_patient_position(tmp_path, caplog):
+    root = tmp_path / "input"
+    _ios_case(root, key="P1", array_name="NotALabelArray")
+    _ios_case(root, key="P2")
+
+    with caplog.at_level(logging.INFO):
+        oriented = dispatch.orient(
+            input_path=str(root), reference_path=_ios_reference(tmp_path),
+            modality=catalogs.MODALITY_IOS, automation=catalogs.AUTOMATION_FULLY,
+            output_dir=str(tmp_path / "out"),
+        )
+
+    assert oriented.report["summary"]["failed"] == 1
+    assert any(line.startswith("patient 1 of 2: Upper jaw: registration failed (")
+               for line in _aso_messages(caplog, "WARNING"))
+
+
+# ---------------------------------------------------------------------------
+# Its own references: a caller names a FRAME, never one of this tool's bundles
+# ---------------------------------------------------------------------------
+
+_OCCLUSAL_POINTS = {
+    "ANS": np.array([0.0, 30.0, 5.0]),
+    "IF": np.array([0.0, 20.0, -5.0]),
+    "PNS": np.array([0.0, -10.0, 0.0]),
+    "UL6O": np.array([20.0, 5.0, -10.0]),
+    "UR1O": np.array([0.0, 28.0, -8.0]),
+    "UR6O": np.array([-20.0, 5.0, -10.0]),
+}
+
+
+def _own_models(tmp_path):
+    """DATA/ASO/models as the manifest stages it: both CBCT planes, the
+    intraoral bundle, and a landmark-weights folder that is no reference."""
+    data_root = tmp_path / "DATA"
+    models = data_root / "ASO" / "models"
+    _write_markups(
+        str(models / catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT] / "gold_lm.mrk.json"),
+        _REFERENCE_POINTS,
+    )
+    _write_markups(
+        str(models / catalogs.FRAME_BUNDLES[catalogs.FRAME_OCCLUSAL] / "gold_lm.mrk.json"),
+        _OCCLUSAL_POINTS,
+    )
+    for jaw, centroids in (("U", _UPPER_CENTROIDS), ("L", _LOWER_CENTROIDS)):
+        _write_mesh(str(models / "IOS_Gold_file" / f"Gold_{jaw}_Seg.vtk"), centroids)
+    (models / "CBCT_landmark_models" / "Ba" / "1").mkdir(parents=True)
+    return data_root
+
+
+def test_a_named_frame_resolves_its_own_bundle_from_the_data_root(tmp_path):
+    """What AREG and VFACE send now: the frame, by name, and no path."""
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input", points=_OCCLUSAL_POINTS)
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path="",
+        frame=catalogs.FRAME_OCCLUSAL,
+        data_root=data_root,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        # Empty: the landmarks the frame's own reference defines.
+        cbct_landmarks=[],
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_OCCLUSAL]
+    assert oriented.report["frame"] == catalogs.FRAME_OCCLUSAL
+    assert oriented.report["requested_landmarks"] == [
+        name for name in catalogs.CBCT_LANDMARKS if name in _OCCLUSAL_POINTS
+    ]
+    assert oriented.report["cases"]["patient1"]["status"] == "ok"
+
+
+def test_run_accepts_a_frame_in_place_of_a_reference(tmp_path):
+    """The same through `run()`, which is what the supervisor calls."""
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input")
+
+    output = run(input=tmp_path / "input", output_dir=tmp_path / "out",
+                 frame=catalogs.FRAME_FRANKFURT, automation=catalogs.AUTOMATION_SEMI,
+                 data_root=data_root)
+
+    report = _report(str(output))
+    assert report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT]
+    assert report["cases"]["patient1"]["status"] == "ok"
+
+
+def test_a_frame_picks_its_bundle_out_of_the_folder_the_server_hands_over(tmp_path):
+    """Over HTTP a hidden hosted-model argument arrives as the whole models
+    FOLDER. A frame named beside it still picks the bundle by name."""
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input", points=_OCCLUSAL_POINTS)
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path=str(data_root / "ASO" / "models"),
+        frame=catalogs.FRAME_OCCLUSAL,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(_OCCLUSAL_POINTS),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_OCCLUSAL]
+
+
+def test_with_no_reference_and_no_frame_the_selection_chooses_among_its_own(tmp_path):
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input")
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path="",
+        data_root=data_root,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(catalogs.DEFAULT_CBCT_LANDMARKS),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT]
+
+
+def test_a_reference_path_still_works_and_wins_over_a_frame(tmp_path):
+    """Path input is what an HTTP client and a caller with a reference of its
+    own still send, and a bundle named outright is obeyed."""
+    _cbct_case(tmp_path / "input")
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path=_cbct_reference(tmp_path),
+        frame=catalogs.FRAME_OCCLUSAL,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(catalogs.DEFAULT_CBCT_LANDMARKS),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == "gold"
+    assert oriented.report["cases"]["patient1"]["status"] == "ok"
+
+
+def test_an_intraoral_run_with_no_reference_finds_its_own_bundle(tmp_path):
+    """AREG's intraoral engine names no reference either: there is one
+    intraoral bundle, and it is this tool's."""
+    data_root = _own_models(tmp_path)
+    _ios_case(tmp_path / "input")
+
+    oriented = dispatch.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path="",
+        data_root=data_root,
+        modality=catalogs.MODALITY_IOS,
+        automation=catalogs.AUTOMATION_FULLY,
+        output_dir=str(tmp_path / "out"),
+    )
+
+    assert oriented.report["reference"] == "IOS_Gold_file"
+
+
+def test_a_frame_whose_bundle_is_not_staged_says_what_to_install(tmp_path):
+    data_root = tmp_path / "DATA"
+    (data_root / "ASO" / "models").mkdir(parents=True)
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolInputError) as raised:
+        dispatch.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path="",
+            frame=catalogs.FRAME_FRANKFURT,
+            data_root=data_root,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            output_dir=str(tmp_path / "out"),
+        )
+    assert catalogs.FRAME_BUNDLES[catalogs.FRAME_FRANKFURT] in str(raised.value)
+    assert "setup-models" in str(raised.value)
+
+
+def test_no_reference_and_no_data_root_is_refused_clearly(tmp_path):
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolInputError, match="No 'reference' given"):
+        dispatch.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path="",
+            frame=catalogs.FRAME_FRANKFURT,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            output_dir=str(tmp_path / "out"),
+        )
+
+
+def test_an_unknown_frame_and_a_frame_on_intraoral_scans_are_refused(tmp_path):
+    with pytest.raises(ToolInputError, match="Unknown 'frame'"):
+        dispatch.orient(input_path=str(tmp_path), reference_path="", frame="Sideways",
+                        modality=catalogs.MODALITY_CBCT,
+                        automation=catalogs.AUTOMATION_SEMI,
+                        output_dir=str(tmp_path / "out"))
+    with pytest.raises(ToolInputError, match="CBCT reference frame"):
+        dispatch.orient(input_path=str(tmp_path), reference_path="",
+                        frame=catalogs.FRAME_FRANKFURT, modality=catalogs.MODALITY_IOS,
+                        automation=catalogs.AUTOMATION_FULLY,
+                        output_dir=str(tmp_path / "out"))
+
+
+def test_an_empty_selection_with_nothing_to_choose_by_is_refused(tmp_path):
+    data_root = _own_models(tmp_path)
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolInputError, match="name a frame"):
+        dispatch.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path="",
+            data_root=data_root,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            cbct_landmarks=[],
+            output_dir=str(tmp_path / "out"),
+        )
+
+
+def test_the_frame_bundles_are_the_ones_the_manifest_stages_for_aso():
+    """The names `FRAME_BUNDLES` resolves are only right while the manifest
+    unpacks the archives to them, under ASO's own folder."""
+    import importlib.util
+
+    repo = Path(__file__).resolve().parents[3]
+    script = repo / "scripts" / "fetch_data.py"
+    manifest_path = repo / "scripts" / "data-manifest.yml"
+    if not (script.is_file() and manifest_path.is_file()):
+        pytest.skip("the data manifest is not in this checkout")
+    spec = importlib.util.spec_from_file_location("fetch_data", script)
+    fetch_data = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch_data)
+
+    manifest = fetch_data._parse_manifest(str(manifest_path))
+    staged = {
+        os.path.relpath(fetch_data._target_path("DATA", entry),
+                        os.path.join("DATA", "ASO", "models"))
+        for entry in fetch_data._entries(manifest, "models", ["ASO"])
+    }
+    for bundle in catalogs.FRAME_BUNDLES.values():
+        assert bundle in staged, bundle
+
+
+# ---------------------------------------------------------------------------
+# A Semi-Automated jaw without landmarks falls back to tooth centroids
+# ---------------------------------------------------------------------------
+
+def test_a_jaw_without_landmarks_aligns_on_a_triplet_not_the_landmark_selection(monkeypatch):
+    """Ticking the whole arch for crown landmarks used to fail every jaw that
+    came without landmarks: the centroid alignment needs 3 or 4 teeth."""
+    from sadt_aso import catalogs
+    from sadt_aso.ios import pipeline
+
+    received = {}
+
+    def fake_fully(available, reference_entry, teeth, *rest):
+        received["teeth"] = teeth
+        return np.eye(4)
+
+    monkeypatch.setattr(pipeline, "_fully_automated_matrix", fake_fully)
+    whole_arch = list(catalogs.UPPER_TEETH)
+    pipeline._matrix_for(
+        "Upper", {"surface": "u.vtk", "markups": None}, {"Upper": {"surface": "r.vtk"}},
+        catalogs.AUTOMATION_SEMI, {"Upper": whole_arch}, {"Upper": []}, None, {}, 1, 0,
+        pipeline.FileCache(),
+    )
+    assert received["teeth"] == [t for t in catalogs.DEFAULT_TEETH if t in catalogs.UPPER_TEETH]
+
+
+def test_a_fitting_selection_and_a_forced_one_are_used_as_given(monkeypatch):
+    from sadt_aso import catalogs
+    from sadt_aso.ios import pipeline
+
+    assert pipeline._centroid_teeth("Lower", ["LR6", "LR1", "LL6"], False) == ["LR6", "LR1", "LL6"]
+    assert pipeline._centroid_teeth("Lower", list(catalogs.LOWER_TEETH), True) == list(catalogs.LOWER_TEETH)

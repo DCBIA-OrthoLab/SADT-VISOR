@@ -32,8 +32,10 @@ Four things worth knowing before changing anything here:
   answer and "deploy a tool" usually is not.
 """
 
+import json
 import logging
 import os
+import shutil
 
 from sadt_areg_common.errors import SupervisorRequired
 
@@ -80,9 +82,21 @@ def _returned(produced) -> str:
     return str(produced)
 
 
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing, which is what a caller with no bar of its own wants.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
-                 landmark_model: str = "", **extra) -> str:
-    """Orient every case under `scan_dir` onto `reference_path`.
+                 landmark_model: str = "", span=None, **extra) -> str:
+    """Orient every case under `scan_dir` onto `reference_path`, or onto ASO's
+    own reference when none is named.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
     landmarks through ALI, for IOS it is the tooth-centroid alignment. Either
@@ -95,7 +109,6 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     logger.info("AREG: asking 'ASO' for oriented %s scans", modality)
     parameters = {
         "input": scan_dir,
-        "reference": reference_path,
         "modality": modality,
         "automation": "Fully-Automated",
         "output_suffix": "Or",
@@ -106,11 +119,15 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     # three tools down, so it is passed explicitly and required by _check_cbct.
     if modality == "CBCT" and landmark_model:
         parameters["landmark_model"] = landmark_model
+    # Sent only when a caller named one. The reference bundles are ASO's own,
+    # and with none named ASO orients onto the one it holds for the modality.
+    if reference_path:
+        parameters["reference"] = reference_path
     parameters.update(extra)
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
-def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
+def label_crowns(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
     """Label the crowns of every mesh under `mesh_dir`.
 
     `skip_segmented` is left at its default: a mesh already carrying a
@@ -127,10 +144,52 @@ def label_crowns(sup, mesh_dir: str, model_path: str = "") -> str:
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("Crown_Seg", **parameters))
+    return _as_input_tree(_returned(sup.run("Crown_Seg", **parameters, **_span(span))))
 
 
-def predict_mucogingival(sup, mesh_dir: str, model_path: str = "") -> str:
+def _as_input_tree(crown_dir: str) -> str:
+    """Crown_Seg's output laid out like its input, or `crown_dir` as it came.
+
+    Crown_Seg files a mesh that already carried labels under the input's own
+    tree, and one it segmented under shapeaxi's `<csv stem>_<suffix>/` -- two
+    trees, as its README says. AREG mirrors the tree it registers into its own
+    outputs, so every Fully-Automated result came back under
+    `crownseg_input_Seg/`, a folder named after Crown_Seg's scratch csv.
+
+    Rebuilt from the run report's `cases`, which maps each input (relative to
+    the folder it was given) to what it produced -- the contract ALI_IOS reads
+    too -- rather than from a folder name that is Crown_Seg's business. With no
+    report, or nothing in it to place, the output is used as it is.
+    """
+    try:
+        with open(os.path.join(crown_dir, "run_report.json"), encoding="utf-8") as handle:
+            cases = json.load(handle)["cases"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return crown_dir
+    # Every file Crown_Seg returned, by its path inside the returned folder,
+    # longest first: the report holds paths as Crown_Seg wrote them, so the
+    # most specific tail is the one that names the file.
+    returned = sorted(
+        (os.path.relpath(os.path.join(root, name), crown_dir)
+         for root, _dirs, names in os.walk(crown_dir) for name in names),
+        key=len, reverse=True,
+    )
+    tree = crown_dir.rstrip(os.sep) + "_tree"
+    placed = 0
+    for key, case in (cases.items() if isinstance(cases, dict) else ()):
+        for produced in (case or {}).get("produced") or []:
+            match = next((rel for rel in returned
+                          if str(produced).replace("\\", "/").endswith("/" + rel.replace(os.sep, "/"))), None)
+            if match is None:
+                continue
+            destination = os.path.join(tree, os.path.dirname(key), os.path.basename(match))
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.copy2(os.path.join(crown_dir, match), destination)
+            placed += 1
+    return tree if placed else crown_dir
+
+
+def predict_mucogingival(sup, mesh_dir: str, model_path: str = "", span=None) -> str:
     """Predict the 13 mucogingival landmarks on every lower arch under `mesh_dir`.
 
     Returns the directory holding ALI's markups files, which `ios.mgl` then
@@ -166,4 +225,4 @@ def predict_mucogingival(sup, mesh_dir: str, model_path: str = "") -> str:
     }
     if model_path:
         parameters["model"] = model_path
-    return _returned(sup.run("ALI_IOS", **parameters))
+    return _returned(sup.run("ALI_IOS", **parameters, **_span(span)))

@@ -6,6 +6,7 @@ inside the returned archive.
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -100,7 +101,7 @@ def test_the_work_directory_does_not_survive_a_run_that_produced_nothing(
 ):
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
-    with pytest.raises(RuntimeError, match="produced no segmented mesh"):
+    with pytest.raises(RuntimeError, match="0 of 1 meshes segmented; shapeaxi returned without error"):
         pipeline.segment_crowns(
             input_path=str(tmp_path / "cohort"),
             model_path=str(model_file),
@@ -464,7 +465,7 @@ def test_a_run_that_produced_nothing_at_all_is_a_failure_not_an_empty_report(
     """An empty archive and a green status is the worst answer available."""
     write_surface(tmp_path / "cohort" / "arch.vtk")
 
-    with pytest.raises(RuntimeError, match="produced no segmented mesh"):
+    with pytest.raises(RuntimeError, match="0 of 1 meshes segmented; shapeaxi returned without error"):
         pipeline.segment_crowns(
             input_path=str(tmp_path / "cohort"),
             model_path=str(model_file),
@@ -540,3 +541,191 @@ def test_a_raw_mesh_with_no_engine_fails_the_run_rather_than_reporting_success(
             model_path=str(model_file),
             output_dir=str(tmp_path / "out"),
         )
+
+
+# ---------------------------------------------------------------------------
+# What an operator reads when a run fails
+# ---------------------------------------------------------------------------
+
+DATALOADER_FAILURE = (
+    "Caught ValueError in DataLoader worker process 0.\n"
+    "Original Traceback (most recent call last):\n"
+    '  File "/venv/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py", '
+    "line 308, in _worker_loop\n"
+    "    data = fetcher.fetch(index)\n"
+    '  File "/venv/lib/python3.10/site-packages/shapeaxi/saxi_dataset.py", line 70, '
+    "in __getitem__\n"
+    "    raise ValueError(msg)\n"
+    "ValueError: mesh has 0 points\n"
+)
+
+
+def test_the_cause_of_a_dataloader_failure_is_its_last_line():
+    """The wrapper and the frame list come first and say nothing; the server
+    keeps only the head of a reason, so the cause must be pulled out."""
+    assert pipeline._last_meaningful_line(DATALOADER_FAILURE) == "ValueError: mesh has 0 points"
+    assert pipeline._describe_failure(RuntimeError(DATALOADER_FAILURE)) == (
+        "ValueError: mesh has 0 points"
+    )
+
+
+def test_a_one_line_failure_keeps_its_own_type():
+    assert pipeline._describe_failure(RuntimeError("CUDA out of memory")) == (
+        "RuntimeError: CUDA out of memory"
+    )
+    assert pipeline._describe_failure(RuntimeError("")) == "RuntimeError"
+
+
+def test_a_very_long_cause_is_cut_to_fit_the_reason():
+    cause = pipeline._last_meaningful_line("x" * 1000)
+    assert len(cause) == pipeline.MAX_CAUSE
+    assert cause.endswith("...")
+
+
+def _engine_failing_after_the_first(monkeypatch, message):
+    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
+
+    def write_one_then_fail(csv_path, output_dir, model_path, input_root, array_name,
+                            suffix, device, fdi, num_workers=2):
+        with open(csv_path, encoding="utf-8") as handle:
+            meshes = [line.strip() for line in handle.read().splitlines()[1:] if line.strip()]
+        write_surface(
+            pipeline._predicted_path(output_dir, "crownseg_input", suffix, meshes[0],
+                                     input_root),
+            labelled=True,
+        )
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(pipeline, "_run_shapeaxi", write_one_then_fail)
+
+
+def test_a_shapeaxi_failure_says_what_failed_and_how_far_it_got(
+    tmp_path, monkeypatch, model_file, caplog
+):
+    _engine_failing_after_the_first(monkeypatch, DATALOADER_FAILURE)
+    for name in ("a", "b", "c"):
+        write_surface(tmp_path / "cohort" / f"{name}.vtk")
+
+    with caplog.at_level(logging.INFO, logger="sadt_crownseg"):
+        with pytest.raises(RuntimeError) as failure:
+            pipeline.segment_crowns(
+                input_path=str(tmp_path / "cohort"),
+                model_path=str(model_file),
+                output_dir=str(tmp_path / "out"),
+            )
+
+    message = str(failure.value)
+    assert message == (
+        "crown segmentation failed: ValueError: mesh has 0 points "
+        "(1 of 3 meshes were written before it)"
+    )
+    assert type(failure.value) is RuntimeError
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert "Original Traceback" not in message
+    assert "segmenting 3 mesh(es) on cpu" in caplog.text
+    assert (
+        "shapeaxi failed after 1 of 3 meshes were written "
+        "(ValueError: mesh has 0 points)"
+    ) in caplog.text
+    assert "worker.py" not in caplog.text
+
+
+def test_a_value_error_out_of_shapeaxi_is_not_answered_as_the_callers_fault(
+    tmp_path, monkeypatch, model_file
+):
+    """ValueError maps to 422; a crash inside the bundled engine is a 500."""
+    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
+
+    def explode(**kwargs):
+        raise ValueError("size mismatch for model.0.conv.unit0.conv.weight")
+
+    monkeypatch.setattr(pipeline, "_run_shapeaxi", explode)
+    write_surface(tmp_path / "cohort" / "arch.vtk")
+
+    with pytest.raises(RuntimeError) as failure:
+        pipeline.segment_crowns(
+            input_path=str(tmp_path / "cohort"),
+            model_path=str(model_file),
+            output_dir=str(tmp_path / "out"),
+        )
+
+    assert not isinstance(failure.value, ValueError)
+    assert "ValueError: size mismatch" in str(failure.value)
+    assert "0 of 1 meshes were written" in str(failure.value)
+
+
+def test_an_engine_that_writes_nothing_says_it_returned_without_error(
+    tmp_path, failing_engine, model_file, caplog
+):
+    for name in ("a", "b"):
+        write_surface(tmp_path / "cohort" / f"{name}.vtk")
+
+    with caplog.at_level(logging.WARNING, logger="sadt_crownseg"):
+        with pytest.raises(RuntimeError) as failure:
+            pipeline.segment_crowns(
+                input_path=str(tmp_path / "cohort"),
+                model_path=str(model_file),
+                output_dir=str(tmp_path / "out"),
+            )
+
+    assert str(failure.value) == (
+        "0 of 2 meshes segmented; shapeaxi returned without error but wrote "
+        "none of the 2 expected outputs"
+    )
+    assert "mesh 1 of 2: segmentation failed" in caplog.text
+    assert "mesh 2 of 2: segmentation failed" in caplog.text
+
+
+def test_a_complete_run_closes_with_an_info_summary(
+    tmp_path, stub_engine, model_file, caplog
+):
+    write_surface(tmp_path / "cohort" / "raw.vtk")
+    write_surface(tmp_path / "cohort" / "done.vtk", labelled=True)
+
+    with caplog.at_level(logging.INFO, logger="sadt_crownseg"):
+        pipeline.segment_crowns(
+            input_path=str(tmp_path / "cohort"),
+            model_path=str(model_file),
+            output_dir=str(tmp_path / "out"),
+        )
+
+    summary = [r for r in caplog.records if "meshes labelled" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in summary] == [
+        (logging.INFO,
+         "2 of 2 meshes labelled, 0 failed (1 segmented here, 1 already labelled)"),
+    ]
+
+
+def test_a_partial_run_closes_with_a_warning_summary(tmp_path, monkeypatch, model_file, caplog):
+    monkeypatch.setattr(pipeline, "_import_dental_model_seg", lambda: None)
+    monkeypatch.setattr(pipeline, "resolve_device", lambda requested=None: "cpu")
+
+    def only_the_first(csv_path, output_dir, model_path, input_root, array_name, suffix,
+                       device, fdi, num_workers=2):
+        with open(csv_path, encoding="utf-8") as handle:
+            meshes = [line.strip() for line in handle.read().splitlines()[1:] if line.strip()]
+        write_surface(
+            pipeline._predicted_path(output_dir, "crownseg_input", suffix, meshes[0],
+                                     input_root),
+            labelled=True,
+        )
+
+    monkeypatch.setattr(pipeline, "_run_shapeaxi", only_the_first)
+    write_surface(tmp_path / "cohort" / "a.vtk")
+    write_surface(tmp_path / "cohort" / "b.vtk")
+
+    with caplog.at_level(logging.INFO, logger="sadt_crownseg"):
+        pipeline.segment_crowns(
+            input_path=str(tmp_path / "cohort"),
+            model_path=str(model_file),
+            output_dir=str(tmp_path / "out"),
+        )
+
+    summary = [r for r in caplog.records if "meshes labelled" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in summary] == [
+        (logging.WARNING,
+         "1 of 2 meshes labelled, 1 failed (1 segmented here, 0 already labelled)"),
+    ]
+    assert "mesh 2 of 2: segmentation failed" in caplog.text

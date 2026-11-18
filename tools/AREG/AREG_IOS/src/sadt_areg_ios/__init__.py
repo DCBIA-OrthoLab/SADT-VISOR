@@ -14,17 +14,82 @@ The tooth labels and the mucogingival landmarks this needs come from other
 tools reached through the supervisor; see `tools.py`.
 """
 
+import shutil
 from pathlib import Path
 from typing import Literal
+
+from sadt_areg_common import patient_folders
 
 from .dispatch import main
 
 
+# Which inputs hold the same patients, for a client splitting a cohort into
+# batches. See AREG_CBCT for the contract.
+PAIRED = {"axes": ["t1", "t2"]}
+
+
+def pairs(t1: list, t2: list) -> dict:
+    """Which of these meshes go together, by NAME only. A patient travels with
+    every arch it has at each timepoint; which arch is registered is decided by
+    `run()`, as it is for a cohort sent whole."""
+    from sadt_areg_common import batching
+
+    from .pipeline import discover
+    from .surfaces import SURFACE_EXTENSIONS
+
+    def match(roots):
+        sides = {"t1": discover(roots["t1"], ""), "t2": discover(roots["t2"], "")}
+        both = set(sides["t1"]) & set(sides["t2"])
+        matched = {key: {side: sorted(sides[side][key].values()) for side in sides} for key in both}
+        unmatched = {side: {key: sorted(found[key].values()) for key in found if key not in both}
+                     for side, found in sides.items()}
+        return dict(roots), matched, unmatched
+
+    return batching.pairs_by_name({"t1": t1, "t2": t2}, match, known_extensions=SURFACE_EXTENSIONS)
+
+
+def _is_mesh(name: str) -> bool:
+    # Imported here: `surfaces` loads vtk, and CI imports this module on every
+    # PR to publish the schema.
+    from .surfaces import is_surface_file
+
+    return is_surface_file(name)
+
+
+_ROLE = patient_folders.by_timepoint(_is_mesh)
+
+
+def _filed_as(patient: str, role: str, relative: str, index: int) -> str:
+    """`<patient>_T1_U.vtk`: the patient, the timepoint and the jaw the pairing reads.
+
+    A mesh whose name says no jaw is filed without one, and reported by the
+    pairing as it is in the per-type layout.
+    """
+    name = relative.replace("\\", "/").rsplit("/", 1)[-1]
+    jaw = patient_folders.jaw_of(name) or f"mesh{index}"
+    return f"{patient}_{role.upper()}_{jaw}{patient_folders.extension_of(name)}"
+
+
 def run(
-    t1: Path,
-    t2: Path,
-    output_dir: Path,
-    automation: Literal["Semi-Automated", "Fully-Automated"] = "Fully-Automated",
+    # First, because it decides which of the next three the panel asks for.
+    # Spelled out because `Literal` takes literals only; a test asserts it
+    # against `catalogs.LAYOUT_CHOICES`.
+    input_layout: Literal["One folder per type", "One folder per patient"] = "One folder per type",
+    # Not required any more, and not because they are optional: which of
+    # `t1`/`t2` or `patients` is needed depends on `input_layout`, and a field
+    # the panel marks required in the layout that does not read it would
+    # refuse to apply. `patient_folders.resolve` refuses what is missing.
+    t1: Path = "",
+    t2: Path = "",
+    patients: Path = "",
+    output_dir: Path = "",
+    # "From the data" is the default and names no mode: `dispatch.derive_automation`
+    # reads it off the meshes -- ones that already carry their tooth labels are
+    # Semi-Automated, ones that do not are Fully-Automated. Naming either is an
+    # override and still obeyed.
+    automation: Literal[
+        "From the data", "Semi-Automated", "Fully-Automated"
+    ] = "From the data",
     ios_reference: Path = "",
     patch: Literal[
         "Palate (upper arch)", "Mucogingival line (lower arch)"
@@ -35,6 +100,11 @@ def run(
     mgl_landmarks: Path = "",
     mgl_patch_height: float = 0.0,
     output_suffix: str = "Reg",
+    # Nothing ticked by default: each Extra output is for a reader who asked
+    # for it. Named and spelled as AREG_IOSCBCT's, because the AREG facade
+    # merges every engine's `outputs` per mode. Spelled out because `Literal`
+    # takes literals only; a test pins it to `catalogs`.
+    outputs: list[Literal["Metrics spreadsheet (.xlsx + .csv)"]] = [],
     *,
     sup=None,
     data_root=None,
@@ -42,6 +112,12 @@ def run(
     """Register a follow-up intraoral scan onto its baseline, so the two compare.
 
     Args:
+        input_layout: How the files are organised: one folder for each type
+            of file (T1 and T2, or intraoral scans and CBCT) holding every
+            patient, or one folder for each patient holding all of that
+            patient's files. Rest the pointer on each option for an example.
+        patients: The folder of patient folders, in the one-folder-per-patient
+            layout. Each patient's folder name names its results.
         t1: The baseline meshes -- one surface or a folder of them, searched
             recursively. Each must say its jaw in its name.
         t2: The follow-up meshes, paired to T1 by patient key.
@@ -50,7 +126,8 @@ def run(
         automation: Semi-Automated takes meshes that already carry their tooth
             labels and orientation; Fully-Automated labels and orients them
             first, through the crown-segmentation and orientation tools.
-        ios_reference: The frame the arches are oriented onto before registering.
+        ios_reference: A reference to orient the arches onto instead of the
+            one ASO holds. Left empty -- the normal case -- ASO uses its own.
         patch: Which part of the arch to match on -- the palate for an upper
             arch, the band around the mucogingival line for a lower one.
         registration_model: The model that finds the palatal patch. Not used by
@@ -65,6 +142,11 @@ def run(
         mgl_patch_height: How far the band extends from the mucogingival
             line, in millimetres. 0 uses the engine's default.
         output_suffix: Added to each output name, e.g. `scan_Reg.vtk`.
+        outputs: What to hand back beside the registered meshes, their
+            transforms and scenes, which are always written. Metrics
+            spreadsheet: what each registration measured, one row per patient
+            and one per landmark, as `AREG_metrics.xlsx` and `.csv` beside
+            the report.
 
     Returns:
         The output directory.
@@ -72,19 +154,28 @@ def run(
     # torch, pytorch3d and monai are imported inside the engine: CI imports this
     # module on every PR to publish the schema, and that must not cost a CUDA
     # stack.
-    return main(
-        t1=t1,
-        t2=t2,
-        output_dir=output_dir,
-        automation=automation,
-        ios_reference=ios_reference,
-        ios_patch=patch,
-        registration_model=registration_model,
-        crown_model=crown_model,
-        mgl_model=mgl_model,
-        mgl_landmarks=mgl_landmarks,
-        mgl_patch_height=mgl_patch_height,
-        output_suffix=output_suffix,
-        sup=sup,
-        data_root=data_root,
+    folders, scratch = patient_folders.resolve(
+        input_layout, patients, {"t1": t1, "t2": t2}, output_dir, _ROLE, _filed_as,
     )
+    try:
+        result = main(
+            t1=folders["t1"],
+            t2=folders["t2"],
+            output_dir=output_dir,
+            automation=automation,
+            ios_reference=ios_reference,
+            ios_patch=patch,
+            registration_model=registration_model,
+            crown_model=crown_model,
+            mgl_model=mgl_model,
+            mgl_landmarks=mgl_landmarks,
+            mgl_patch_height=mgl_patch_height,
+            output_suffix=output_suffix,
+            outputs=outputs,
+            sup=sup,
+            data_root=data_root,
+        )
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+    return result

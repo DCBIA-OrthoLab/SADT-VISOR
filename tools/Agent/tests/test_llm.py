@@ -6,12 +6,14 @@ code path: installing Ollama, pulling a model, and starting a server.
 
 import io
 import json
+import logging
+import socket
 import urllib.error
 
 import pytest
 
 from sadt_agent import llm
-from sadt_agent.errors import ToolInputError, ToolUnavailableError
+from sadt_agent.errors import ModelAnswerError, ToolInputError, ToolUnavailableError
 
 
 def response(payload):
@@ -26,9 +28,27 @@ def answer(content):
 # Where the endpoint is
 # ---------------------------------------------------------------------------
 
-def test_the_argument_wins(monkeypatch):
+def test_a_loopback_argument_wins(monkeypatch):
     monkeypatch.setenv(llm.ENDPOINT_ENV, "http://elsewhere:1234")
-    assert llm.resolve_endpoint("http://asked:9999") == "http://asked:9999"
+    assert llm.resolve_endpoint("http://127.0.0.1:9999") == "http://127.0.0.1:9999"
+    assert llm.resolve_endpoint("localhost:9999") == "http://localhost:9999"
+
+
+def test_the_argument_may_name_the_operator_s_own_endpoint(monkeypatch):
+    monkeypatch.setenv(llm.ENDPOINT_ENV, "http://elsewhere:1234")
+    assert llm.resolve_endpoint("http://elsewhere:1234/") == "http://elsewhere:1234"
+
+
+@pytest.mark.parametrize("asked", [
+    "http://169.254.169.254", "http://evil.example:11434", "http://10.0.0.5:8000",
+    "http://127.0.0.1.evil.example:1", "http://[::ffff:10.0.0.5]:1", "file:///etc/passwd",
+])
+def test_an_argument_off_this_machine_is_refused(monkeypatch, asked):
+    """A request field: honouring any host would make the server a proxy to
+    whatever it can reach that the caller cannot."""
+    monkeypatch.delenv(llm.ENDPOINT_ENV, raising=False)
+    with pytest.raises(ToolInputError, match="endpoint"):
+        llm.resolve_endpoint(asked)
 
 
 def test_the_environment_is_used_when_nothing_is_asked(monkeypatch):
@@ -49,7 +69,7 @@ def test_a_host_and_port_with_no_scheme_is_accepted(monkeypatch):
 
 
 def test_a_trailing_slash_never_doubles(monkeypatch):
-    assert llm.resolve_endpoint("http://host:1/") == "http://host:1"
+    assert llm.resolve_endpoint("http://127.0.0.1:1/") == "http://127.0.0.1:1"
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +143,44 @@ def test_an_unreachable_endpoint_is_a_deployment_failure_naming_the_url(monkeypa
     message = str(raised.value)
     assert "http://127.0.0.1:9" in message
     assert "does not install" in message
+
+
+@pytest.mark.parametrize("error", [
+    TimeoutError("timed out"),
+    socket.timeout("timed out"),
+    urllib.error.URLError(socket.timeout("timed out")),
+    urllib.error.URLError(TimeoutError("timed out")),
+])
+def test_a_timeout_names_the_call_and_the_limit_not_a_missing_server(
+    monkeypatch, error
+):
+    """`TimeoutError` is an `OSError`, so a server that was up but slow used to
+    be reported as "No Ollama server answered" -- sending the operator to start
+    a service that was already running."""
+
+    def stall(request, timeout=None):
+        raise error
+
+    monkeypatch.setattr("urllib.request.urlopen", stall)
+    with pytest.raises(ToolUnavailableError) as raised:
+        llm.chat("http://h:1", "qwen3:8b", [], timeout_seconds=42, call="router call")
+    message = str(raised.value)
+    assert message.startswith("router call exceeded timeout_seconds=42")
+    assert "No Ollama server" not in message
+    assert raised.value.__cause__ is error
+
+
+def test_a_refused_connection_is_still_reported_as_no_server(monkeypatch):
+    """The timeout branch must not swallow the case it was split from."""
+
+    def refuse(request, timeout=None):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
+    with pytest.raises(ToolUnavailableError) as raised:
+        llm.chat("http://h:1", "m", [])
+    assert "No Ollama server answered" in str(raised.value)
+    assert raised.value.__cause__ is not None
 
 
 def test_a_missing_model_is_named_with_its_whole_tag(monkeypatch):
@@ -230,12 +288,23 @@ def test_a_brace_inside_a_string_does_not_end_the_object():
     assert llm.parse_json_object(text, "routing")["tool"] == "X"
 
 
-def test_an_answer_with_no_object_says_what_the_model_said():
-    with pytest.raises(ToolInputError) as raised:
-        llm.parse_json_object("I am not going to answer that.", "routing")
-    assert "not going to answer" in str(raised.value)
+def test_an_answer_with_no_object_is_a_server_fault_that_does_not_quote_it(caplog):
+    """Not a 422: no argument the caller changes makes the model answer in
+    JSON. And the model's text stays out of the message -- it can quote the
+    request -- with its length there and its opening at DEBUG."""
+    text = "I am not going to answer that."
+    with caplog.at_level(logging.DEBUG, logger="Agent"):
+        with pytest.raises(ModelAnswerError) as raised:
+            llm.parse_json_object(text, "routing")
+    message = str(raised.value)
+    assert not isinstance(raised.value, ValueError)
+    assert "routing answer was not a JSON object" in message
+    assert "({} characters)".format(len(text)) in message
+    assert "not going to answer" not in message
+    debug = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any("not going to answer" in r.getMessage() for r in debug)
 
 
 def test_a_json_array_is_not_an_object():
-    with pytest.raises(ToolInputError):
+    with pytest.raises(ModelAnswerError):
         llm.parse_json_object('["X"]', "routing")

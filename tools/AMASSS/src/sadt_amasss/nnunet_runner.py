@@ -22,10 +22,14 @@ publish the schema, and that must not pay for a CUDA stack.
 """
 
 import glob
+import importlib
 import inspect
 import logging
 import os
+import pkgutil
+import threading
 
+from . import progress
 from .errors import ModelNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,12 @@ def resolve_device(requested: str) -> str:
     if wanted.startswith("cuda") and not torch.cuda.is_available():
         logger.warning(
             "device=%s requested but CUDA is unavailable; falling back to CPU", requested
+        )
+        # The operator's concern: the result is the same, only many times
+        # slower, and the fix is in the deployment.
+        progress.log(
+            "a GPU was requested but none is visible; segmenting on the CPU",
+            "warning",
         )
         return "cpu"
     if wanted == "mps" and not torch.backends.mps.is_available():
@@ -73,6 +83,111 @@ def find_model_folder(model_root: str, structure_code: str):
     if os.path.isfile(os.path.join(structure_root, "fold_0", CHECKPOINT_NAME)):
         return structure_root
     return None
+
+
+def why_no_model(model_root: str, structure_code: str) -> str:
+    """Why `find_model_folder` found nothing for this structure, in words.
+
+    In words and not as a path, because the operator reads it through a
+    redaction that turns every path into `<path>`: "MAND: <path>" says nothing,
+    "MAND: folder missing" says what to copy.
+    """
+    structure_root = os.path.join(model_root, structure_code)
+    if not os.path.isdir(structure_root):
+        return "folder missing"
+    pattern = os.path.join(structure_root, "**", PLANS_FOLDER_PATTERN)
+    if not glob.glob(pattern, recursive=True):
+        return "no 3d_fullres plans folder"
+    return "no fold-0 final checkpoint under the 3d_fullres plans folder"
+
+
+def _last_line(exc: BaseException) -> str:
+    """The last non-empty line of an exception's message, or its class name.
+
+    nnUNet's errors are long and end on their cause, and the server cuts a
+    reason at about 300 characters -- so the cause is what is kept.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    return lines[-1] if lines else type(exc).__name__
+
+
+# The packages nnUNet searches BY NAME while loading and running a model:
+# `recursive_find_python_class` walks them with `importlib.import_module`,
+# importing module after module until one holds the class it was asked for
+# (the trainer named in the checkpoint, the resamplers, normaliser,
+# preprocessor, reader/writer and label manager named in the plans, and the
+# network architecture as a fallback to `pydoc.locate`).
+_RESOLVED_BY_NAME = (
+    "nnunetv2.training.nnUNetTrainer",
+    "nnunetv2.preprocessing",
+    "nnunetv2.imageio",
+    "nnunetv2.utilities.label_handling",
+    "dynamic_network_architectures.architectures",
+)
+
+_preload_lock = threading.Lock()
+_preloaded = False
+
+
+def _import_tree(package_name: str) -> int:
+    """Import a package and every module below it. Returns how many were imported.
+
+    A module that cannot be imported is skipped, not raised: the trainer
+    variants include some with optional dependencies, and nnUNet only imports
+    the ones its search reaches. If a model actually needs one, nnUNet raises
+    the same error at load time, where it is reported against the structure.
+    """
+    package = importlib.import_module(package_name)
+    count = 1
+
+    def skipped(name):
+        logger.debug("preload: package %s could not be imported; skipped", name)
+
+    for info in pkgutil.walk_packages(package.__path__, package_name + ".", onerror=skipped):
+        try:
+            importlib.import_module(info.name)
+            count += 1
+        except Exception as exc:  # noqa: BLE001 -- see the docstring
+            logger.debug("preload: %s could not be imported (%s); skipped", info.name, exc)
+    return count
+
+
+def preload() -> None:
+    """Import everything nnUNet would otherwise import lazily, once per process.
+
+    **Call it before any thread that loads a model starts.** Structures are
+    predicted in parallel threads (see pipeline), and each of them used to be
+    the first to import nnunetv2: the predictor module on construction, then
+    the trainer class nnUNet looks up by name in
+    `initialize_from_trained_model_folder`, then the resamplers and
+    preprocessor it resolves the same way while predicting. nnUNet's modules
+    import each other in cycles (the trainer module imports the predictor
+    module), and when several threads import them for the first time at once,
+    CPython can hand a thread a module that another one is still executing --
+    the classic "cannot import name 'nnUNetTrainer'" from a partially
+    initialised module. On the server, every structure of a five-channel run
+    failed that way, while the same input succeeded on one channel.
+
+    Done here, under a lock, nothing is left for the threads to import for the
+    first time: each finds every module complete in `sys.modules`. A caller
+    arriving while another is preloading waits for it to finish rather than
+    returning early. The cost is paid once, on the first call -- a few seconds,
+    the price of the imports the threads used to pay anyway.
+
+    Imports only; no model, device or global setting is touched, so the
+    masks are unchanged.
+    """
+    global _preloaded
+    with _preload_lock:
+        if _preloaded:
+            return
+        import torch  # noqa: F401 -- nnUNet's own imports assume it
+        # Raised, not skipped: without the predictor there is no AMASSS.
+        importlib.import_module("nnunetv2.inference.predict_from_raw_data")
+        importlib.import_module("nnunetv2.utilities.find_objects")
+        count = sum(_import_tree(name) for name in _RESOLVED_BY_NAME)
+        logger.info("nnUNet preloaded (%d modules resolved by name)", count)
+        _preloaded = True
 
 
 def _build_predictor(device: str, tile_step_size: float):
@@ -206,37 +321,89 @@ def predict_folder(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    predictor = _build_predictor(device, tile_step_size)
-    # Explicit path: no nnUNet_results env var, hence no cross-run race.
-    predictor.initialize_from_trained_model_folder(
-        model_folder,
-        use_folds=(0,),
-        checkpoint_name=CHECKPOINT_NAME,
-    )
+    try:
+        # A no-op once the pipeline has preloaded before starting its threads;
+        # here so that no caller can reach nnUNet without it.
+        preload()
+        predictor = _build_predictor(device, tile_step_size)
+        # Explicit path: no nnUNet_results env var, hence no cross-run race.
+        predictor.initialize_from_trained_model_folder(
+            model_folder,
+            use_folds=(0,),
+            checkpoint_name=CHECKPOINT_NAME,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"loading the nnUNet model failed ({type(exc).__name__}: {_last_line(exc)})"
+        ) from exc
 
     on_gpu = bool(gpu_resampling) and _enable_gpu_resampling(predictor, device)
+    logger.info(
+        "nnUNet predicting on %s (tile_step_size=%s, gpu_resampling=%s)",
+        device, tile_step_size, on_gpu,
+    )
 
-    if on_gpu:
-        # `predict_from_files` fans preprocessing and export out to SPAWNED
-        # processes, each of which would need its own CUDA context to run a
-        # GPU resampler. The GPU path therefore runs everything in this
-        # process, trading away the CPU/GPU overlap on multi-scan batches --
-        # a smaller loss than the resampling win.
-        predictor.predict_from_files_sequential(
-            input_dir,
-            output_dir,
-            save_probabilities=False,
-            overwrite=True,
-        )
-    else:
-        predictor.predict_from_files(
-            input_dir,
-            output_dir,
-            save_probabilities=False,
-            overwrite=True,
-            num_processes_preprocessing=2,
-            num_processes_segmentation_export=2,
-        )
+    in_process = on_gpu or not device.startswith("cuda")
+    try:
+        if in_process:
+            _predict_in_process(predictor, input_dir, output_dir)
+        else:
+            _predict_with_workers(predictor, input_dir, output_dir)
+    except Exception as exc:
+        raise RuntimeError(f"nnUNet prediction failed on {device} ({_cause(exc)})") from exc
+
+
+def _predict_in_process(predictor, input_dir: str, output_dir: str) -> None:
+    """Every stage in this process.
+
+    With GPU resamplers because `predict_from_files` fans preprocessing and
+    export out to SPAWNED processes, each of which would need its own CUDA
+    context to run them -- trading away the CPU/GPU overlap, a smaller loss
+    than the resampling win. On a CPU device because there is no overlap to
+    keep: the workers would compete with the network for the same cores, and a
+    worker that dies -- almost always the kernel reclaiming RAM -- surfaces
+    only as "Background workers died", its cause printed to a stderr no
+    operator sees. Both paths run the same preprocessor, network call and
+    export on the same float32 data, so the masks are the same.
+    """
+    predictor.predict_from_files_sequential(
+        input_dir,
+        output_dir,
+        save_probabilities=False,
+        overwrite=True,
+    )
+
+
+def _predict_with_workers(predictor, input_dir: str, output_dir: str) -> None:
+    """The card with scipy resamplers: nnUNet's own worker processes.
+
+    The workers are what overlap one scan's resampling with the next one's
+    inference, and that resampling is most of a run, so they stay -- with
+    their death translated by `_cause`.
+    """
+    predictor.predict_from_files(
+        input_dir,
+        output_dir,
+        save_probabilities=False,
+        overwrite=True,
+        num_processes_preprocessing=2,
+        num_processes_segmentation_export=2,
+    )
+
+
+def _cause(exc: BaseException) -> str:
+    """"Type: last line", or what a dead nnUNet worker actually means.
+
+    nnUNet reports a worker process that died as "Background workers died" or
+    "Segmentation export worker died", and the real error went to that
+    worker's stderr, which nothing forwards. The usual cause is the kernel
+    killing it for RAM, so that is said instead of the line that says nothing.
+    """
+    text = str(exc)
+    if "worker" in text.lower() and "died" in text.lower():
+        return (f"{type(exc).__name__}: an nnUNet worker process died, most often for "
+                "lack of RAM; its own error went to stderr only")
+    return f"{type(exc).__name__}: {_last_line(exc)}"
 
 
 __all__ = [
@@ -244,5 +411,7 @@ __all__ = [
     "ModelNotFoundError",
     "find_model_folder",
     "predict_folder",
+    "preload",
     "resolve_device",
+    "why_no_model",
 ]

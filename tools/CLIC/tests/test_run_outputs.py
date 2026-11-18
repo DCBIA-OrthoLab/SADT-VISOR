@@ -5,6 +5,7 @@ round trip, the per-scan failure handling, the report -- runs for real.
 """
 
 import json
+import logging
 
 import numpy as np
 import pytest
@@ -393,9 +394,14 @@ def test_a_batch_where_every_scan_fails_is_refused(tmp_path, stubbed):
         sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
                       output_dir=tmp_path / "out", device="cpu")
 
+    # Counted, never listed: the file names were patient identifiers in the
+    # one message the server keeps.
     message = str(raised.value)
-    assert "segmented none" in message
-    assert "a.nii.gz" in message and "b.nii.gz" in message
+    assert message.startswith("0 of 2 scans segmented; most common failure: ")
+    assert "not a readable NIfTI volume" in message
+    assert message.endswith("(2 of 2)")
+    assert "a.nii.gz" not in message and "b.nii.gz" not in message
+    assert str(tmp_path) not in message
 
 
 def test_no_report_is_written_when_every_scan_failed(tmp_path, stubbed):
@@ -478,3 +484,93 @@ def test_the_progress_protocol_is_not_printed(tmp_path, stubbed, make_scan, caps
                   output_dir=tmp_path / "out", device="cpu")
 
     assert capsys.readouterr().out == ""
+
+
+def test_a_batch_the_server_failed_on_every_scan_is_a_runtime_error(tmp_path, stubbed,
+                                                                    make_scan, monkeypatch):
+    """Readable scans that the network could not run on are the deployment's
+    fault, not the request's: a ValueError would be answered as a 422 and
+    send the caller off to fix input that was fine."""
+    def out_of_memory(model, volume, device, threshold):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    monkeypatch.setattr(sadt_clic, "segment_volume", out_of_memory)
+    make_scan(tmp_path / "in" / "first_patient.nii.gz")
+    make_scan(tmp_path / "in" / "second_patient.nii.gz")
+    (tmp_path / "in" / "third_patient.nii.gz").write_bytes(b"not a nifti")
+
+    with pytest.raises(RuntimeError) as raised:
+        sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
+                      output_dir=tmp_path / "out", device="cpu")
+
+    message = str(raised.value)
+    assert not isinstance(raised.value, ValueError)
+    assert message == (
+        "0 of 3 scans segmented; most common failure: RuntimeError: CUDA out "
+        "of memory. Tried to allocate 2.00 GiB (2 of 3)"
+    )
+    assert "patient" not in message
+    assert isinstance(raised.value.__cause__, Exception)
+
+
+def test_each_failed_scan_is_logged_by_position_step_and_class(tmp_path, stubbed,
+                                                               make_scan, monkeypatch,
+                                                               caplog):
+    """The server shows log lines without a traceback, so the line itself has
+    to say which scan, which step, and what was raised -- and never the name."""
+    calls = []
+
+    def fails_second(model, volume, device, threshold):
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("CUDA out of memory")
+        return np.ones(volume.shape, np.int16), 1
+
+    monkeypatch.setattr(sadt_clic, "segment_volume", fails_second)
+    make_scan(tmp_path / "in" / "a_patient.nii.gz")
+    make_scan(tmp_path / "in" / "b_patient.nii.gz")
+
+    with caplog.at_level(logging.INFO, logger="sadt_clic"):
+        sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
+                      output_dir=tmp_path / "out", device="cpu")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "scan 2 of 2: segmentation failed (RuntimeError: CUDA out of memory)" in messages
+    assert not any("patient" in m for m in messages), messages
+    summary = [r for r in caplog.records if r.getMessage() == "1 of 2 scans segmented, 1 failed"]
+    assert summary and summary[0].levelno == logging.WARNING
+
+
+def test_a_clean_batch_ends_with_an_info_summary(tmp_path, stubbed, make_scan, caplog):
+    make_scan(tmp_path / "in" / "one.nii.gz")
+
+    with caplog.at_level(logging.INFO, logger="sadt_clic"):
+        sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
+                      output_dir=tmp_path / "out", device="cpu")
+
+    summary = [r for r in caplog.records if r.getMessage() == "1 of 1 scans segmented, 0 failed"]
+    assert summary and summary[0].levelno == logging.INFO
+    # Announced before the load, so a run that dies in it says where.
+    assert any(r.getMessage().startswith("loading checkpoint m.pth")
+               for r in caplog.records)
+
+
+def test_a_scan_with_no_detection_is_logged_with_its_position_and_threshold(
+        tmp_path, stubbed, make_scan, monkeypatch, caplog):
+    """An empty segmentation on every scan is the signature of a wrong
+    checkpoint, and an operator only reads the log."""
+    monkeypatch.setattr(
+        sadt_clic, "segment_volume",
+        lambda model, volume, device, threshold: (np.zeros(volume.shape, np.int16), 0),
+    )
+    make_scan(tmp_path / "in" / "quiet_patient.nii.gz")
+
+    with caplog.at_level(logging.INFO, logger="sadt_clic"):
+        sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
+                      output_dir=tmp_path / "out", device="cpu",
+                      score_threshold=0.85)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(m.startswith("scan 1 of 1: no detection cleared the score threshold 0.85")
+               for m in warnings), warnings
+    assert not any("patient" in m for m in warnings), warnings

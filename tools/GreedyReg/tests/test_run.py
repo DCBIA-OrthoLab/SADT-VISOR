@@ -197,7 +197,7 @@ def test_greedy_runs_in_a_child_process_with_a_timeout(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert pipeline.run_greedy(["-d", "3", "-a"]) == "ok"
-    assert seen["timeout"] == pipeline.CASE_TIMEOUT_SECONDS == 600
+    assert seen["timeout"] == pipeline.CASE_TIMEOUT_SECONDS == 1800
     assert seen["command"][0].endswith("python") or "python" in seen["command"][0]
     assert seen["command"][1] == "-c"
     assert seen["command"][-3:] == ["-d", "3", "-a"]
@@ -270,8 +270,8 @@ def test_a_failure_names_the_position_and_never_the_patient(
                            output_dir=tmp_path / "out")
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any(m.startswith("GreedyReg failed on patient ") and m.endswith(" of 2")
-               for m in messages), messages
+    assert "GreedyReg failed on patient 1 of 2: greedy registration (NCC, 6 dof) failed " \
+        "(RuntimeError: greedy: images do not overlap)" in messages, messages
     assert not any("MAMP_0001" in m for m in messages), messages
 
     report = json.loads((tmp_path / "out" / "GreedyReg_report.json").read_text())

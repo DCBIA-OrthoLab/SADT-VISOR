@@ -35,6 +35,12 @@ the point and is meant to be deleted. The rules it demonstrates are:
    `pipeline.summarise`. Stdlib, best effort, and the message carries the
    POSITION in the batch and never a file name: it is stored on the server and
    shown, and a file name is patient metadata.
+9. A failure explains itself to someone who sees only a few redacted lines.
+   The job directory is deleted when a run fails, so what is left is the
+   exception and this package's log records -- see the top of `pipeline.py`
+   for what reaches the operator and `pipeline.summarise` for the per-item
+   warning, the guard against a batch that produced nothing, and the closing
+   summary line.
 """
 
 from pathlib import Path

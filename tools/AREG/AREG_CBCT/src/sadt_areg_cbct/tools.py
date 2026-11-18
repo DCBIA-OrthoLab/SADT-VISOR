@@ -32,9 +32,11 @@ Four things worth knowing before changing anything here:
   answer and "deploy a tool" usually is not.
 """
 
+import json
 import logging
 import os
 
+from sadt_areg_common import pairing
 from sadt_areg_common.errors import SupervisorRequired
 
 logger = logging.getLogger(__name__)
@@ -77,9 +79,26 @@ def _returned(produced) -> str:
     return str(produced)
 
 
+def _span(span) -> dict:
+    """`_progress` for `sup.run`, or nothing when the caller gave no span.
+
+    The keyword is the supervisor's, not the callee's: it removes it before the
+    callee sees it and folds the callee's own 0..1 into that slice of this
+    run's bar. Left out, the call behaves exactly as it did before there was
+    such a thing, which is what a caller with no bar of its own wants.
+    """
+    return {"_progress": tuple(span)} if span else {}
+
+
 def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
-                 landmark_model: str = "", **extra) -> str:
-    """Orient every case under `scan_dir` onto `reference_path`.
+                 landmark_model: str = "", span=None, frame: str = "", **extra) -> str:
+    """Orient every case under `scan_dir` into `frame`, or onto `reference_path`.
+
+    `frame` is the frame as ASO names it ("Frankfurt horizontal", "Occlusal
+    plane"). The reference bundles that define the frames are ASO's own, under
+    ASO's data folder, and ASO resolves the one a frame names -- AREG holds no
+    copy. `reference_path` is for a caller that named a bundle of its own, and
+    wins when given.
 
     Fully-Automated on both modalities: for CBCT that is ASO predicting the
     landmarks through ALI, for IOS it is the tooth-centroid alignment. Either
@@ -92,22 +111,91 @@ def orient_scans(sup, scan_dir: str, reference_path: str, modality: str,
     logger.info("AREG: asking 'ASO' for oriented %s scans", modality)
     parameters = {
         "input": scan_dir,
-        "reference": reference_path,
         "modality": modality,
         "automation": "Fully-Automated",
         "output_suffix": "Or",
     }
+    if reference_path:
+        parameters["reference"] = reference_path
+    elif frame:
+        parameters["frame"] = frame
     # CBCT orientation is itself landmark-driven, and ASO needs the bundle
     # NAMED: it used to be optional because the server picked one matching the
     # input, and a tool no longer resolves paths. Forgetting it is a failure
     # three tools down, so it is passed explicitly and required by _check_cbct.
     if modality == "CBCT" and landmark_model:
         parameters["landmark_model"] = landmark_model
+    # The landmarks to orient on are the ones the REFERENCE defines. Left out,
+    # ASO falls back to its own defaults -- the Frankfurt set -- which only
+    # happen to match the Frankfurt reference: the occlusal one defines none of
+    # them, and every run with it was refused before ALI was even asked.
+    #
+    # A reference named here is read for them. A frame is not AREG's to read:
+    # an EMPTY selection asks ASO for every landmark the frame's own reference
+    # defines, which is the same answer from the tool that holds the file.
+    if modality == "CBCT" and "cbct_landmarks" not in extra:
+        if reference_path:
+            labels = reference_landmarks(reference_path)
+            if labels:
+                parameters["cbct_landmarks"] = labels
+        elif frame:
+            parameters["cbct_landmarks"] = []
     parameters.update(extra)
-    return _returned(sup.run("ASO", **parameters))
+    return _returned(sup.run("ASO", **parameters, **_span(span)))
 
 
-def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
+def reference_landmarks(reference_path: str) -> list:
+    """The landmark labels the reference's markups file defines, in its order,
+    or [] when there is none to read.
+
+    Read from the reference itself rather than listed per reference here, so a
+    new reference orients on its own landmarks without this file changing.
+    """
+    candidates = []
+    if os.path.isfile(reference_path):
+        candidates = [reference_path]
+    elif os.path.isdir(reference_path):
+        for directory, _subdirs, names in sorted(os.walk(reference_path)):
+            candidates += [os.path.join(directory, name) for name in sorted(names)
+                           if name.endswith(".mrk.json") and not name.startswith(".")]
+    for index, path in enumerate(candidates, start=1):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError) as exc:
+            # Skipped, not fatal -- another markups file may still name the
+            # landmarks -- but said: when it was the only one, ASO falls back
+            # to its own default set, which is the wrong frame for any
+            # reference other than the Frankfurt one.
+            logger.warning(
+                "orientation reference: markups file %d of %d could not be read (%s: %s)",
+                # `strerror` for an OSError, whose own text ends in the path.
+                index, len(candidates), type(exc).__name__,
+                getattr(exc, "strerror", None) or exc,
+            )
+            continue
+        labels = []
+        for markup in document.get("markups") or []:
+            for point in markup.get("controlPoints") or []:
+                label = point.get("label")
+                if isinstance(label, str) and label and label not in labels:
+                    labels.append(label)
+        if labels:
+            return labels
+    return []
+
+
+def count_scans(root: str) -> int:
+    """How many scans a step's folder holds, the way the pairing will count them.
+
+    A supervised step that drops a subject does not fail: the subject is simply
+    missing from its output, and further down that reads as a T1 nobody paired.
+    Counting before and after each step is what tells the two apart.
+    """
+    return len(pairing.discover(str(root), "")) if root and os.path.isdir(str(root)) else 0
+
+
+def segment_masks(sup, scan_dir: str, model_path: str, mask_structures, span=None) -> str:
     """Segment every scan under `scan_dir` into the requested mask structures.
 
     Returns the directory holding AMASSS's output, which `cbct.pipeline.find_masks`
@@ -118,12 +206,17 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
     the packaged tool takes codes directly. The in-process version had to
     translate them into display names through AMASSS's own table; the schema
     publishes the codes now, so the translation is gone rather than restated.
+
+    `model_path` is sent only when a caller named one. There is one AMASSS
+    model and AMASSS resolves it from its own data folder; AREG naming it meant
+    keeping a copy under DATA/AREG/.
     """
-    logger.info("AREG: asking 'AMASSS' for T1 masks (%s)", ", ".join(mask_structures))
+    logger.info("AREG: asking 'AMASSS' for masks (%s)", ", ".join(mask_structures))
+    weights = {"model": model_path} if model_path else {}
     return _returned(sup.run(
         "AMASSS",
         scans=scan_dir,
-        model=model_path,
+        **weights,
         structures=list(mask_structures),
         # One binary file per structure: `find_masks` looks each region's mask
         # up by name, and a merged multi-label volume would make every region
@@ -136,4 +229,5 @@ def segment_masks(sup, scan_dir: str, model_path: str, mask_structures) -> str:
         merge=["SEPARATE"],
         prediction_ID="seg",
         generate_surface=False,
+        **_span(span),
     ))

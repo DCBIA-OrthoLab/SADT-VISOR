@@ -57,7 +57,7 @@ def resolve_device(requested: str = "cuda") -> str:
 CHECKPOINT_EXTENSIONS = (".ckpt", ".pth")
 
 
-def find_checkpoint(model_path: str) -> str:
+def find_checkpoint(model_path: str, named_by_caller: bool = True) -> str:
     """The checkpoint file inside a hosted model entry.
 
     A `server_selectable` name resolves to whatever is under
@@ -67,6 +67,11 @@ def find_checkpoint(model_path: str) -> str:
     (`getModel(folder, extension="ckpt")`) and took `[0]` of whatever it found;
     an ambiguity is a 422 naming the candidates instead, because which weights
     registered a patient must never be a surprise.
+
+    `named_by_caller` is False when the deployment filled the field itself
+    (`dispatch._own_bundle`). The same two defects are then the server's, not the
+    request's, and are raised as RuntimeError so they do not come back as a 422
+    the caller can do nothing about.
     """
     if os.path.isfile(model_path):
         return model_path
@@ -78,14 +83,15 @@ def find_checkpoint(model_path: str) -> str:
         if file_name.lower().endswith(CHECKPOINT_EXTENSIONS) and not file_name.startswith(".")
     )
     name = os.path.basename(str(model_path).rstrip(os.sep))
+    error = ToolInputError if named_by_caller else RuntimeError
     if not found:
-        raise ToolInputError(
+        raise error(
             f"'{name}' holds no {' or '.join(CHECKPOINT_EXTENSIONS)} checkpoint. Fetch the "
             f"published bundle with `./scripts/setup-models.sh --tool AREG`, or name "
             f"another entry in 'registration_model'."
         )
     if len(found) > 1:
-        raise ToolInputError(
+        raise error(
             f"'{name}' holds several checkpoints "
             f"({', '.join(os.path.basename(path) for path in found)}): "
             f"'registration_model' has to name an entry holding exactly one."
@@ -101,16 +107,20 @@ class PatchPredictor:
     holding it here means a forty-patient batch pays for it once.
     """
 
-    def __init__(self, model_path: str, device: str = None):
+    def __init__(self, model_path: str, device: str = None, named_by_caller: bool = True):
         self.device = device or resolve_device()
-        self.checkpoint = find_checkpoint(str(model_path))
+        self.checkpoint = find_checkpoint(str(model_path), named_by_caller=named_by_caller)
         self.model = net.load(self.checkpoint, self.device)
 
-    def __call__(self, surface: vtk.vtkPolyData) -> tuple:
+    def __call__(self, surface: vtk.vtkPolyData, where: str = None) -> tuple:
         """`(mesh carrying the patch array, note or None)`.
 
         The mesh is returned in its own coordinates: the canonical orientation
         is a rendering convenience and never leaves this function.
+
+        `where` is the mesh's position in the run ("subject 3 of 8, T1"), put in
+        front of every log line so an operator can tell which mesh it was
+        without its file name ever being written.
         """
         surface = postprocess.triangulate(surface)
 
@@ -128,7 +138,7 @@ class PatchPredictor:
                 f"patch predicted without the canonical orientation ({exc}); "
                 f"check the result if the mesh was not oriented beforehand"
             )
-            logger.warning("AREG IOS: %s", note)
+            logger.warning("AREG IOS, %s: %s", where or "one mesh", note)
 
         labels = self._predict(oriented)
 

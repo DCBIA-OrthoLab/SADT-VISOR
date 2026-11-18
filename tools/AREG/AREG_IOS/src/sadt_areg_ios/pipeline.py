@@ -28,7 +28,11 @@ reported rather than guessed.
 import logging
 import os
 
-from sadt_areg_common import catalogs, pairing
+import numpy as np
+
+from sadt_areg_common import catalogs, pairing, scene
+from sadt_areg_common.errors import ToolInputError
+
 from . import landmarks as landmark_files
 from . import butterfly, icp, mgl, surfaces
 
@@ -143,18 +147,34 @@ class MGLPainter:
 
     array_name = mgl.MGL_ARRAY_NAME
 
-    def __init__(self, landmark_root: str, height: float = mgl.DEFAULT_HEIGHT):
+    def __init__(self, landmark_root: str, height: float = mgl.DEFAULT_HEIGHT,
+                 predicted: bool = False):
         self.height = height
         self.index = landmark_files.index(landmark_root, also_drop=_MATCHING_TOKENS)
         if not self.index:
-            raise landmark_files.LandmarkError(
-                "the mucogingival landmarks folder holds no Slicer markups file "
-                "(.json/.mrk.json)"
+            # Whose folder it is decides whose fault it is. The caller's
+            # 'mgl_landmarks' holding nothing usable is theirs to fix (a 422);
+            # ALI_IOS writing nothing is a server-side failure of the tool this
+            # run drove, and must not come back to the caller as a bad request.
+            if predicted:
+                raise RuntimeError(
+                    "ALI_IOS produced no mucogingival landmark file (.json or "
+                    ".mrk.json) for any mesh of either timepoint"
+                )
+            raise ToolInputError(
+                "'mgl_landmarks' holds no Slicer markups file (.json or .mrk.json); "
+                "send one per lower scan, or leave the field empty to have them predicted"
             )
 
-    def __call__(self, surface, scan_path: str) -> tuple:
+    def landmarks_for(self, scan_path: str) -> dict:
+        """{label: position} of the mucogingival landmarks of the scan at `scan_path`."""
         path = landmark_files.for_scan(self.index, scan_path, also_drop=_MATCHING_TOKENS)
-        return mgl.build_patch(surface, landmark_files.load(path), height=self.height)
+        return landmark_files.load(path)
+
+    def __call__(self, surface, scan_path: str, where: str = None) -> tuple:
+        return mgl.build_patch(
+            surface, self.landmarks_for(scan_path), height=self.height, where=where
+        )
 
 
 class PalatePainter:
@@ -165,8 +185,8 @@ class PalatePainter:
     def __init__(self, predictor):
         self.predictor = predictor
 
-    def __call__(self, surface, scan_path: str) -> tuple:
-        return self.predictor(surface)
+    def __call__(self, surface, scan_path: str, where: str = None) -> tuple:
+        return self.predictor(surface, where=where)
 
 
 # ---------------------------------------------------------------------------
@@ -181,29 +201,48 @@ def register_patient(
     relative_key: str,
     suffix: str,
     prior_transforms: dict = None,
+    position: str = None,
 ) -> dict:
     """Register one patient's two timepoints. Returns a report entry.
 
     Raises `icp.RegistrationError`, `surfaces.SurfaceError`, `mgl.PatchError` or
     `landmarks.LandmarkError` when this patient cannot be registered; the caller
     records that and moves on.
+
+    `position` is this subject's place in the run ("subject 3 of 8"), handed to
+    the painter with the timepoint so its log lines say which mesh they are
+    about without naming it.
     """
     registered = jaws[registered_jaw]
-    t1_surface, t1_note = painter(surfaces.read_surface(registered["t1"]), registered["t1"])
-    t2_surface, t2_note = painter(surfaces.read_surface(registered["t2"]), registered["t2"])
-
-    matrix = icp.align(
-        butterfly.patch_cloud(t2_surface, painter.array_name),
-        butterfly.patch_cloud(t1_surface, painter.array_name),
+    t1_surface, t1_note = painter(
+        surfaces.read_surface(registered["t1"]), registered["t1"],
+        where=_where(position, "T1"),
     )
+    t2_surface, t2_note = painter(
+        surfaces.read_surface(registered["t2"]), registered["t2"],
+        where=_where(position, "T2"),
+    )
+
+    t2_patch = butterfly.patch_cloud(t2_surface, painter.array_name)
+    t1_patch = butterfly.patch_cloud(t1_surface, painter.array_name)
+    alignment = {}
+    matrix = icp.align(t2_patch, t1_patch, stats=alignment)
+    metrics = {"icp": icp.measure(t2_patch, t1_patch, matrix,
+                                  iterations=alignment.get("iterations"))}
+    displacement = _landmark_displacement(painter, registered, matrix)
+    if displacement:
+        metrics["landmark_displacement"] = displacement
 
     relative_dir, patient = os.path.split(relative_key)
     destination = os.path.join(output_dir, relative_dir)
     os.makedirs(destination, exist_ok=True)
 
-    written = [
-        _write(t1_surface, registered["t1"], destination, suffix),
-        _write(surfaces.transform_surface(t2_surface, matrix), registered["t2"], destination, suffix),
+    # (path, role) for this subject's scene: every file below is in the T1's
+    # space, the T1 meshes as they are and the T2 ones moved onto them.
+    in_scene = [
+        (_write(t1_surface, registered["t1"], destination, suffix), "reference"),
+        (_write(surfaces.transform_surface(t2_surface, matrix), registered["t2"], destination, suffix),
+         "registered"),
     ]
 
     for jaw, files in jaws.items():
@@ -213,24 +252,31 @@ def register_patient(
         # point of registering on a region that does not move is that the whole
         # model follows it, so the occlusion the two arches were captured in is
         # preserved.
-        written.append(_write(surfaces.read_surface(files["t1"]), files["t1"], destination, suffix))
-        written.append(
+        in_scene.append(
+            (_write(surfaces.read_surface(files["t1"]), files["t1"], destination, suffix), "reference"))
+        in_scene.append((
             _write(
                 surfaces.transform_surface(surfaces.read_surface(files["t2"]), matrix),
                 files["t2"],
                 destination,
                 suffix,
-            )
-        )
+            ),
+            "registered",
+        ))
 
     prior = (prior_transforms or {}).get(relative_key)
-    written.append(
+    in_scene.append((
         icp.write_transform(
             matrix,
             os.path.join(destination, f"{patient}_{suffix}_transform.tfm"),
             prior_path=prior,
-        )
-    )
+        ),
+        "registration",
+    ))
+    written = [path for path, _role in in_scene]
+    # Named after the subject: several share `destination`.
+    written.append(scene.write(destination, "the T1", in_scene,
+                               name=f"{patient}_{suffix}_{scene.SCENE_NAME}"))
 
     entry = {
         "status": "ok",
@@ -243,11 +289,43 @@ def register_patient(
             else "the registered T2 mesh -> the T1 mesh AREG was given"
         ),
         "outputs": sorted(os.path.relpath(path, output_dir) for path in written),
+        "metrics": metrics,
     }
     notes = [note for note in (t1_note, t2_note) if note]
     if notes:
         entry["notes"] = notes
     return entry
+
+
+def _landmark_displacement(painter, registered: dict, matrix) -> dict:
+    """How far each landmark is from its T1 position once T2 is registered.
+
+    Only for a painter that reads landmarks per scan (the mucogingival band):
+    the T2 landmark is moved by the registration and compared with the T1
+    landmark of the same label. On a stable region that is what is left of the
+    misalignment, plus the landmarks' own placement noise and any real change.
+    None when the painter has no landmarks or the two scans share no label.
+    """
+    read = getattr(painter, "landmarks_for", None)
+    if read is None:
+        return None
+    try:
+        t1, t2 = read(registered["t1"]), read(registered["t2"])
+    except landmark_files.LandmarkError:
+        return None
+    labels = [label for label in mgl.MGL_ORDER + mgl.MGL_ORDER_LEGACY
+              if label in t1 and label in t2]
+    labels += sorted(label for label in set(t1) & set(t2) if label not in labels)
+    if not labels:
+        return None
+    moved = np.array([t2[label] for label in labels]) @ matrix[:3, :3].T + matrix[:3, 3]
+    distances = np.linalg.norm(moved - np.array([t1[label] for label in labels]), axis=1)
+    return {"labels": labels, "distances_mm": [round(float(d), 4) for d in distances]}
+
+
+def _where(position: str, timepoint: str) -> str:
+    """"subject 3 of 8, T1", or the timepoint alone outside a run."""
+    return f"{position}, {timepoint}" if position else timepoint
 
 
 def _write(surface, source_path: str, destination: str, suffix: str) -> str:

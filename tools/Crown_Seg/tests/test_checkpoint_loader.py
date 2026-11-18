@@ -9,7 +9,6 @@ per process, however many times `_run_shapeaxi` runs.
 import pickle
 
 import pytest
-
 from sadt_crownseg import pipeline
 
 torch = pytest.importorskip("torch")

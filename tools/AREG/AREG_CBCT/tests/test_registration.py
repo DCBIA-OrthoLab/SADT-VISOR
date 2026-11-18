@@ -14,8 +14,9 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from conftest import cohort, displaced, full_mask, phantom, tree_of, write
+from conftest import FakeSup, cohort, displaced, full_mask, phantom, tree_of, write
 from sadt_areg_cbct import dispatch
+from sadt_areg_cbct import pipeline as cbct_pipeline
 from sadt_areg_common import catalogs, pairing
 from sadt_areg_common.errors import ToolInputError
 
@@ -42,9 +43,31 @@ def test_a_run_writes_a_registered_scan_a_transform_and_a_report(semi_run):
     assert run.succeeded == ["P1"]
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
     ])
+
+
+def test_the_scene_lists_the_registration_in_the_t1_space(semi_run):
+    run, _root = semi_run
+    with open(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_scene.json")) as handle:
+        scene = json.load(handle)
+    assert scene == {"version": 1, "space": "the T1", "files": [
+        {"path": "P1_T2_CB_Reg.nii.gz", "kind": "volume", "role": "registered"},
+        {"path": "P1_T2_CB_Reg_transform.tfm", "kind": "transform", "role": "registration"},
+    ]}
+
+
+def test_scans_copies_the_t1_beside_the_registered_t2(tmp_path):
+    cohort(tmp_path, size=32)
+    run = semi(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
+    folder = os.path.join(run.output_dir, "T2_Registered")
+    with open(os.path.join(folder, "P1_T2_CB_Reg_scene.json")) as handle:
+        files = json.load(handle)["files"]
+    reference = [entry["path"] for entry in files if entry["role"] == "reference"]
+    assert len(reference) == 1 and os.path.isfile(os.path.join(folder, reference[0]))
+    assert reference[0] in os.listdir(os.path.join(str(tmp_path), "T1"))
 
 
 def test_each_region_is_a_registration_of_its_own(tmp_path):
@@ -56,10 +79,12 @@ def test_each_region_is_a_registration_of_its_own(tmp_path):
 
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "P1_CB_Reg_transform.tfm"),
-        os.path.join("MAND", "P1_MAND_Reg.nii.gz"),
-        os.path.join("MAND", "P1_MAND_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "P1_T2_MAND_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_MAND_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_MAND_Reg_scene.json"),
     ])
     assert set(run.patients["P1"]["regions"]) == {"CB", "MAND"}
 
@@ -79,10 +104,12 @@ def test_a_batch_keeps_the_tree_its_scans_arrived_in(tmp_path):
     assert sorted(run.succeeded) == [os.path.join("siteA", "P1"), os.path.join("siteB", "P1")]
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "siteA", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "siteA", "P1_CB_Reg_transform.tfm"),
-        os.path.join("CB", "siteB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "siteB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "siteA", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "siteA", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "siteA", "P1_T2_CB_Reg_scene.json"),
+        os.path.join("T2_Registered", "siteB", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "siteB", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "siteB", "P1_T2_CB_Reg_scene.json"),
     ])
 
 
@@ -91,8 +118,9 @@ def test_the_suffix_reaches_both_names_it_writes(tmp_path):
     run = semi(tmp_path, output_suffix="Study7")
     assert tree_of(run.output_dir) == sorted([
         "AREG_report.json",
-        os.path.join("CB", "P1_CB_Study7.nii.gz"),
-        os.path.join("CB", "P1_CB_Study7_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Study7.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Study7_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Study7_scene.json"),
     ])
 
 
@@ -104,7 +132,7 @@ def test_the_output_carries_a_spelling_itk_can_actually_write(tmp_path, given, e
     and ITK has no `.nrrd.gz` writer at all, so that spelling maps back down."""
     cohort(tmp_path, size=32, extension=given)
     run = semi(tmp_path)
-    assert os.path.join("CB", f"P1_CB_Reg{expected}") in tree_of(run.output_dir)
+    assert os.path.join("T2_Registered", f"P1_T2_CB_Reg{expected}") in tree_of(run.output_dir)
 
 
 def test_the_output_directory_is_created_when_it_does_not_exist(tmp_path):
@@ -136,16 +164,209 @@ def test_the_working_directory_does_not_survive_the_run(semi_run):
 
 
 def test_the_registered_volume_keeps_the_t2s_own_grid(semi_run):
-    """Resampled on the MOVING image's grid, as the original did: the result
-    keeps the T2's resolution and field of view, in the T1's frame. Resampling
-    onto the T1 grid instead would crop the T2 to the T1's field of view."""
+    """The T2's own size and spacing, placed where the T2 landed in the T1's
+    frame. Resampling onto the T1 grid instead would crop the T2 to the T1's
+    field of view."""
     run, root = semi_run
     moving = sitk.ReadImage(os.path.join(root, "T2", "P1_T2_scan.nii.gz"))
-    registered = sitk.ReadImage(os.path.join(run.output_dir, "CB", "P1_CB_Reg.nii.gz"))
+    registered = sitk.ReadImage(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg.nii.gz"))
 
     assert registered.GetSize() == moving.GetSize()
     assert registered.GetSpacing() == pytest.approx(moving.GetSpacing())
     assert registered.GetPixelID() == sitk.sitkInt16
+
+
+def _oriented_run(tmp_path, sups=None, outputs=()):
+    """An Oriented + Fully-Automated run, ASO and AMASSS planted, elastix real.
+
+    The T1 comes back from 'ASO' centred on the origin, as the real one does; the
+    T2 keeps the far-off origin of a scan straight from the machine. That gap is
+    the whole point: it is what the original's recentring of the T2 hid.
+    """
+    fixed = phantom(origin=(-18.8, -18.8, -18.8))
+    moving, _truth = displaced(fixed)
+    moving.SetOrigin((60.0, 40.0, -110.0))
+    write(phantom(origin=(0.0, 0.0, -38.0)), tmp_path / "T1" / "P1_T1_scan.nii.gz")
+    write(moving, tmp_path / "T2" / "P1_T2_scan.nii.gz")
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        (out / "P1_T1_lm_Or.mrk.json").write_text('{"markups": []}')
+        sitk.WriteTransform(sitk.Euler3DTransform(), str(out / "P1_T1_Or_transform.tfm"))
+        (out / "ASO_report.json").write_text("{}")
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    # No AMASSS model and no ASO reference: both tools resolve their own. The
+    # frame is what AREG asks ASO for.
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    if sups is not None:
+        sups.append(sup)
+    run = dispatch.register(
+        t1_path=str(tmp_path / "T1"),
+        t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_ORIENTED,
+        regions=["Cranial base"],
+        orientation=catalogs.ORIENTATION_FRANKFURT,
+        output_dir=str(tmp_path / "out"),
+        sup=sup,
+        outputs=list(outputs),
+    )
+    return run, fixed
+
+
+def test_an_oriented_run_names_the_frame_and_none_of_its_neighbours_bundles(tmp_path):
+    """Every tool owns its model. ASO is asked for the frame by name and
+    handed none of its own reference bundles; AMASSS is asked for structures
+    and handed no weights. Each resolves its own from its own data folder."""
+    sups = []
+    _oriented_run(tmp_path, sups)
+    sup = sups[0]
+
+    (aso,) = [params for name, params in sup.calls if name == "ASO"]
+    assert aso["frame"] == "Frankfurt horizontal"
+    assert "reference" not in aso
+    # Empty: every landmark the frame's own reference defines, read by ASO.
+    assert aso["cbct_landmarks"] == []
+    (amasss,) = [params for name, params in sup.calls if name == "AMASSS"]
+    assert "model" not in amasss
+
+
+def test_a_bundle_the_caller_named_is_still_forwarded(tmp_path):
+    """An override, not the normal path: a reference or a segmentation model
+    named explicitly reaches the callee as named."""
+    fixed = phantom(origin=(-18.8, -18.8, -18.8))
+    moving, _truth = displaced(fixed)
+    write(fixed, tmp_path / "T1" / "P1_T1_scan.nii.gz")
+    write(moving, tmp_path / "T2" / "P1_T2_scan.nii.gz")
+    reference = tmp_path / "reference"
+    reference.mkdir()
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    dispatch.register(
+        t1_path=str(tmp_path / "T1"), t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+        orientation=catalogs.ORIENTATION_OCCLUSAL,
+        segmentation_model="/models/AMASSS", orientation_reference=str(reference),
+        output_dir=str(tmp_path / "out"), sup=sup,
+    )
+
+    sent = dict(sup.calls)
+    assert sent["ASO"]["reference"] == str(reference)
+    assert "frame" not in sent["ASO"]
+    assert sent["AMASSS"]["model"] == "/models/AMASSS"
+
+
+def test_an_oriented_run_moves_its_bar_forward_through_every_step(tmp_path, monkeypatch):
+    """ASO, then AMASSS, then the registration, each in its own slice and in
+    that order. Before the spans the bar showed each child's 0..1 and then
+    AREG's own, which reads as three runs starting over."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    sups = []
+
+    _oriented_run(tmp_path, sups)
+
+    assert sups[0].spans == [("ASO", (0.0, 0.25)), ("AMASSS", (0.25, 0.5))]
+    events = [json.loads(line) for line in events_file.read_text().splitlines()]
+    fractions = [event["fraction"] for event in events if "fraction" in event]
+    assert fractions == sorted(fractions)
+    # ASO, AMASSS, the pairing, the registrations starting, then the one
+    # registration done -- the pairing announced where the registration's
+    # slice starts, so a failure in it is not reported against "segmenting".
+    assert fractions == [0.0, 0.25, 0.5, 0.5, 1.0]
+
+
+def test_an_oriented_run_returns_the_t1_the_t2_was_registered_onto(tmp_path):
+    """The registered T2 is in the ORIENTED T1's frame, so it can only be read
+    next to that T1 -- which used to be thrown away with the supervisor's
+    scratch, leaving the caller a result and nothing to lay it over."""
+    run, _fixed = _oriented_run(tmp_path)
+    oriented = os.path.join(run.output_dir, dispatch.ORIENTED_DIRNAME)
+
+    assert sorted(os.listdir(oriented)) == [
+        "ASO_report.json", "P1_T1_Or.nii.gz", "P1_T1_Or_transform.tfm", "P1_T1_lm_Or.mrk.json",
+    ]
+    report = json.load(open(os.path.join(run.output_dir, dispatch.REPORT_NAME), encoding="utf-8"))
+    assert os.path.join(dispatch.ORIENTED_DIRNAME, "P1_T1_Or.nii.gz") in report["oriented"]
+
+
+def test_an_oriented_t1_is_listed_where_it_already_is_not_copied_again(tmp_path):
+    """The scene points at the copy under T1_Oriented/: a second copy of the
+    heaviest file of the run says nothing the first does not."""
+    run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_T1_SCAN])
+    folder = os.path.join(run.output_dir, "T2_Registered")
+    assert sorted(os.listdir(folder)) == [
+        "P1_T2_CB_Reg.nii.gz", "P1_T2_CB_Reg_scene.json", "P1_T2_CB_Reg_transform.tfm"]
+
+    with open(os.path.join(folder, "P1_T2_CB_Reg_scene.json")) as handle:
+        files = json.load(handle)["files"]
+    assert files[0] == {"path": "../T1_Oriented/P1_T1_Or.nii.gz", "kind": "volume",
+                        "role": "reference"}
+    assert all(entry["kind"] != "markups" for entry in files), "landmarks are their own option"
+    for entry in files:
+        assert os.path.isfile(os.path.join(folder, *entry["path"].split("/")))
+
+
+def test_the_orientation_landmarks_are_listed_beside_the_oriented_t1(tmp_path):
+    """Asked for, ASO's landmarks are in the scene where they already are,
+    under T1_Oriented/, in the oriented T1's space the T2 was registered into."""
+    run, _fixed = _oriented_run(tmp_path, outputs=[catalogs.OUTPUT_ORIENTATION_LANDMARKS])
+    with open(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_scene.json")) as handle:
+        files = json.load(handle)["files"]
+    assert files[0] == {"path": "../T1_Oriented/P1_T1_lm_Or.mrk.json", "kind": "markups",
+                        "role": "orientation landmarks"}
+
+
+def test_an_oriented_run_lists_no_t1_unless_asked(tmp_path):
+    run, _fixed = _oriented_run(tmp_path)
+    with open(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg_scene.json")) as handle:
+        roles = [entry["role"] for entry in json.load(handle)["files"]]
+    assert roles == ["registered", "registration"]
+
+
+@pytest.mark.parametrize("scan, landmarks", [
+    ("P1_T1_Or.nii.gz", "P1_T1_lm_Or.mrk.json"),
+    ("P1_Oriented.nrrd", "P1_lm_Oriented.mrk.json"),
+])
+def test_aso_landmarks_are_found_by_its_own_naming(scan, landmarks):
+    found = cbct_pipeline.oriented_landmarks(os.path.join("T1_Oriented", scan))
+    assert found == os.path.join("T1_Oriented", landmarks)
+
+
+def test_a_t2_far_from_the_oriented_t1_comes_back_whole_and_on_it(tmp_path):
+    """Resampled on the T2's grid as it stood, a T2 whose box does not surround
+    the oriented T1's overlapped it on a corner, and the rest came back empty --
+    on a clinical pair, seven eighths of the volume. The grid now goes where the
+    T2 landed: same size and spacing, and the T2 sits on the T1 it was
+    registered onto."""
+    run, fixed = _oriented_run(tmp_path)
+    registered = sitk.ReadImage(os.path.join(run.output_dir, "T2_Registered", "P1_T2_CB_Reg.nii.gz"), sitk.sitkFloat32)
+
+    on_t1 = sitk.GetArrayFromImage(sitk.Resample(registered, fixed, sitk.Transform(), sitk.sitkLinear, 0.0))
+    t1 = sitk.GetArrayFromImage(fixed)
+    # Whole, not a corner: the old grid kept one eighth. Not all of it either,
+    # because the phantom's displacement turns it by about two degrees and a
+    # turned cube's corners leave the T1's box -- 89 % of the voxels on the GPU
+    # engine, which finds that rotation (0.05 mm from the truth). elastix found
+    # almost none of it here (1.6 mm from the truth) and so kept more.
+    assert (on_t1 != 0).mean() > 0.85
+    assert np.corrcoef(t1.ravel(), on_t1.ravel())[0, 1] > 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +412,9 @@ def test_the_report_lists_what_the_run_produced_relative_to_the_output(semi_run)
     run, root = semi_run
     entry = run.patients["P1"]["regions"]["CB"]
     assert entry["outputs"] == sorted([
-        os.path.join("CB", "P1_CB_Reg.nii.gz"),
-        os.path.join("CB", "P1_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg.nii.gz"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_transform.tfm"),
+        os.path.join("T2_Registered", "P1_T2_CB_Reg_scene.json"),
     ])
     with open(os.path.join(run.output_dir, dispatch.REPORT_NAME), encoding="utf-8") as handle:
         assert root not in handle.read()
@@ -241,11 +463,15 @@ def test_a_label_the_mask_does_not_hold_fails_that_patient_only(tmp_path):
     """It used to fall through to using the WHOLE mask, so asking for label 4
     of a two-label mask registered on everything and reported success."""
     cohort(tmp_path, subjects=("P1", "P2"), size=32)
-    run = semi(tmp_path, segmentation_label=4)
-
-    assert run.succeeded == []
-    for key in ("P1", "P2"):
-        assert "no label 4" in run.patients[key]["regions"]["CB"]["reason"]
+    # Every subject fails on the same argument, so the run fails -- as the
+    # caller's input, with the reason in the error itself: the report holding
+    # the per-subject reasons is deleted with a failed job.
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path, segmentation_label=4)
+    message = str(raised.value)
+    assert message.startswith("0 of 2 subjects registered")
+    assert "no label 4" in message
+    assert "(2 of 2 registrations)" in message
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +519,11 @@ def test_a_subject_with_no_mask_says_how_to_name_one(tmp_path):
     cohort(tmp_path, size=32)
     os.remove(str(tmp_path / "masks" / "P1_T1_CB_seg.nii.gz"))
 
-    run = semi(tmp_path)
-    reason = run.patients["P1"]["regions"]["CB"]["reason"]
+    # Its only subject unregistered, the run fails -- and as the caller's
+    # input, since in Semi-Automated the masks are theirs to name.
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path)
+    reason = str(raised.value)
     assert "no Cranial base mask" in reason
     assert "mask/seg/pred" in reason
     assert "P1_T1_CB_seg.nii.gz" in reason
@@ -316,7 +545,7 @@ def test_a_second_run_does_not_take_the_first_ones_output_as_input(tmp_path):
     """`P1_CB_Reg.nii.gz` sorts before `P1_T2_scan.nii.gz`, so without the
     previous-output rule a re-run would register an already-registered scan."""
     cohort(tmp_path, size=16)
-    write(phantom(size=16), str(tmp_path / "T2" / "P1_CB_Reg.nii.gz"))
+    write(phantom(size=16), str(tmp_path / "T2" / "P1_T2_CB_Reg.nii.gz"))
 
     found = pairing.discover(str(tmp_path / "T2"), "Reg")
     assert os.path.basename(found["P1"]) == "P1_T2_scan.nii.gz"
@@ -329,9 +558,9 @@ def test_a_previous_output_is_still_usable_when_it_is_all_there_is(tmp_path):
     of the fixed `PATIENT_SUFFIXES` -- so both timepoints of a re-run carry it
     and still pair with each other.
     """
-    write(phantom(size=16), str(tmp_path / "T2" / "P1_CB_Reg.nii.gz"))
+    write(phantom(size=16), str(tmp_path / "T2" / "P1_T2_CB_Reg.nii.gz"))
     found = pairing.discover(str(tmp_path / "T2"), "Reg")
-    assert [os.path.basename(path) for path in found.values()] == ["P1_CB_Reg.nii.gz"]
+    assert [os.path.basename(path) for path in found.values()] == ["P1_T2_CB_Reg.nii.gz"]
 
 
 def test_a_subject_in_only_one_timepoint_is_named_in_the_report(tmp_path):
@@ -373,3 +602,399 @@ def test_a_single_file_input_becomes_a_folder_of_its_own(tmp_path):
         t2_path=str(both / "P1_T2_scan.nii.gz"),
     )
     assert run.succeeded == ["P1"]
+
+
+# ---------------------------------------------------------------------------
+# The mode, read off the request
+# ---------------------------------------------------------------------------
+# `automation` used to be a dropdown a clinician had to set, and setting it
+# wrong was silent: Fully-Automated over a folder of masks segmented again,
+# Semi-Automated over scans with none failed patient by patient. Each of the
+# three modes is identified by an INPUT, so the question never needed asking.
+# ASO closed the same hole first, for landmarks.
+
+
+def test_masks_make_it_semi_automated():
+    mode, source = dispatch.derive_automation(
+        catalogs.AUTOMATION_AUTO, "/somewhere/masks", None
+    )
+
+    assert mode == catalogs.AUTOMATION_SEMI
+    assert source == "from the data"
+
+
+def test_no_masks_makes_it_fully_automated():
+    mode, source = dispatch.derive_automation(catalogs.AUTOMATION_AUTO, None)
+
+    assert mode == catalogs.AUTOMATION_FULLY
+    assert source == "from the data"
+
+
+@pytest.mark.parametrize("frame", [
+    catalogs.ORIENTATION_FRANKFURT, catalogs.ORIENTATION_OCCLUSAL,
+])
+def test_naming_a_frame_is_what_picks_the_oriented_variant(frame):
+    """The one thing here no folder can answer, so it is asked by NAME.
+
+    Both frames select the oriented mode: they differ in WHERE the scans end up,
+    not in whether they are oriented."""
+    mode, source = dispatch.derive_automation(catalogs.AUTOMATION_AUTO, None, frame)
+
+    assert mode == catalogs.AUTOMATION_ORIENTED
+    assert source == "from the data"
+
+
+def test_leaving_the_scans_as_they_came_is_fully_automated():
+    assert dispatch.derive_automation(
+        catalogs.AUTOMATION_AUTO, None, catalogs.ORIENTATION_NONE
+    )[0] == catalogs.AUTOMATION_FULLY
+    # And the same for a caller that sends nothing at all, `main` being callable
+    # directly, where the signature's default does not apply.
+    assert dispatch.derive_automation(catalogs.AUTOMATION_AUTO, None, None)[0] == (
+        catalogs.AUTOMATION_FULLY
+    )
+
+
+def test_masks_win_over_asking_for_an_orientation():
+    """With masks in hand there is nothing to segment and nothing to orient
+    for, so the frame is not read."""
+    mode, _source = dispatch.derive_automation(
+        catalogs.AUTOMATION_AUTO, "/somewhere/masks", catalogs.ORIENTATION_FRANKFURT
+    )
+
+    assert mode == catalogs.AUTOMATION_SEMI
+
+
+def test_each_orientation_asks_aso_for_the_frame_aso_publishes():
+    """The bundles that define the frames are ASO's, so AREG names the frame
+    in ASO's own words and ASO resolves the bundle. Spelled out here rather
+    than imported: the two tools share no virtualenv."""
+    assert dispatch.ASO_FRAMES == {
+        catalogs.ORIENTATION_FRANKFURT: "Frankfurt horizontal",
+        catalogs.ORIENTATION_OCCLUSAL: "Occlusal plane",
+    }
+    # The frame that is no frame asks for nothing.
+    assert catalogs.ORIENTATION_NONE not in dispatch.ASO_FRAMES
+
+
+def test_the_orientation_reference_is_never_a_mode_signal():
+    """Measured through the server on 2026-09-29, after 113 unit tests had
+    passed on the opposite assumption.
+
+    `reference` carries `server_selectable = "model"`, so the server fills it
+    from `DATA/AREG/models/` whenever the client leaves it empty -- it is never
+    absent. Reading it as "the caller asked for an orientation" refused every
+    run that sent masks, for a reference nobody had named.
+
+    Asserted on the SIGNATURE, because that is what makes the mistake
+    impossible to make again: there is nowhere to pass it.
+    """
+    import inspect
+
+    assert list(inspect.signature(dispatch.derive_automation).parameters) == [
+        "automation", "t1_masks", "orientation",
+    ]
+
+
+@pytest.mark.parametrize("named", [
+    catalogs.AUTOMATION_SEMI, catalogs.AUTOMATION_FULLY, catalogs.AUTOMATION_ORIENTED,
+])
+def test_a_named_mode_overrides_the_data(named):
+    """The one thing naming a mode still does, and a legitimate thing to want:
+    "Fully-Automated" beside a folder of masks means "segment anyway, I know
+    they are there"."""
+    mode, source = dispatch.derive_automation(named, "/somewhere/masks")
+
+    assert mode == named
+    assert source == "requested"
+
+
+def test_the_report_says_whether_anybody_chose_the_mode(tmp_path):
+    """"Semi-Automated" in a report does not say whether it was asked for."""
+    cohort(tmp_path)
+    run = semi(tmp_path, automation=catalogs.AUTOMATION_AUTO)
+
+    assert run.report["automation"] == catalogs.AUTOMATION_SEMI
+    assert run.report["automation_source"] == "from the data"
+
+
+# ---------------------------------------------------------------------------
+# The orientation reference the deployment answers with
+# ---------------------------------------------------------------------------
+# `reference` is `server_selectable = "model"`, so a request that names no
+# bundle arrives holding `DATA/AREG/models/` -- the FOLDER, eight bundles deep,
+# which ASO cannot orient onto. The field is hidden and the tool answers.
+
+
+def test_the_models_folder_is_not_mistaken_for_a_named_bundle(tmp_path):
+    """The whole point: `main` has to tell "the caller named a bundle" from
+    "the server filled this in with the folder holding all of them". The
+    folder is "not named", and the frame answers."""
+    models = tmp_path / "data" / "AREG" / "models"
+    models.mkdir(parents=True)
+
+    assert dispatch._named_reference(str(models)) == ""
+    assert dispatch._named_reference(str(models) + os.sep) == ""
+    assert dispatch._named_reference("") == ""
+    assert dispatch._named_reference(None) == ""
+    assert dispatch._named_reference("/own/reference") == "/own/reference"
+
+
+def test_the_models_folder_the_server_fills_in_never_reaches_aso(tmp_path):
+    """Asserted through `main`, because the discrimination lives there -- and a
+    run that got the folder died inside ASO, minutes in, on a path that looks
+    perfectly valid."""
+    fixed = phantom(origin=(-18.8, -18.8, -18.8))
+    moving, _truth = displaced(fixed)
+    write(fixed, tmp_path / "T1" / "P1_T1_scan.nii.gz")
+    write(moving, tmp_path / "T2" / "P1_T2_scan.nii.gz")
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    sup = FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss})
+    dispatch.main(
+        automation=catalogs.AUTOMATION_AUTO,
+        t1=str(tmp_path / "T1"), t2=str(tmp_path / "T2"),
+        cbct_regions=["Cranial base"],
+        cbct_reference=str(tmp_path / "data" / "AREG" / "models"),
+        orientation=catalogs.ORIENTATION_OCCLUSAL,
+        output_dir=str(tmp_path / "out"), sup=sup,
+    )
+
+    sent = dict(sup.calls)
+    assert "reference" not in sent["ASO"]
+    assert sent["ASO"]["frame"] == "Occlusal plane"
+    assert "model" not in sent["AMASSS"]
+
+
+def test_the_orientation_reference_is_not_put_to_the_reader():
+    from sadt_areg_cbct.layout import LAYOUT
+
+    assert LAYOUT["reference"]["hidden"] is True
+
+
+def test_register_on_reads_like_the_amasss_lists():
+    """Three lists of anatomy in one panel should read alike."""
+    from sadt_areg_cbct.layout import LAYOUT
+
+    assert LAYOUT["regions"]["ui"] == "chips"
+    assert LAYOUT["segmentations"]["ui"] == "chips"
+    # And each chip says which folder its transforms come back in.
+    assert LAYOUT["regions"]["option_help"]["Cranial base"] == "CB"
+
+
+# ---------------------------------------------------------------------------
+# Failure, as the operator reads it
+# ---------------------------------------------------------------------------
+
+def _messages(caplog, level=None):
+    return [record.getMessage() for record in caplog.records
+            if record.name.startswith("sadt_areg_cbct")
+            and (level is None or record.levelname == level)]
+
+
+def test_a_failed_subject_is_logged_with_its_position_class_and_cause(tmp_path, caplog):
+    """The report holding the reason is deleted with a failed job, and an
+    operator never sees it anyway: the log line has to say which subject (by
+    position), which step, which exception and why -- and never the file."""
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    write(full_mask(phantom(size=24)), str(tmp_path / "masks" / "P2_T1_CB_seg.nii.gz"))
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    run = semi(tmp_path)
+
+    assert run.succeeded == ["P1"]
+    warnings = _messages(caplog, "WARNING")
+    failed = [line for line in warnings if line.startswith("subject ")]
+    assert failed == [failed[0]]
+    assert failed[0].startswith("subject 2 of 2: Cranial base registration failed (")
+    assert "RegistrationError: " in failed[0] and "not the same sampling" in failed[0]
+    assert all("P2" not in line and ".nii" not in line for line in _messages(caplog))
+    # Partial: the summary is a warning, and counts both sides.
+    assert any("1 of 2 subjects registered, 1 failed" in line for line in warnings)
+
+
+def test_a_complete_run_summarises_at_info(tmp_path, caplog):
+    cohort(tmp_path, size=32)
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+    semi(tmp_path)
+    summary = [r for r in caplog.records if "subjects registered" in r.getMessage()]
+    assert [r.levelname for r in summary] == ["INFO"]
+    assert "1 of 1 subjects registered, 0 failed" in summary[0].getMessage()
+
+
+def test_a_run_where_the_engine_failed_everyone_is_a_server_error(tmp_path, monkeypatch):
+    """Not an archive with nothing in it, and not the caller's fault."""
+    from sadt_areg_cbct import elastix, gpu_rigid
+    # The engine that fails here is elastix: keep the card out of it.
+    monkeypatch.setattr(gpu_rigid, "available", lambda: False)
+
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+
+    def broken(fixed, moving, cost=None):
+        raise RuntimeError("elastix rigid registration failed: too few samples")
+
+    monkeypatch.setattr(elastix, "register", broken)
+    with pytest.raises(RuntimeError) as raised:
+        semi(tmp_path)
+    assert not isinstance(raised.value, ValueError)
+    message = str(raised.value)
+    assert message.startswith("0 of 2 subjects registered; most common failure: RuntimeError: ")
+    assert "too few samples (2 of 2 registrations)" in message
+    # Not chained: the registrations run in spawned workers, and only their
+    # description comes back -- which is why the cause is in the message.
+
+
+def test_one_server_fault_among_input_faults_keeps_it_a_server_error(tmp_path, monkeypatch):
+    """ToolInputError is "your fault"; that is only true when ALL of it was."""
+    from sadt_areg_cbct import elastix, gpu_rigid
+    # The engine that fails here is elastix: keep the card out of it.
+    monkeypatch.setattr(gpu_rigid, "available", lambda: False)
+
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    os.remove(str(tmp_path / "masks" / "P2_T1_CB_seg.nii.gz"))
+    monkeypatch.setattr(elastix, "register",
+                        lambda fixed, moving, cost=None: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError) as raised:
+        semi(tmp_path)
+    assert not isinstance(raised.value, ToolInputError)
+
+
+def test_the_pairing_counts_are_logged_and_announced(tmp_path, caplog, monkeypatch):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    cohort(tmp_path, subjects=("P1",), size=32)
+    write(phantom(size=32), str(tmp_path / "T2" / "P9_T2_scan.nii.gz"))
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    semi(tmp_path)
+
+    assert "paired 1 subject(s); 0 T1-only, 1 T2-only" in _messages(caplog, "WARNING")
+    messages = [json.loads(line).get("message") for line in events_file.read_text().splitlines()]
+    assert messages[0] == "pairing timepoints"
+
+
+def test_the_pairing_rule_is_said_in_words(tmp_path):
+    """An example file name reaches the operator redacted to a placeholder."""
+    write(phantom(size=16), str(tmp_path / "T1" / "alpha_T1.nii.gz"))
+    write(phantom(size=16), str(tmp_path / "T2" / "beta_T2.nii.gz"))
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path, t1_masks_path=str(tmp_path / "T1"))
+    message = str(raised.value)
+    assert "timepoint token" in message
+    assert ".nii" not in message and "P1" not in message
+
+
+def test_a_subject_the_segmentation_dropped_is_counted(tmp_path, caplog):
+    """AMASSS skipping a scan does not fail; it leaves a subject without a mask,
+    which further down reads like a naming problem. Said per region, counted."""
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    fixed = sitk.ReadImage(str(tmp_path / "T1" / "P1_T1_scan.nii.gz"))
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_scan_Seg_SegOut" / "P1_T1_scan_Seg_CBMASK.nii.gz")
+        return out
+
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+    run = dispatch.register(
+        t1_path=str(tmp_path / "T1"), t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_FULLY, regions=["Cranial base"],
+        segmentation_model="/models/AMASSS", output_dir=str(tmp_path / "out"),
+        sup=FakeSup(tmp_path, {"AMASSS": amasss}),
+    )
+    assert run.succeeded == ["P1"]
+    assert "AMASSS produced no Cranial base mask for 1 of 2 subjects" in _messages(caplog, "WARNING")
+
+
+def test_a_scan_orientation_dropped_is_counted_before_the_pairing(tmp_path, caplog):
+    cohort(tmp_path, subjects=("P1", "P2"), size=32)
+    fixed = sitk.ReadImage(str(tmp_path / "T1" / "P1_T1_scan.nii.gz"))
+
+    def aso(params):
+        out = tmp_path / "aso"
+        write(fixed, out / "P1_T1_Or.nii.gz")
+        (out / "P1_T1_lm_Or.mrk.json").write_text('{"markups": []}')
+        return out
+
+    def amasss(params):
+        out = tmp_path / "amasss"
+        write(full_mask(fixed), out / "P1_T1_Or_Seg_SegOut" / "P1_T1_Or_Seg_CBMASK.nii.gz")
+        return out
+
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+    dispatch.register(
+        t1_path=str(tmp_path / "T1"), t2_path=str(tmp_path / "T2"),
+        automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+        segmentation_model="/models/AMASSS", orientation_reference=str(reference),
+        output_dir=str(tmp_path / "out"),
+        sup=FakeSup(tmp_path, {"ASO": aso, "AMASSS": amasss}),
+    )
+    warnings = _messages(caplog, "WARNING")
+    assert any(line.startswith("ASO returned 1 of 2 oriented T1 scans") for line in warnings)
+    assert "paired 1 subject(s); 0 T1-only, 1 T2-only" in warnings
+
+
+def test_dicom_conversion_is_announced_and_its_failure_names_the_argument(tmp_path, monkeypatch):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    cohort(tmp_path, size=16)
+
+    with pytest.raises(ToolInputError) as raised:
+        semi(tmp_path, dicom_input=True)
+    assert "No DICOM series found in 't1'" in str(raised.value)
+    messages = [json.loads(line).get("message") for line in events_file.read_text().splitlines()]
+    assert messages[-1] == "converting DICOM (T1)"
+
+
+def test_no_segmentation_bundle_is_required_of_the_caller():
+    """There is one AMASSS model and AMASSS resolves it; the request is not
+    refused for a field nobody is meant to fill."""
+    assert dispatch._check_cbct(
+        automation=catalogs.AUTOMATION_FULLY, regions=["Cranial base"],
+        t1_masks=None, reference=None, sup=FakeSup("/tmp/areg-rules"),
+    ) is None
+
+
+def test_an_oriented_run_with_a_frame_needs_no_reference():
+    assert dispatch._check_cbct(
+        automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+        t1_masks=None, reference=None, sup=FakeSup("/tmp/areg-rules"),
+        frame="Frankfurt horizontal",
+    ) is None
+
+
+def test_the_missing_frame_names_the_arguments_not_an_endpoint():
+    with pytest.raises(ToolInputError) as raised:
+        dispatch._check_cbct(
+            automation=catalogs.AUTOMATION_ORIENTED, regions=["Cranial base"],
+            t1_masks=None, reference=None, sup=FakeSup("/tmp/areg-rules"),
+        )
+    message = str(raised.value)
+    assert "'orientation'" in message and "'reference'" in message
+    assert "/" not in message
+
+
+def test_an_unreadable_reference_markups_file_is_warned_about(tmp_path, caplog):
+    from sadt_areg_cbct import tools
+
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    (reference / "frame_Or.mrk.json").write_text("{not json")
+    caplog.set_level("INFO", logger="sadt_areg_cbct")
+
+    assert tools.reference_landmarks(str(reference)) == []
+    warnings = _messages(caplog, "WARNING")
+    assert len(warnings) == 1
+    assert warnings[0].startswith("orientation reference: markups file 1 of 1 could not be read (JSONDecodeError: ")
+    assert "frame_Or" not in warnings[0]

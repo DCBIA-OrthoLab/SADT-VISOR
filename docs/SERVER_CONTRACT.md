@@ -364,7 +364,7 @@ asked:
 - **The callee is selected by VENV.** `sup.run` looks up
   `<TOOLS_DIR>/<name>/.venv/bin/python` and execs it, so the callee gets its own
   interpreter and its own dependency set. Nesting is the same recursion:
-  `AREG → ASO → ALI_CBCT` needs no special case.
+  `VFACE → AREG_CBCT → ASO → ALI_CBCT` needs no special case.
 - **Absolute paths and a neutral working directory.** Each nested call gets its
   own job directory under `<job>/sup/NN_<tool>/`, and runs with that as `cwd`.
 - **The scratch is `sup.tmp`**, a sibling of `output/` inside the job directory,
@@ -385,6 +385,13 @@ errors a tool author will read:
   for one that is already above it fails immediately, naming the chain, rather
   than after starting four processes. `MAX_SUPERVISOR_DEPTH` (5) is only the
   backstop for a chain that grows without repeating.
+
+  **It has one level of headroom left, and it used to have three.** `VFACE`
+  drives six tools and two of them are supervised in their own right, so
+  `VFACE → AREG_CBCT → ASO → ALI_CBCT` is four deep. A tool added above VFACE,
+  or a fifth level inside any of those, hits the cap -- and hits it as a refusal
+  partway through a run rather than at admission. Worth raising deliberately if
+  another orchestrating tool arrives, rather than discovering it on a cohort.
 - **A failing child carries its reason up.** The parent reads the child's
   `result.json` and raises with the child's own `type` and `message`, because
   "see the output above" is a promise a nested process cannot keep.
@@ -424,13 +431,12 @@ piece of this list outstanding.
 
 ## 7. Two things to know before you start
 
-- **CrownSeg does not currently run, and did not before the migration.**
-  `shapeaxi.dental_model_seg` reads `DentalModelSeg` off `shapeaxi.saxi_nets`,
-  but in the whole 2.0.x line the class lives in `shapeaxi.saxi_nets_lightning`.
-  The pre-port tool fails the same way on the deployed image. This repository
-  carries a two-line workaround (`_restore_moved_class`) guarded so it vanishes
-  when upstream fixes it. Anything downstream of crown segmentation -- ALI's IOS
-  half, the IOS modes of ASO/AREG/FlexReg -- has been broken on the current image.
+- **CrownSeg needs shapeaxi 2.0.3 or later.** From 2.0.0 to 2.0.2,
+  `shapeaxi.dental_model_seg` read `DentalModelSeg` off `shapeaxi.saxi_nets`
+  while the class lived in `shapeaxi.saxi_nets_lightning`, so the tool failed
+  before touching a mesh, the pre-port one included. This repository carried a
+  workaround for it until 2.0.3 fixed the lookup upstream; the pin now asks for
+  that release and the workaround is gone.
 - **Disk.** Each torch venv is 7.2-7.7 GB at cu128. Deduplication across them is
   not automatic and depends on `UV_CACHE_DIR` sitting on the same filesystem as
   the venvs; see the repository README.

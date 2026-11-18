@@ -150,7 +150,7 @@ that already has the points does not spend a GPU re-predicting them.
 
 | | |
 |---|---|
-| Inputs | `input`: one scan (`.nii`/`.nii.gz`/`.nrrd`/`.nrrd.gz`/`.gipl`/`.gipl.gz`), one mesh (`.vtk`/`.stl`), or a folder of either. `reference`: the already-oriented case defining the target frame. `output_dir`: where results go. |
+| Inputs | `input`: one scan (`.nii`/`.nii.gz`/`.nrrd`/`.nrrd.gz`/`.gipl`/`.gipl.gz`), one mesh (`.vtk`/`.stl`), or a folder of either. `reference`: the already-oriented case defining the target frame -- optional: left empty, ASO uses its own bundles from `DATA/ASO/models/`. `frame`: the CBCT frame by name (`Frankfurt horizontal`, `Occlusal plane`), which is how another tool asks for an orientation without holding ASO's references; `cbct_landmarks` sent empty then means the frame's own landmarks. `output_dir`: where results go. |
 | Outputs | Per patient: the oriented scan or mesh, its landmarks (`_lm_Or.mrk.json`) and the transform (`_Or_transform.tfm`), mirroring the input tree, plus `ASO_report.json`. |
 | Model files | None for three of the four modes -- a *reference bundle* is data, not weights. Fully-automated CBCT needs ALI's bundle, named in `landmark_model` and passed straight through. Both `reference` and `landmark_model` are named so the server publishes them as hosted names rather than uploads. |
 | GPU | None. This is the one migrated tool with no torch in it; the venv is 1.2 GB. |

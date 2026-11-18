@@ -151,6 +151,82 @@ def test_run_accepts_the_old_display_names(tmp_path, stub_predictor):
 
 
 # ---------------------------------------------------------------------------
+# Its own bundle, when nobody names one
+# ---------------------------------------------------------------------------
+
+def test_with_no_model_named_it_segments_with_its_own_staged_bundle(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """What a neighbour calling through the supervisor relies on: it asks for
+    structures and names no weights, and AMASSS finds its single bundle under
+    its own data folder."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    data_root = tmp_path / "DATA"
+    own = _make_model_bundle(data_root / "AMASSS" / "models" / "AMASSS_Models", ["MAND"])
+    used = []
+    real_resolve = pipeline.resolve_models
+    monkeypatch.setattr(
+        pipeline, "resolve_models",
+        lambda model_path, structures: used.append(str(model_path))
+        or real_resolve(model_path, structures),
+    )
+
+    output = run(scans=tmp_path / "input", output_dir=tmp_path / "out",
+                 structures=["MAND"], data_root=data_root)
+
+    assert used == [own]
+    assert (output / "patient01_Pred_SegOut" / "patient01_Pred_MAND.nii.gz").is_file()
+
+
+def test_a_named_model_still_wins_over_its_own_bundle(tmp_path, stub_predictor, monkeypatch):
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    data_root = tmp_path / "DATA"
+    _make_model_bundle(data_root / "AMASSS" / "models" / "AMASSS_Models", ["MAND"])
+    named = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+    used = []
+    real_resolve = pipeline.resolve_models
+    monkeypatch.setattr(
+        pipeline, "resolve_models",
+        lambda model_path, structures: used.append(str(model_path))
+        or real_resolve(model_path, structures),
+    )
+
+    run(scans=tmp_path / "input", model=Path(named), output_dir=tmp_path / "out",
+        structures=["MAND"], data_root=data_root)
+
+    assert used == [named]
+
+
+def test_with_no_model_and_no_bundle_staged_it_says_what_to_install(tmp_path):
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    (tmp_path / "DATA" / "AMASSS" / "models").mkdir(parents=True)
+
+    with pytest.raises(ToolInputError, match="AMASSS_Models") as caught:
+        run(scans=tmp_path / "input", output_dir=tmp_path / "out",
+            data_root=tmp_path / "DATA")
+    assert "setup-models" in str(caught.value)
+
+
+def test_with_no_model_and_no_data_root_it_refuses_clearly(tmp_path):
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+
+    with pytest.raises(ToolInputError, match="No 'model' given"):
+        run(scans=tmp_path / "input", output_dir=tmp_path / "out")
+
+
+def test_model_is_optional_and_data_root_is_injected_not_published():
+    """Optional so a supervised call may omit it; `data_root` keyword-only and
+    unannotated, which is the shape the runner injects and `describe.py`
+    keeps out of the schema."""
+    import inspect
+
+    parameters = inspect.signature(run).parameters
+    assert parameters["model"].default == ""
+    assert parameters["data_root"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["data_root"].annotation is inspect.Parameter.empty
+
+
+# ---------------------------------------------------------------------------
 # split_scan_extension / is_previous_output
 # ---------------------------------------------------------------------------
 
@@ -178,10 +254,27 @@ def test_split_scan_extension(filename, expected):
         # A legitimate scan whose name merely contains MASK is NOT an output:
         # the original CLI's blunt `'MASK' not in f` filter dropped it.
         ("MASKED_patient.nii.gz", False),
+        # The Slicer module's output, under a prediction id other than ours.
+        ("patient01_T1_Or_CBMASK-Seg_Pred.nii.gz", True),
+        ("patient01_T1_Or_MAXMASK-Seg_seg.nii.gz", True),
+        ("patient01_MAND-Seg.nii.gz", True),
+        ("patient01_T1_Or.nii.gz", False),
     ],
 )
 def test_is_previous_output(filename, expected):
     assert pipeline.is_previous_output(filename, "Pred") is expected
+
+
+def test_masks_kept_beside_a_scan_are_not_discovered_as_scans(tmp_path):
+    # The layout of a semi-automated AREG case, segmented under AREG's own id.
+    scan = tmp_path / "patient01_T1_Or.nii.gz"
+    scan.write_bytes(b"")
+    masks = tmp_path / "patient01_T1_Or_SegOut"
+    masks.mkdir()
+    for code in ("CBMASK", "MANDMASK", "MAXMASK"):
+        (masks / f"patient01_T1_Or_{code}-Seg_Pred.nii.gz").write_bytes(b"")
+
+    assert pipeline.discover_scans(str(tmp_path), "seg") == [str(scan)]
 
 
 def test_discover_scans_excludes_previous_outputs(tmp_path):
@@ -299,7 +392,7 @@ def test_segment_batch_merged_and_separate(tmp_path, stub_predictor):
         prediction_ID="Pred",
     )
 
-    assert report["summary"] == {"total": 2, "processed": 2, "failed": 0}
+    assert report["summary"] == {"total": 2, "processed": 2, "failed": 0, "partial": 0}
     assert sorted(os.path.basename(p) for p in segmentation_files(report)) == [
         "patient01_Pred_MAND.nii.gz",
         "patient01_Pred_MAX.nii.gz",
@@ -764,7 +857,7 @@ def test_real_models_segment_a_real_scan(tmp_path):
     with open(output / "AMASSS_report.json") as handle:
         report = json.load(handle)
 
-    assert report["summary"] == {"total": 1, "processed": 1, "failed": 0}
+    assert report["summary"] == {"total": 1, "processed": 1, "failed": 0, "partial": 0}
     assert report["predicted_structures"] == ["MAND", "MAX", "CB"]
     assert report["device"].startswith("cuda")
     assert report["gpu_resampling"] is True
@@ -824,6 +917,10 @@ def test_progress_counts_structures_because_that_is_what_the_run_loops_over(
     """
     events_file = tmp_path / "events.jsonl"
     monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    # The masks counted between completions are pinned by the test below; the
+    # watcher is kept out of this one so its exact sequence cannot depend on
+    # how fast the stub writes.
+    monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 3600.0)
     _write_scan(tmp_path / "input" / "patient01.nii.gz")
     _write_scan(tmp_path / "input" / "patient02.nii.gz")
     bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
@@ -838,9 +935,11 @@ def test_progress_counts_structures_because_that_is_what_the_run_loops_over(
     )
 
     events = [json.loads(line) for line in
-              Path(events_file).read_text().splitlines() if line]
+              Path(events_file).read_text().splitlines()
+              if line and json.loads(line).get("kind") != "log"]
     assert [event["message"] for event in events] == [
         "reading scan 1 of 2", "reading scan 2 of 2",
+        "predicting 2 structure(s)",
         "structure 1 of 2", "structure 2 of 2",
         "writing scan 1 of 2", "writing scan 2 of 2",
     ]
@@ -848,6 +947,105 @@ def test_progress_counts_structures_because_that_is_what_the_run_loops_over(
     assert fractions == sorted(fractions), "the bar must not restart per phase"
     assert max(fractions) < 1.0, "the run is not finished until the server says so"
     assert not any("patient" in event["message"] for event in events)
+
+
+def test_the_bar_moves_inside_a_structure_as_its_masks_are_written(
+    tmp_path, monkeypatch
+):
+    """One nnUNet call per structure covers the whole cohort and says nothing
+    on the way, but it writes each case's mask as soon as that case is done.
+    Counting those masks across every structure is a count of (structure,
+    scan) pairs finished -- never an estimate -- so the bar moves through each
+    structure instead of sitting still for its whole length, and never runs
+    ahead of, or back behind, the completions reported beside it.
+    """
+    import time
+
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    monkeypatch.setattr(pipeline, "WATCH_INTERVAL", 0.01)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested: "cpu")
+    total_masks = 4
+    written = []
+
+    def one_case_at_a_time(model_folder, input_dir, output_dir, device, **kwargs):
+        os.makedirs(output_dir, exist_ok=True)
+        for name in sorted(os.listdir(input_dir)):
+            if not name.endswith("_0000.nii.gz"):
+                continue
+            case_id = name[: -len("_0000.nii.gz")]
+            reference = sitk.ReadImage(os.path.join(input_dir, name))
+            array = np.zeros(sitk.GetArrayFromImage(reference).shape, dtype=np.uint8)
+            array[2:5, 2:5, 2:5] = 1
+            mask = sitk.GetImageFromArray(array)
+            mask.CopyInformation(reference)
+            sitk.WriteImage(mask, os.path.join(output_dir, f"{case_id}.nii.gz"))
+            written.append(case_id)
+            if len(written) == total_masks:
+                continue
+            # Wait for the watcher to have seen this mask, so the sequence
+            # below does not depend on how fast this machine is.
+            wanted = f"mask {len(written) + 1} of {total_masks}"
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and wanted not in events_file.read_text():
+                time.sleep(0.01)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", one_case_at_a_time)
+    _write_scan(tmp_path / "input" / "Smith_John.nii.gz")
+    _write_scan(tmp_path / "input" / "Jones_Mary.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+        device="cpu",
+    )
+
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    events = [record for record in records if record.get("kind") != "log"]
+    assert [event["message"] for event in events] == [
+        "reading scan 1 of 2", "reading scan 2 of 2",
+        "predicting 2 structure(s)",
+        "mask 2 of 4", "mask 3 of 4", "structure 1 of 2",
+        "mask 4 of 4", "structure 2 of 2",
+        "writing scan 1 of 2", "writing scan 2 of 2",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions), "the two counts must not fight"
+    assert all(0.1 <= event["fraction"] < 0.9 for event in events
+               if event["message"].startswith(("mask", "structure")))
+    assert [record for record in records if record.get("kind") == "log"] == []
+    text = events_file.read_text()
+    assert "Smith" not in text and "Jones" not in text
+
+
+def test_a_structure_with_no_model_is_logged_to_the_clinician(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """Asked for and not delivered: the report lists it, and the panel says so
+    at the time, by the structure's code -- which names anatomy, not a patient."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    report = pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX"),
+        merge=("SEPARATE",),
+    )
+
+    assert report["structures_without_model"] == ["MAX"]
+    logs = [json.loads(line) for line in events_file.read_text().splitlines()
+            if line and json.loads(line).get("kind") == "log"]
+    assert [(log["level"], log["audience"], log["message"]) for log in logs] == [
+        ("warning", "user", "no model is installed for MAX; it was not segmented"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -885,17 +1083,66 @@ def test_a_scan_that_cannot_be_read_is_logged_by_position(
 
     messages = [record.getMessage() for record in caplog.records]
     assert "Skipping 1 file(s) that look like a previous AMASSS output" in messages
-    assert any(m.startswith("Could not read scan ") and m.endswith(" of 2")
+    assert any(m.startswith("scan ") and " of 2: reading failed (" in m
                for m in messages), messages
     assert not any("Smith_John" in m or "Jones_Mary" in m for m in messages), messages
     assert [scan["input"] for scan in report["cases"] if scan["status"] == "failed"] \
         == ["Jones_Mary_T2.nii.gz"], "the report still names it"
 
 
-def test_a_missing_prediction_is_logged_by_case_id(tmp_path, monkeypatch, caplog):
-    """`p_001` is the scan's position in the batch AND what nnUNet read and
-    wrote, so it is both the safe half of the old line and the useful one."""
+def test_a_missing_mask_is_logged_by_position_and_marks_the_scan_partial(
+    tmp_path, monkeypatch, caplog
+):
+    """The case id `p_001` reaches the operator as `<id>`; the position does
+    not. And a scan written without one of its structures says so in the
+    report, not only in a log line."""
 
+    def predict_max_for_the_first_case_only(model_folder, input_dir, output_dir,
+                                            device, **kwargs):
+        os.makedirs(output_dir, exist_ok=True)
+        names = sorted(n for n in os.listdir(input_dir) if n.endswith("_0000.nii.gz"))
+        if "MAX" in model_folder:
+            names = names[:1]
+        for name in names:
+            reference = sitk.ReadImage(os.path.join(input_dir, name))
+            array = np.zeros(sitk.GetArrayFromImage(reference).shape, dtype=np.uint8)
+            array[2:5, 2:5, 2:5] = 1
+            mask = sitk.GetImageFromArray(array)
+            mask.CopyInformation(reference)
+            sitk.WriteImage(mask, os.path.join(
+                output_dir, name[: -len("_0000.nii.gz")] + ".nii.gz"))
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", predict_max_for_the_first_case_only)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested: "cpu")
+    _write_scan(tmp_path / "input" / "Adams_Ann_T1.nii.gz")
+    _write_scan(tmp_path / "input" / "Zulu_Zoe_T2.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    with caplog.at_level(logging.INFO, logger="sadt_amasss"):
+        report = pipeline.segment(
+            input_path=str(tmp_path / "input"),
+            model_path=bundle,
+            output_dir=str(tmp_path / "out"),
+            structures=("MAND", "MAX"),
+            merge=("SEPARATE",),
+            prediction_ID="Pred",
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "scan 2 of 2 has no MAX mask; written without it" in messages, messages
+    assert not any("p_00" in m for m in messages), messages
+    assert not any("Zulu_Zoe" in m or "Adams_Ann" in m for m in messages), messages
+    assert report["summary"] == {"total": 2, "processed": 2, "failed": 0, "partial": 1}
+    assert report["cases"][1]["partial"] is True
+    assert report["cases"][1]["structures_missing"] == ["MAX"]
+    assert "partial" not in report["cases"][0]
+    summary = [r for r in caplog.records if r.getMessage().startswith("2 of 2 scans segmented")]
+    assert [r.levelno for r in summary] == [logging.WARNING], messages
+
+
+def test_a_scan_with_no_mask_at_all_is_logged_with_position_and_class(
+    tmp_path, monkeypatch, caplog
+):
     def predict_only_the_first_case(model_folder, input_dir, output_dir, device, **kwargs):
         os.makedirs(output_dir, exist_ok=True)
         name = sorted(n for n in os.listdir(input_dir) if n.endswith("_0000.nii.gz"))[0]
@@ -912,8 +1159,8 @@ def test_a_missing_prediction_is_logged_by_case_id(tmp_path, monkeypatch, caplog
     _write_scan(tmp_path / "input" / "Zulu_Zoe_T2.nii.gz")
     bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
 
-    with caplog.at_level(logging.INFO, logger="sadt_amasss.pipeline"):
-        pipeline.segment(
+    with caplog.at_level(logging.INFO, logger="sadt_amasss"):
+        report = pipeline.segment(
             input_path=str(tmp_path / "input"),
             model_path=bundle,
             output_dir=str(tmp_path / "out"),
@@ -923,9 +1170,205 @@ def test_a_missing_prediction_is_logged_by_case_id(tmp_path, monkeypatch, caplog
         )
 
     messages = [record.getMessage() for record in caplog.records]
-    assert "No MAND prediction for p_001" in messages, messages
-    assert "Failed to assemble outputs for scan 2 of 2" in messages, messages
+    assert ("scan 2 of 2: writing outputs failed (RuntimeError: nnUNet wrote no mask "
+            "for this scan for any of 1 structure(s))") in messages, messages
     assert not any("Zulu_Zoe" in m or "Adams_Ann" in m for m in messages), messages
+    assert "Zulu_Zoe" not in report["cases"][1]["error"]
+    summary = [r for r in caplog.records if r.getMessage().startswith("1 of 2 scans segmented, 1 failed")]
+    assert [r.levelno for r in summary] == [logging.WARNING], messages
+
+
+def test_no_scan_segmented_raises_a_runtime_error_with_the_commonest_cause(
+    tmp_path, monkeypatch
+):
+    """Every scan readable, none written: the server's fault, so not an input
+    error -- and the message leads with the count and the cause."""
+
+    def predict_nothing(model_folder, input_dir, output_dir, device, **kwargs):
+        os.makedirs(output_dir, exist_ok=True)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", predict_nothing)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested: "cpu")
+    _write_scan(tmp_path / "input" / "a.nii.gz")
+    _write_scan(tmp_path / "input" / "b.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    with pytest.raises(RuntimeError) as caught:
+        pipeline.segment(
+            input_path=str(tmp_path / "input"), model_path=bundle,
+            output_dir=str(tmp_path / "out"), structures=("MAND",), merge=("SEPARATE",),
+        )
+
+    assert not isinstance(caught.value, ValueError)
+    assert str(caught.value) == (
+        "0 of 2 scans segmented; most common failure: RuntimeError: nnUNet wrote no "
+        "mask for this scan for any of 1 structure(s) (2 of 2)"
+    )
+
+
+def test_no_structure_predicted_raises_with_the_commonest_cause(
+    tmp_path, monkeypatch, caplog
+):
+    def boom(model_folder, input_dir, output_dir, device, **kwargs):
+        raise RuntimeError("nnUNet prediction failed on cpu (MemoryError: out of RAM)")
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", boom)
+    monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested: "cpu")
+    _write_scan(tmp_path / "input" / "a.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    with caplog.at_level(logging.INFO, logger="sadt_amasss"), \
+            pytest.raises(RuntimeError) as caught:
+        pipeline.segment(
+            input_path=str(tmp_path / "input"), model_path=bundle,
+            output_dir=str(tmp_path / "out"), structures=("MAND", "MAX"),
+            merge=("SEPARATE",),
+        )
+
+    assert str(caught.value).startswith(
+        "0 of 2 structures predicted; most common failure: RuntimeError: nnUNet "
+        "prediction failed on cpu (MemoryError: out of RAM) (2 of 2)"
+    )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(m.startswith("structure 1 of 2 (")
+               and "prediction failed (RuntimeError: nnUNet prediction" in m
+               for m in messages), messages
+
+
+def test_no_readable_scan_stays_an_input_error_with_the_commonest_cause(tmp_path):
+    (tmp_path / "input").mkdir()
+    (tmp_path / "input" / "a.nii.gz").write_bytes(b"not a volume")
+    (tmp_path / "input" / "b.nii.gz").write_bytes(b"not a volume")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    with pytest.raises(ToolInputError, match=r"^0 of 2 scans could be read .*\(2 of 2\)$"):
+        pipeline.segment(
+            input_path=str(tmp_path / "input"), model_path=bundle,
+            output_dir=str(tmp_path / "out"), structures=("MAND",), merge=("SEPARATE",),
+            device="cpu",
+        )
+
+
+def test_input_errors_name_the_argument_and_no_path(tmp_path):
+    with pytest.raises(FileNotFoundError) as missing:
+        pipeline.discover_scans(str(tmp_path / "nowhere"), "Pred")
+    assert str(missing.value) == "'scans' path does not exist"
+
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError) as empty:
+        pipeline.discover_scans(str(tmp_path / "empty"), "Pred")
+    assert "'scans' folder" in str(empty.value)
+    assert str(tmp_path) not in str(empty.value)
+    # No dotted suffix: the redaction would read ".nii.gz" as a file name.
+    assert ".nii" not in str(empty.value) and "nii, nrrd, gipl" in str(empty.value)
+
+    with pytest.raises(FileNotFoundError) as model:
+        pipeline.resolve_models(str(tmp_path / "nowhere"), ("MAND",))
+    assert str(model.value) == "'model' path is not a directory"
+
+
+def test_no_model_says_why_in_words_per_structure(tmp_path, caplog):
+    bundle = tmp_path / "bundle"
+    (bundle / "MAX" / "D1" / "t__nnUNetPlans__3d_fullres").mkdir(parents=True)
+    (bundle / "CB").mkdir()
+
+    with caplog.at_level(logging.INFO, logger="sadt_amasss"), \
+            pytest.raises(nnunet_runner.ModelNotFoundError) as caught:
+        pipeline.resolve_models(str(bundle), ("MAND", "MAX", "CB"))
+
+    message = str(caught.value)
+    assert message.startswith(
+        "No usable nnUNet model for any requested structure (MAND: folder missing; "
+        "MAX: no fold-0 final checkpoint under the 3d_fullres plans folder; "
+        "CB: no 3d_fullres plans folder)"
+    )
+    assert "/" not in message and str(bundle) not in message
+    messages = [record.getMessage() for record in caplog.records]
+    assert "structure MAND has no usable model (folder missing); it is skipped" in messages
+
+
+def test_predict_folder_runs_in_process_on_the_cpu_and_names_the_failure(
+    tmp_path, monkeypatch
+):
+    """`predict_from_files` on the CPU fans out to worker processes whose
+    death reads only "Background workers died"; the sequential path raises
+    the real error in this process."""
+    calls = []
+
+    class FakePredictor:
+        configuration_manager = None
+
+        def initialize_from_trained_model_folder(self, *args, **kwargs):
+            pass
+
+        def predict_from_files(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("worker-process path used")
+
+        def predict_from_files_sequential(self, *args, **kwargs):
+            calls.append(kwargs)
+            raise MemoryError("Unable to allocate 4.00 GiB\nfor an array")
+
+    monkeypatch.setattr(nnunet_runner, "_build_predictor", lambda *a, **k: FakePredictor())
+
+    with pytest.raises(RuntimeError) as caught:
+        nnunet_runner.predict_folder("model", str(tmp_path), str(tmp_path / "out"), "cpu",
+                                     tile_step_size=0.5, gpu_resampling=True)
+
+    assert len(calls) == 1
+    assert str(caught.value) == "nnUNet prediction failed on cpu (MemoryError: for an array)"
+    assert isinstance(caught.value.__cause__, MemoryError)
+
+
+def test_the_card_with_scipy_resamplers_keeps_the_workers_and_names_their_death(
+    tmp_path, monkeypatch
+):
+    """There the workers overlap resampling with inference, so they stay; a
+    dead one is then reported with its usual cause, since its own error went
+    to a stderr nobody reads."""
+
+    class FakePredictor:
+        def initialize_from_trained_model_folder(self, *args, **kwargs):
+            pass
+
+        def predict_from_files(self, *args, **kwargs):
+            raise RuntimeError("Background workers died. Look for the error message further up!")
+
+    monkeypatch.setattr(nnunet_runner, "_build_predictor", lambda *a, **k: FakePredictor())
+
+    with pytest.raises(RuntimeError) as caught:
+        nnunet_runner.predict_folder("model", str(tmp_path), str(tmp_path / "out"), "cuda",
+                                     tile_step_size=0.5, gpu_resampling=False)
+
+    assert str(caught.value).startswith(
+        "nnUNet prediction failed on cuda (RuntimeError: an nnUNet worker process died, "
+        "most often for lack of RAM")
+
+
+def test_a_failed_surface_write_raises_instead_of_passing_silently(tmp_path):
+    reference = sitk.Image(10, 10, 10, sitk.sitkInt16)
+    mask = np.zeros((10, 10, 10), dtype=np.uint8)
+    mask[3:7, 3:7, 3:7] = 1
+
+    with pytest.raises(RuntimeError, match="^writing a surface failed"):
+        vtk_export.write_separate_surface(
+            mask, reference, "MAND", catalog.LABEL_COLORS, catalog.LABELS,
+            smoothing=0, output_path=str(tmp_path / "missing" / "x.vtk"),
+        )
+
+
+def test_an_empty_surface_is_warned_about_with_the_scan_position(tmp_path, caplog):
+    reference = sitk.Image(10, 10, 10, sitk.sitkInt16)
+    mask = np.zeros((10, 10, 10), dtype=np.uint8)
+
+    with caplog.at_level(logging.INFO, logger="sadt_amasss"):
+        vtk_export.write_separate_surfaces(
+            {"MAND": mask}, reference, catalog.LABEL_COLORS, catalog.LABELS,
+            smoothing=0, decimation=0, output_dir=str(tmp_path),
+            name_of=lambda code: f"{code}.vtk", where="scan 3 of 4: ",
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "scan 3 of 4: surface for MAND is empty (0 triangles); written anyway" in messages
 
 
 # ---------------------------------------------------------------------------
@@ -1110,7 +1553,7 @@ def test_the_bar_counts_finished_structures_not_started_ones(
 
     messages = [json.loads(line)["message"] for line in
                 events_file.read_text().splitlines()]
-    structures = [m for m in messages if "structure" in m]
+    structures = [m for m in messages if m.startswith("structure ")]
     assert structures == ["structure 1 of 2", "structure 2 of 2"], structures
 
 
@@ -1250,6 +1693,214 @@ def test_the_separate_surfaces_are_named_after_their_own_structure(tmp_path):
 
     assert [os.path.basename(p) for p in written] == ["p_MAND.vtk", "p_MAX.vtk", "p_CB.vtk"]
     assert all(os.path.isfile(p) for p in written)
+
+
+# ---------------------------------------------------------------------------
+# nnUNet imported once, before the structures' threads
+# ---------------------------------------------------------------------------
+
+def test_the_pipeline_preloads_nnunet_before_any_structure_thread_starts(
+    tmp_path, stub_predictor, monkeypatch
+):
+    """The structures' threads must only ever find nnUNet fully imported.
+
+    Each thread used to be the first to import nnunetv2 and the trainer class
+    nnUNet looks up by name, and on a five-channel run every structure failed
+    on a half-initialised module. The preload has to happen once, on the
+    run's own thread, before the pool hands out any work.
+    """
+    import threading
+
+    events = []
+    lock = threading.Lock()
+    main_thread = threading.current_thread()
+
+    def record_preload():
+        with lock:
+            events.append(("preload", threading.current_thread() is main_thread))
+
+    stubbed = nnunet_runner.predict_folder
+
+    def record_predict(model_folder, input_dir, output_dir, device, **kwargs):
+        with lock:
+            events.append(("predict", threading.current_thread() is main_thread))
+        stubbed(model_folder, input_dir, output_dir, device, **kwargs)
+
+    monkeypatch.setattr(nnunet_runner, "preload", record_preload)
+    monkeypatch.setattr(nnunet_runner, "predict_folder", record_predict)
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX", "CB"])
+
+    report = pipeline.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        output_dir=str(tmp_path / "out"),
+        structures=("MAND", "MAX", "CB"),
+        merge=("SEPARATE",),
+        num_workers=3,
+    )
+
+    assert report["summary"]["processed"] == 1
+    assert events[0] == ("preload", True), "preloaded on the run's thread, first"
+    assert [kind for kind, _ in events].count("preload") == 1
+    assert sorted(events[1:]) == [("predict", False)] * 3, "then predicted in the pool"
+
+
+def test_concurrent_callers_of_preload_import_once_and_all_wait_for_it(monkeypatch):
+    """However many threads arrive at once, the imports run exactly once, and
+    none of them returns before they are complete -- a caller returning early
+    would reach nnUNet while another thread is still importing it."""
+    import threading
+    import time
+
+    walked = []
+    walk_lock = threading.Lock()
+
+    def slow_import_tree(package_name):
+        time.sleep(0.05)
+        with walk_lock:
+            walked.append(package_name)
+        return 1
+
+    monkeypatch.setattr(nnunet_runner, "_preloaded", False)
+    monkeypatch.setattr(nnunet_runner, "_import_tree", slow_import_tree)
+
+    callers = 8
+    barrier = threading.Barrier(callers)
+    complete_on_return = []
+
+    def call():
+        barrier.wait()
+        nnunet_runner.preload()
+        with walk_lock:
+            complete_on_return.append(len(walked))
+
+    threads = [threading.Thread(target=call) for _ in range(callers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    expected = list(nnunet_runner._RESOLVED_BY_NAME)
+    assert walked == expected, "each package walked once, not once per caller"
+    assert complete_on_return == [len(expected)] * callers
+
+
+def test_after_preload_loading_a_model_has_nothing_left_to_import():
+    """Everything nnUNet resolves BY NAME while loading and running a model is
+    already in sys.modules once `preload` has run.
+
+    A fresh interpreter, because this process may have imported nnUNet
+    already. The lookups are the ones `initialize_from_trained_model_folder`
+    and prediction perform -- the trainer named in the checkpoint, the network
+    and its building blocks named in the plans, the resamplers, normaliser,
+    preprocessor, reader/writer and label manager -- and none of them may
+    import a module for the first time, since that is exactly what used to
+    happen concurrently in the structures' threads.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import pydoc
+        import sys
+        from os.path import join
+
+        from sadt_amasss import nnunet_runner
+
+        nnunet_runner.preload()
+        before = set(sys.modules)
+
+        import nnunetv2
+        from nnunetv2.imageio.reader_writer_registry import (
+            recursive_find_reader_writer_by_name)
+        from nnunetv2.preprocessing.resampling.utils import (
+            recursive_find_resampling_fn_by_name)
+        from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
+        from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
+
+        root = nnunetv2.__path__[0]
+        found = [
+            recursive_find_trainer_class_by_name("nnUNetTrainer"),
+            recursive_find_trainer_class_by_name("nnUNetTrainerNoMirroring"),
+            recursive_find_resampling_fn_by_name("resample_data_or_seg_to_shape"),
+            recursive_find_resampling_fn_by_name("resample_torch_fornnunet"),
+            recursive_find_reader_writer_by_name("SimpleITKIO"),
+            recursive_find_reader_writer_by_name("NibabelIOWithReorient"),
+            recursive_find_python_class(join(root, "preprocessing"), "DefaultPreprocessor",
+                                        current_module="nnunetv2.preprocessing"),
+            recursive_find_python_class(join(root, "preprocessing", "normalization"),
+                                        "CTNormalization",
+                                        "nnunetv2.preprocessing.normalization"),
+            recursive_find_python_class(join(root, "preprocessing", "normalization"),
+                                        "ZScoreNormalization",
+                                        "nnunetv2.preprocessing.normalization"),
+            recursive_find_python_class(join(root, "utilities", "label_handling"),
+                                        "LabelManager",
+                                        current_module="nnunetv2.utilities.label_handling"),
+            pydoc.locate("dynamic_network_architectures.architectures.unet.PlainConvUNet"),
+            pydoc.locate("dynamic_network_architectures.architectures.unet.ResidualEncoderUNet"),
+            pydoc.locate("torch.nn.modules.conv.Conv3d"),
+            pydoc.locate("torch.nn.modules.instancenorm.InstanceNorm3d"),
+            pydoc.locate("torch.nn.LeakyReLU"),
+        ]
+        assert all(item is not None for item in found), found
+        print("\\n".join(sorted(set(sys.modules) - before)))
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
+        env={**os.environ, "PYTHONWARNINGS": "ignore"},
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip() == "", f"imported after preload:\n{result.stdout}"
+
+
+def test_a_scan_with_a_flipped_axis_gives_its_surface_in_place():
+    """The contour was built from origin and spacing alone. A CBCT stored with
+    direction diag(1, -1, 1) -- origin y positive, rows running front to back
+    the other way -- came out mirrored about the origin, nowhere near the
+    scan. The same physical box, stored both ways, must give the same surface
+    with its normals still pointing out of it."""
+    import vtk
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    volume = np.zeros((20, 20, 20), dtype=np.uint8)
+    volume[4:9, 12:16, 3:7] = 1  # off-centre, so a mirror cannot pass
+
+    identity = sitk.GetImageFromArray(volume)
+    identity.SetSpacing((0.5, 0.5, 0.5))
+    identity.SetOrigin((-5.0, -5.0, -5.0))
+
+    flipped_volume = volume[:, ::-1, :].copy()
+    flipped = sitk.GetImageFromArray(flipped_volume)
+    flipped.SetSpacing((0.5, 0.5, 0.5))
+    flipped.SetDirection((1, 0, 0, 0, -1, 0, 0, 0, 1))
+    flipped.SetOrigin((-5.0, -5.0 + 19 * 0.5, -5.0))
+
+    def surface(mask, reference):
+        mesh = vtk_export._mesh_from_mask(mask, reference, 0, (1, 2, 3))
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(mesh)
+        normals.ComputeCellNormalsOn()
+        normals.ComputePointNormalsOff()
+        normals.AutoOrientNormalsOff()
+        normals.ConsistencyOff()
+        normals.SplittingOff()
+        normals.Update()
+        out = normals.GetOutput()
+        points = vtk_to_numpy(out.GetPoints().GetData())
+        centre = points.mean(axis=0)
+        cell_normals = vtk_to_numpy(out.GetCellData().GetNormals())
+        cells = vtk_to_numpy(out.GetPolys().GetData()).reshape(-1, 4)[:, 1:]
+        outward = np.einsum("ij,ij->i", points[cells].mean(axis=1) - centre, cell_normals)
+        return np.sort(points.round(4), axis=0), np.median(np.sign(outward))
+
+    expected_points, expected_sign = surface(volume, identity)
+    points, sign = surface(flipped_volume, flipped)
+
+    np.testing.assert_allclose(points, expected_points, atol=1e-4)
+    assert sign == expected_sign
 
 
 def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):

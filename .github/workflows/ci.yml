@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
 
+# Every job reads the checkout and nothing else: the token GitHub hands it
+# can do no more than that, whatever a dependency it installs tries.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,7 +23,9 @@ jobs:
     outputs:
       tools: ${{ steps.list.outputs.tools }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - id: list
         run: |
           # Depth 2 AND 3, and keyed on [tool.sadt], which is the same rule
@@ -46,8 +53,10 @@ jobs:
       matrix:
         tool: ${{ fromJson(needs.discover.outputs.tools) }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
@@ -61,7 +70,9 @@ jobs:
       # needs the tool's dependencies. It fails on an unsupported annotation,
       # so a schema the client cannot render never reaches main.
       - name: Import and schema
-        run: tools/${{ matrix.tool }}/.venv/bin/python scripts/describe.py tools/${{ matrix.tool }}
+        env:
+          TOOL: ${{ matrix.tool }}
+        run: tools/"$TOOL"/.venv/bin/python scripts/describe.py tools/"$TOOL"
 
       # GPU tests are excluded here because the runner has no CUDA device. They
       # are not optional: run them by hand and state the result in the PR.
@@ -76,8 +87,10 @@ jobs:
   scripts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
       # --no-project: scripts/ is deliberately not a package. There is no
@@ -93,8 +106,10 @@ jobs:
   testkit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
       - name: Build the template it runs against

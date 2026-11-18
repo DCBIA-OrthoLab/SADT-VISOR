@@ -112,7 +112,8 @@ def test_the_published_schema_matches_the_callable(case, tmp_path):
     assert schema["name"] == "ASO"
     assert schema["returns"] == "path"
     required = [name for name, spec in schema["arguments"].items() if spec["required"]]
-    assert required == ["input", "reference", "output_dir"]
+    # `reference` is optional: left empty, ASO resolves its own bundle.
+    assert required == ["input", "output_dir"]
 
     # The supervisor is not an argument -- a client cannot send one.
     assert "sup" not in schema["arguments"]

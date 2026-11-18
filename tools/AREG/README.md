@@ -92,7 +92,7 @@ usually is not -- and it is what makes this usable standalone.
 |---|---|
 | Inputs | `t1` and `t2`: folders of CBCT scans, or of intra-oral meshes, paired by patient name. `output_dir`: where results go. |
 | Outputs | Per patient and per region: the registered T2 and the transform that produced it, plus `AREG_report.json`. |
-| Model files | `segmentation_model` (AMASSS bundle), `cbct_reference` / `ios_reference` (orientation), `registration_model` (the IOS patch network). All named so the server publishes them as hosted names rather than uploads. |
+| Model files | `registration_model` (the IOS patch network), resolved from `DATA/AREG/models/` when left empty. The masks and the orientation are other tools' work, and each owns its model: AMASSS segments with its own bundle, ASO orients into the frame AREG names with its own reference. `segmentation_model`, `reference` / `cbct_reference` / `ios_reference` remain as overrides a caller may name. All named so the server publishes them as hosted names rather than uploads. |
 | GPU | The IOS patch network uses it. The CBCT engine is elastix on the CPU. |
 
 Three behaviours worth knowing before reading a result:
@@ -102,6 +102,27 @@ Three behaviours worth knowing before reading a result:
   a region that moved between timepoints produces a confident, wrong answer.
 - **Each region is a separate registration** with its own output folder.
 - **`modality` is never inferred from the file extension.**
+- **What comes back is asked as `outputs` ("Extra outputs"), not as steps.**
+  Whatever is ticked is written in the space of the result, so it opens on top
+  of it. IOS to CBCT offers Registration landmarks (IOS + CBCT) (the CBCT landmarks
+  the registration used, and each mesh's own moved by its matrix), Orientation
+  landmarks (ASO) (the landmarks ASO oriented the CBCT on, when the run oriented
+  it), CBCT scan (the CBCT the meshes were
+  registered onto: ASO's oriented scan in the Fully-Automated mode, the
+  caller's otherwise) and Transform (.tfm) (each matrix as a `.tfm`, written as
+  AREG_IOS writes its own: the inverse, for resampling). CBCT offers T1 scan (the
+  T1 the T2 was registered onto: when it was oriented first, the scene points
+  at the copy already under `T1_Oriented/` rather than writing the volume a
+  second time) and Orientation landmarks (ASO) (ASO's landmarks beside that
+  copy). IOS writes everything in the T1's space already and offers nothing more.
+- **Every registration says which of its files make one scene.** `scene.json`
+  (one per patient folder) or `<patient>_..._scene.json` (where patients share a
+  folder) lists them, each with its kind and role, paths relative to the
+  folder: `sadt_areg_common/scene.py`. A viewer reads it instead of guessing
+  from file names. The raw output of each step the chain ran
+  (`keep_intermediate`, "Raw intermediate files") is hidden in all three
+  engines: what a reader wanted from it now comes back as an Extra output, in
+  the result's space.
 
 ## Versions
 

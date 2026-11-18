@@ -143,6 +143,64 @@ AUTOMATION_FULLY = "Fully-Automated"
 AUTOMATION_CHOICES = {AUTOMATION_SEMI: True, AUTOMATION_FULLY: False}
 
 
+# ---------------------------------------------------------------------------
+# Reference frames
+# ---------------------------------------------------------------------------
+# What a CALLER names instead of a reference path. The reference bundles are
+# ASO's own -- staged under DATA/ASO/models/ -- so a neighbour that wants scans
+# in a frame names the frame and this tool finds the bundle that defines it.
+# Holding the bundle's path was the caller holding a copy of ASO's storage.
+#
+# The words are the ones AREG already puts in front of a clinician for its
+# `orientation`, so a frame reads the same in both panels. Spelled "Frankfurt"
+# because that is what the published bundle is called.
+FRAME_FROM_LANDMARKS = "From the landmarks"
+FRAME_FRANKFURT = "Frankfurt horizontal"
+FRAME_OCCLUSAL = "Occlusal plane"
+
+FRAME_CHOICES = {
+    FRAME_FROM_LANDMARKS: True,
+    FRAME_FRANKFURT: False,
+    FRAME_OCCLUSAL: False,
+}
+
+# The bundle each CBCT frame is defined BY -- a reference defines its frame
+# through the landmarks it carries, so naming the bundle is naming the frame.
+# These are the names `scripts/data-manifest.yml` unpacks the two published
+# archives to under DATA/ASO/models/.
+FRAME_BUNDLES = {
+    FRAME_FRANKFURT: "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
+    FRAME_OCCLUSAL: "CBCT_Gold_Occlusal_Midsagittal_Plane",
+}
+
+
+# ---------------------------------------------------------------------------
+# Extra outputs
+# ---------------------------------------------------------------------------
+# What a caller may ask for beside the oriented scans. The wording is AREG's
+# (sadt_areg_common.catalogs), so the same option reads the same in both
+# panels.
+#
+# Not a 3D file: the numbers the orientation measured, for a cohort's table.
+OUTPUT_METRICS = "Metrics spreadsheet (.xlsx + .csv)"
+METRICS_STEM = "ASO_metrics"
+
+# Nothing ticked by default: each extra output is for a reader who asked.
+OUTPUT_CHOICES = {OUTPUT_METRICS: False}
+
+OUTPUT_LABEL = "Extra outputs"
+# Drawn under the label, always visible: the one thing a reader needs before
+# ticking anything is what comes back anyway, and where the rest lands.
+OUTPUT_NOTE = "Saved beside the result. The result and its report are always written."
+
+OUTPUT_HELP = {
+    OUTPUT_METRICS: "What each orientation measured, one row per scan and one "
+                    "per landmark or tooth, as ASO_metrics.xlsx and as .csv "
+                    "files beside the report: the numbers the console shows, "
+                    "kept for a cohort's statistics.",
+}
+
+
 def teeth_to_ids(names) -> tuple:
     """Universal IDs for a list of tooth names, in the order given.
 

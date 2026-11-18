@@ -191,3 +191,30 @@ def test_faces_on_tooth_hands_its_faces_back_in_the_order_it_was_given(tmp_path)
 
     assert kept == [face for face in asked if face in kept]
     assert kept.count(0) == 2
+
+
+def test_a_mesh_with_quad_faces_is_refused_with_a_reason(tmp_path):
+    """It used to fail inside `reshape`, naming an array size and no fix."""
+    import vtk
+
+    points = vtk.vtkPoints()
+    for coordinates in ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1)):
+        points.InsertNextPoint(*coordinates)
+    polys = vtk.vtkCellArray()
+    polys.InsertNextCell(4)
+    for point_id in (0, 1, 2, 3):
+        polys.InsertCellPoint(point_id)
+    polys.InsertNextCell(3)
+    for point_id in (0, 1, 4):
+        polys.InsertCellPoint(point_id)
+    mesh = vtk.vtkPolyData()
+    mesh.SetPoints(points)
+    mesh.SetPolys(polys)
+    labels = vtk.vtkIntArray()
+    labels.SetName("Universal_ID")
+    for _ in range(5):
+        labels.InsertNextValue(8)
+    mesh.GetPointData().AddArray(labels)
+
+    with pytest.raises(ValueError, match=r"^This mesh has non-triangular faces \(up to 4"):
+        surface.surface_properties(mesh, "cpu")

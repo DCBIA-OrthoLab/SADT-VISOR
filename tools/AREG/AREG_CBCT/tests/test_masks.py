@@ -63,6 +63,19 @@ def test_one_regions_mask_is_not_another_regions(tmp_path):
     assert pairing.discover_masks(str(tmp_path), "CB") == {}
 
 
+@pytest.mark.parametrize("region", sorted(catalogs.REGION_MASK_STRUCTURES))
+def test_the_registration_mask_wins_over_the_anatomy_beside_it(tmp_path, region):
+    """A caller who registers on a region AND asks for its anatomy gets both
+    from one AMASSS call, `_CB` sorting before `_CBMASK`. The first match used
+    to win, so the registration ran on the whole structure, not its mask."""
+    mask = catalogs.REGION_MASK_STRUCTURES[region]
+    for code in (region, mask):
+        write(phantom(size=16), str(tmp_path / f"P1_T1_Or_seg_{code}.nii.gz"))
+    found = pairing.discover_masks(str(tmp_path), region)
+    assert [os.path.basename(path) for path in found.values()] == [
+        f"P1_T1_Or_seg_{mask}.nii.gz"]
+
+
 def test_a_mask_keys_to_the_patient_its_scan_keys_to(tmp_path):
     """`P1_T1_MAND_seg.nii.gz` has to key to `P1`, the same key
     `P1_T1_scan.nii.gz` gets, or nothing ever matches."""
@@ -231,3 +244,74 @@ def test_the_label_refusal_lists_what_the_mask_actually_holds():
     assert "no label 7" in message
     assert "0, 2" in message
     assert "segmentation_label" in message
+
+
+# ---------------------------------------------------------------------------
+# DICOM, asked of the data
+# ---------------------------------------------------------------------------
+# `dicom_input` used to be a check box a clinician had to tick. DICOM slices
+# routinely carry no extension, so they could not tell from a file name either,
+# and answering wrong produced a run that failed for a reason nobody could see.
+# The flag survives as an override; the answer is now read off the folder.
+
+def _write_dicom_series(directory, size=(8, 8, 6)):
+    """A minimal but genuinely readable CT series."""
+    os.makedirs(str(directory), exist_ok=True)
+    array = np.zeros(size[::-1], dtype=np.int16)
+    array[2:5, 2:6, 2:6] = 500
+    image = sitk.GetImageFromArray(array)
+    image.SetSpacing((0.5, 0.5, 1.0))
+
+    writer = sitk.ImageFileWriter()
+    writer.KeepOriginalImageUIDOn()
+    series_uid = "1.2.826.0.1.3680043.2.1125.1234567890"
+    for index in range(image.GetDepth()):
+        slice_image = image[:, :, index]
+        position = "\\".join(
+            str(value) for value in image.TransformIndexToPhysicalPoint((0, 0, index))
+        )
+        for tag, value in (
+            ("0008|0060", "CT"), ("0020|000e", series_uid), ("0020|0032", position),
+            ("0020|0013", str(index)), ("0028|0030", "0.5\\0.5"), ("0018|0050", "1.0"),
+            ("0020|0037", "1\\0\\0\\0\\1\\0"),
+        ):
+            slice_image.SetMetaData(tag, value)
+        writer.SetFileName(os.path.join(str(directory), f"slice{index:03d}.dcm"))
+        writer.Execute(slice_image)
+    return str(directory)
+
+
+def test_a_folder_of_slices_is_recognised_as_dicom(tmp_path):
+    from sadt_areg_cbct import dicom
+
+    _write_dicom_series(tmp_path / "patientA")
+
+    assert dicom.holds_a_series(str(tmp_path))
+
+
+def test_a_nested_export_is_found_too(tmp_path):
+    """One level down was all the original looked, so a site/patient export was
+    invisible and the run read no scans at all."""
+    from sadt_areg_cbct import dicom
+
+    _write_dicom_series(tmp_path / "siteA" / "patientA" / "scan")
+
+    assert dicom.holds_a_series(str(tmp_path))
+
+
+def test_a_folder_of_volumes_is_not(tmp_path):
+    """The other half of the statement: if this answered yes to everything, the
+    two tests above would pass against a detector that always says DICOM -- and
+    every ordinary cohort would be sent through the converter, which refuses
+    with 'No DICOM series found in this input'."""
+    from sadt_areg_cbct import dicom
+
+    write(phantom(size=16), str(tmp_path / "T1" / "P1_T1.nii.gz"))
+
+    assert not dicom.holds_a_series(str(tmp_path))
+
+
+def test_an_empty_folder_is_not_dicom(tmp_path):
+    from sadt_areg_cbct import dicom
+
+    assert not dicom.holds_a_series(str(tmp_path))

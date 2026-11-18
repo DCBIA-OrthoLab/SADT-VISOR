@@ -84,6 +84,38 @@ def test_the_compound_extension_is_split_as_one_unit():
 
 
 # ---------------------------------------------------------------------------
+# patient_name
+# ---------------------------------------------------------------------------
+
+def test_the_patient_name_keeps_the_files_own_spelling():
+    """A folder called `42` beside `case_042_...` files was no name to find a
+    patient by: the name keeps its prefix and its zeros."""
+    assert pipeline.patient_name("case_042_T1_L.stl") == "case_042"
+    assert pipeline.patient_name("case_042_T1_CBCT.nii.gz") == "case_042"
+    assert pipeline.patient_name("P_0001_T2.nii.gz") == "P_0001"
+    assert pipeline.patient_name("P001_T2_U_Seg.vtk") == "P001"
+
+
+def test_a_leading_timepoint_is_not_taken_for_the_patient():
+    assert pipeline.patient_name("T1_case_042_U.vtk") == "T1_case_042"
+
+
+def test_a_name_with_no_digit_is_kept_whole():
+    assert pipeline.patient_name("upper_scan.vtk") == "upper_scan"
+
+
+def test_two_patients_never_share_a_folder(tmp_path):
+    """Two keys, one name: the second keeps its key so it cannot overwrite."""
+    write_mesh(tmp_path / "ios" / "case_042_scan2_U.vtk")
+    write_mesh(tmp_path / "ios" / "case_042_scan3_U.vtk")
+    write_volume(tmp_path / "cbct" / "case_042_scan2.nii.gz")
+    write_volume(tmp_path / "cbct" / "case_042_scan3.nii.gz")
+
+    paired, _unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert sorted(data["name"] for data in paired.values()) == ["case_042", "case_042_423"]
+
+
+# ---------------------------------------------------------------------------
 # discover
 # ---------------------------------------------------------------------------
 
@@ -92,7 +124,9 @@ def test_a_patient_present_in_both_modalities_is_paired(tmp_path):
     volume = write_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz")
 
     paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
-    assert paired == {"1": {"ios": [mesh], "cbct": volume}}
+    assert paired == {"1": {"ios": [mesh], "cbct": volume, "name": "P001",
+                            "patient": "1", "ios_timepoint": "t2",
+                            "cbct_timepoint": "t2"}}
     assert unpaired == {}
 
 
@@ -119,19 +153,37 @@ def test_a_patient_with_only_one_modality_is_reported_not_dropped(tmp_path):
 
     paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     assert set(paired) == {"1"}
-    assert unpaired == {"2": "no CBCT", "3": "no intraoral scan"}
+    assert unpaired == {"P002": "no CBCT", "P_0003": "no intraoral scan"}
 
 
-def test_no_pair_at_all_names_both_counts_and_what_was_left_over(tmp_path):
+def test_no_pair_at_all_gives_both_counts_and_no_key(tmp_path):
+    """Counts, never the keys: a key is built from the caller's file names."""
     write_mesh(tmp_path / "ios" / "alpha.vtk")
+    write_mesh(tmp_path / "ios" / "beta.vtk")
     write_volume(tmp_path / "cbct" / "P_0001_T2.nii.gz")
 
     with pytest.raises(ToolInputError) as raised:
         pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     message = str(raised.value)
-    assert "1 intraoral key(s)" in message
+    assert "2 intraoral key(s)" in message
     assert "1 CBCT key(s)" in message
-    assert "no CBCT" in message
+    assert "alpha" not in message
+    assert "'1'" not in message
+
+
+def test_an_empty_side_names_its_source_and_takes_the_class_it_is_given(tmp_path):
+    """The caller's empty folder is theirs to fix; a supervised tool's is not."""
+    write_mesh(tmp_path / "ios" / "P001_T2_U.vtk")
+    (tmp_path / "cbct").mkdir()
+
+    with pytest.raises(ToolInputError, match="No CBCT scan found in 'cbct'"):
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    with pytest.raises(RuntimeError, match="No CBCT scan found in ASO's output") as raised:
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"),
+                          cbct_source="ASO's output", cbct_error=RuntimeError)
+    assert not isinstance(raised.value, ValueError)
+    with pytest.raises(ToolInputError, match="No intraoral mesh"):
+        pipeline.discover(str(tmp_path / "cbct"), str(tmp_path / "ios"))
 
 
 def test_discovery_is_recursive_on_both_sides(tmp_path):
@@ -206,3 +258,87 @@ def test_the_patients_come_back_in_a_stable_order(tmp_path):
 
     paired, _unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
     assert list(paired) == ["1", "2", "3"]
+
+
+# ---------------------------------------------------------------------------
+# Several timepoints of one patient
+# ---------------------------------------------------------------------------
+
+def test_each_timepoint_of_a_patient_pairs_with_its_own_cbct(tmp_path):
+    """Matched on the digits alone, a T1 and a T2 were one patient: the first
+    CBCT was kept and the arches of both timepoints were put onto it."""
+    for point in ("T1", "T2"):
+        write_mesh(tmp_path / "ios" / f"case7_{point}_U.vtk")
+        write_mesh(tmp_path / "ios" / f"case7_{point}_L.vtk")
+        write_volume(tmp_path / "cbct" / f"case7_{point}.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert unpaired == {}
+    assert sorted(paired) == ["7_t1", "7_t2"]
+    for point in ("t1", "t2"):
+        entry = paired[f"7_{point}"]
+        assert os.path.basename(entry["cbct"]) == f"case7_{point.upper()}.nii.gz"
+        assert [os.path.basename(path) for path in entry["ios"]] == [
+            f"case7_{point.upper()}_L.vtk", f"case7_{point.upper()}_U.vtk"]
+        assert entry["name"] == f"case7_{point.upper()}"
+        assert entry["patient"] == "7"
+
+
+def test_a_timepoint_named_by_its_folder_counts(tmp_path):
+    for point in ("T1", "T2"):
+        write_mesh(tmp_path / "ios" / point / "case7_U.vtk")
+        write_volume(tmp_path / "cbct" / point / "case7.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert unpaired == {}
+    assert {entry["cbct"].split(os.sep)[-2] for entry in paired.values()} == {"T1", "T2"}
+    for entry in paired.values():
+        assert entry["ios"][0].split(os.sep)[-2] == entry["cbct"].split(os.sep)[-2]
+
+
+def test_a_timepoint_with_no_cbct_is_reported_under_its_timepoint(tmp_path):
+    write_mesh(tmp_path / "ios" / "case7_T1_U.vtk")
+    write_mesh(tmp_path / "ios" / "case7_T2_U.vtk")
+    write_volume(tmp_path / "cbct" / "case7_T1.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert list(paired) == ["7_t1"]
+    assert unpaired == {"case7_T2": "no CBCT"}
+
+
+def test_arches_naming_no_timepoint_are_not_guessed_onto_one_of_two_cbcts(tmp_path):
+    write_mesh(tmp_path / "ios" / "case7_U.vtk")
+    write_volume(tmp_path / "cbct" / "case7_T1.nii.gz")
+    write_volume(tmp_path / "cbct" / "case7_T2.nii.gz")
+
+    with pytest.raises(ToolInputError):
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+
+
+def test_one_timepoint_named_on_one_side_only_still_pairs(tmp_path):
+    write_mesh(tmp_path / "ios" / "case7_U.vtk")
+    write_volume(tmp_path / "cbct" / "case7_T2.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert list(paired) == ["7"] and unpaired == {}
+
+
+def test_the_only_mesh_and_the_only_cbct_pair_whatever_their_names(tmp_path):
+    """A scan picked from the scene or exported without a patient number:
+    with one patient on each side there is nothing to confuse it with."""
+    write_mesh(tmp_path / "ios" / "lower_arch_L.vtk")
+    write_volume(tmp_path / "cbct" / "cbct_scan.nii.gz")
+
+    paired, unpaired = pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))
+    assert unpaired == {}
+    (entry,) = paired.values()
+    assert os.path.basename(entry["cbct"]) == "cbct_scan.nii.gz"
+
+
+def test_two_unmatched_patients_on_one_side_are_still_refused(tmp_path):
+    write_mesh(tmp_path / "ios" / "P001_U.vtk")
+    write_mesh(tmp_path / "ios" / "P002_U.vtk")
+    write_volume(tmp_path / "cbct" / "P_0009.nii.gz")
+
+    with pytest.raises(ToolInputError):
+        pipeline.discover(str(tmp_path / "ios"), str(tmp_path / "cbct"))

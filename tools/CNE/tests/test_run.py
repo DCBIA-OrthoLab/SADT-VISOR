@@ -234,7 +234,7 @@ def test_archive_residue_directories_are_skipped(tmp_path):
 def test_a_single_note_file_is_accepted_as_input(tmp_path, model, llm):
     note = write_txt(tmp_path / "one.txt")
 
-    output = sadt_cne.run(note, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(note, "TMJ", tmp_path / "out", model)
 
     assert (output / "Extraction_one.txt.json").is_file()
 
@@ -245,19 +245,19 @@ def test_an_empty_folder_is_refused_not_reported_as_a_finished_run(tmp_path, mod
     (tmp_path / "notes").mkdir()
 
     with pytest.raises(ValueError, match="No note found"):
-        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
 
 def test_a_folder_of_unsupported_files_is_refused(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "scan.dcm")
 
     with pytest.raises(ValueError, match="No note found"):
-        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
 
 def test_a_missing_input_path_is_a_file_not_found_error(tmp_path, model, llm):
     with pytest.raises(FileNotFoundError):
-        sadt_cne.run(tmp_path / "nowhere", "TMJ", model, tmp_path / "out")
+        sadt_cne.run(tmp_path / "nowhere", "TMJ", tmp_path / "out", model)
 
 
 # --------------------------------------------------------------------------
@@ -273,7 +273,7 @@ def test_three_notes_sharing_a_stem_write_three_extractions(tmp_path, model, llm
     write_pdf(notes / "B_001.pdf", "PDF note, right side.")
     write_docx(notes / "B_001.docx", ["Word note, both sides."])
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     written = sorted(path.name for path in output.glob("Extraction_*.json"))
     assert written == [
@@ -287,7 +287,7 @@ def test_three_notes_sharing_a_stem_write_three_extractions(tmp_path, model, llm
 def test_the_output_name_keeps_the_source_extension(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "B_001.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert (output / "Extraction_B_001.txt.txt").is_file()
     assert (output / "Extraction_B_001.txt.json").is_file()
@@ -296,7 +296,7 @@ def test_the_output_name_keeps_the_source_extension(tmp_path, model, llm):
 def test_subfolders_are_mirrored_in_the_output(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "patient_1" / "visit_a" / "note.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert (output / "patient_1" / "visit_a" / "Extraction_note.txt.json").is_file()
 
@@ -305,7 +305,7 @@ def test_two_notes_of_one_name_in_different_folders_do_not_collide(tmp_path, mod
     write_txt(tmp_path / "notes" / "patient_1" / "note.txt", "First patient.")
     write_txt(tmp_path / "notes" / "patient_2" / "note.txt", "Second patient.")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert (output / "patient_1" / "Extraction_note.txt.json").is_file()
     assert (output / "patient_2" / "Extraction_note.txt.json").is_file()
@@ -334,7 +334,7 @@ def test_a_json_is_written_beside_every_text_extraction(tmp_path, model, llm):
     step and threw the object away, so nothing downstream could read it."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert json.loads((output / "Extraction_a.txt.json").read_text()) == {
         "chief_complaint": "jaw pain", "side": "left",
@@ -344,7 +344,7 @@ def test_a_json_is_written_beside_every_text_extraction(tmp_path, model, llm):
 def test_the_text_extraction_is_key_colon_value(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert (output / "Extraction_a.txt.txt").read_text() == (
         "chief_complaint : jaw pain\nside : left\n"
@@ -362,7 +362,7 @@ def test_the_engine_creates_its_own_output_directory(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
     destination = tmp_path / "does" / "not" / "exist"
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, destination)
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", destination, model)
 
     assert output.is_dir()
     assert (output / "Extraction_a.txt.json").is_file()
@@ -371,7 +371,7 @@ def test_the_engine_creates_its_own_output_directory(tmp_path, model, llm):
 def test_mirrored_subdirectories_are_created_too(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "deep" / "deeper" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert (output / "deep" / "deeper" / "Extraction_a.txt.json").is_file()
 
@@ -386,7 +386,7 @@ def test_writing_into_the_notes_folder_is_refused(tmp_path, model, llm):
     write_txt(notes / "a.txt")
 
     with pytest.raises(ValueError, match="must not be the notes folder"):
-        sadt_cne.run(notes, "TMJ", model, notes)
+        sadt_cne.run(notes, "TMJ", notes, model)
 
 
 def test_an_output_folder_inside_the_notes_folder_is_not_discovered(tmp_path, model, llm):
@@ -394,7 +394,7 @@ def test_an_output_folder_inside_the_notes_folder_is_not_discovered(tmp_path, mo
     write_txt(notes / "a.txt")
     write_txt(notes / "extractions" / "leftover.txt", "A previous run's output.")
 
-    output = sadt_cne.run(notes, "TMJ", model, notes / "extractions")
+    output = sadt_cne.run(notes, "TMJ", notes / "extractions", model)
 
     assert [entry["input"] for entry in report_of(output)["notes"]] == ["a.txt"]
 
@@ -404,8 +404,8 @@ def test_a_second_run_extracts_the_same_notes_not_its_own_output(tmp_path, model
     write_txt(notes / "a.txt")
     output_dir = notes / "extractions"
 
-    sadt_cne.run(notes, "TMJ", model, output_dir)
-    second = sadt_cne.run(notes, "TMJ", model, output_dir)
+    sadt_cne.run(notes, "TMJ", output_dir, model)
+    second = sadt_cne.run(notes, "TMJ", output_dir, model)
 
     assert report_of(second)["summary"] == "1/1 note(s) extracted"
 
@@ -422,7 +422,7 @@ def test_a_note_with_no_text_is_never_sent_to_the_model(tmp_path, model, llm):
     write_pdf(notes / "scanned.pdf", text="")
     write_txt(notes / "real.txt")
 
-    sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     sent = [call["messages"][-1]["content"] for call in llm.calls]
     assert sent == ["Patient reports left jaw pain."]
@@ -433,7 +433,7 @@ def test_a_note_with_no_text_writes_nothing(tmp_path, model, llm):
     write_pdf(notes / "scanned.pdf", text="")
     write_txt(notes / "real.txt")
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert not (output / "Extraction_scanned.pdf.json").exists()
     assert not (output / "Extraction_scanned.pdf.txt").exists()
@@ -444,7 +444,7 @@ def test_a_note_with_no_text_is_reported_as_failed_and_says_why(tmp_path, model,
     write_pdf(notes / "scanned.pdf", text="")
     write_txt(notes / "real.txt")
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     entry = entry_for(output, "scanned.pdf")
     assert entry["status"] == "failed"
@@ -457,7 +457,7 @@ def test_a_whitespace_only_note_counts_as_empty(tmp_path, model, llm):
     write_txt(notes / "blank.txt", "\n\n   \t\n")
     write_txt(notes / "real.txt")
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "blank.txt")["status"] == "failed"
 
@@ -476,7 +476,7 @@ def test_the_character_count_of_every_note_is_reported(tmp_path, model, llm):
     published rather than judged."""
     write_txt(tmp_path / "notes" / "a.txt", "Pain 7/10.")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "a.txt")["characters"] == len("Pain 7/10.")
 
@@ -520,7 +520,7 @@ def test_a_utf8_bom_is_stripped_rather_than_read_as_a_character(tmp_path):
 def test_the_encoding_that_worked_is_reported(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt", "Café", encoding="cp1252")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "a.txt")["encoding"] == "cp1252"
 
@@ -658,7 +658,7 @@ def test_an_unreadable_note_fails_only_that_note(tmp_path, model, llm, monkeypat
         return real(path)
 
     monkeypatch.setattr(sadt_cne, "read_note", flaky)
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert report_of(output)["summary"] == "1/2 note(s) extracted"
     assert entry_for(output, "good.txt")["status"] == "ok"
@@ -678,7 +678,7 @@ def test_a_text_only_batch_needs_neither_pdf_nor_word_reader(tmp_path, model, ll
     monkeypatch.setattr(readers, "require", refuse)
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert report_of(output)["summary"] == "1/1 note(s) extracted"
 
@@ -692,7 +692,7 @@ def test_a_missing_pdf_reader_costs_the_pdf_notes_and_nothing_else(tmp_path, mod
     write_pdf(notes / "a.pdf")
     write_txt(notes / "b.txt")
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "b.txt")["status"] == "ok"
     assert "pymupdf" in entry_for(output, "a.pdf")["reason"]
@@ -708,7 +708,7 @@ def test_a_pdf_only_batch_without_a_pdf_reader_is_unavailable_not_invalid(tmp_pa
     write_pdf(tmp_path / "notes" / "a.pdf")
 
     with pytest.raises(ToolUnavailableError, match="pymupdf"):
-        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
 
 def test_a_missing_llama_cpp_is_a_tool_unavailable_error(tmp_path, monkeypatch):
@@ -735,7 +735,7 @@ def test_the_tmj_prompt_and_context_are_chosen_from_one_table(tmp_path, model, l
     the Ortho 2048 window and long notes were silently truncated."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert llm.loaded["context_tokens"] == 6144
     assert llm.calls[0]["messages"][0] == {
@@ -748,7 +748,7 @@ def test_ortho_gets_no_system_prompt_and_its_own_context(tmp_path, model, llm):
     instruction it never saw in training changes what it emits."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "Ortho", model, tmp_path / "out")
+    sadt_cne.run(tmp_path / "notes", "Ortho", tmp_path / "out", model)
 
     assert llm.loaded["context_tokens"] == 2048
     assert [message["role"] for message in llm.calls[0]["messages"]] == ["user"]
@@ -761,7 +761,7 @@ def test_the_note_type_table_and_the_prompt_table_cover_the_same_types():
 def test_an_explicit_context_size_overrides_the_note_type_default(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                  context_tokens=12288)
 
     assert llm.loaded["context_tokens"] == 12288
@@ -775,7 +775,7 @@ def test_a_negative_context_size_is_refused():
 def test_the_note_type_is_recorded_in_the_report(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "Ortho", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "Ortho", tmp_path / "out", model)
 
     assert report_of(output)["notes_type"] == "Ortho"
     assert report_of(output)["system_prompt"] is False
@@ -792,7 +792,7 @@ def test_a_truncated_answer_is_a_failure_not_a_written_result(tmp_path, model, l
     write_txt(tmp_path / "notes" / "b.txt")
     llm.answers = [('{"pain": "yes"', "length"), (ANSWER, "stop")]
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "a.txt")["status"] == "failed"
     assert entry_for(output, "b.txt")["status"] == "ok"
@@ -804,7 +804,7 @@ def test_a_truncated_answer_writes_nothing(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "b.txt")
     llm.answers = [('{"pain": "yes"', "length"), (ANSWER, "stop")]
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert not (output / "Extraction_a.txt.txt").exists()
     assert not (output / "Extraction_a.txt.json").exists()
@@ -814,7 +814,7 @@ def test_the_default_temperature_is_zero_so_a_run_can_be_checked(tmp_path, model
     """Upstream used 0.1, so the same note extracted twice gave two answers."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert llm.calls[0]["temperature"] == 0.0
 
@@ -822,7 +822,7 @@ def test_the_default_temperature_is_zero_so_a_run_can_be_checked(tmp_path, model
 def test_max_tokens_reaches_the_model(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                  max_tokens=64)
 
     assert llm.calls[0]["max_tokens"] == 64
@@ -831,7 +831,7 @@ def test_max_tokens_reaches_the_model(tmp_path, model, llm):
 def test_the_seed_reaches_the_engine_and_the_report(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                           seed=17, temperature=0.7)
 
     assert llm.loaded["seed"] == 17
@@ -844,7 +844,7 @@ def test_the_cpu_device_offloads_no_layer(tmp_path, model, llm):
     queue behind a segmentation for the card."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert llm.loaded["n_gpu_layers"] == 0
 
@@ -852,7 +852,7 @@ def test_the_cpu_device_offloads_no_layer(tmp_path, model, llm):
 def test_the_cuda_device_offloads_every_layer(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                  device="cuda")
 
     assert llm.loaded["n_gpu_layers"] == -1
@@ -863,7 +863,7 @@ def test_the_mps_device_offloads_every_layer(tmp_path, model, llm):
     with the same `n_gpu_layers` the CUDA build takes."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                  device="mps")
 
     assert llm.loaded["n_gpu_layers"] == -1
@@ -883,7 +883,7 @@ def test_a_cuda_run_on_a_cuda_build_reports_the_offload(tmp_path, model, llm):
     llm.gpu_offload = True
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                           device="cuda")
 
     report = report_of(output)
@@ -898,7 +898,7 @@ def test_a_cuda_run_on_a_cpu_build_is_reported_as_ignored(tmp_path, model, llm):
     llm.gpu_offload = False
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                           device="cuda")
 
     report = report_of(output)
@@ -915,7 +915,7 @@ def test_a_cuda_request_a_cpu_build_cannot_honour_is_not_refused(tmp_path, model
     llm.gpu_offload = False
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                           device="cuda")
 
     assert entry_for(output, "a.txt")["status"] == "ok"
@@ -925,7 +925,7 @@ def test_a_cpu_run_never_claims_the_gpu_however_capable_the_build(tmp_path, mode
     llm.gpu_offload = True
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                           device="cpu")
 
     report = report_of(output)
@@ -946,7 +946,7 @@ def test_the_build_is_asked_about_the_gpu_before_the_weights_are_loaded(
                         lambda *a, **k: (order.append("loaded"), real_load(*a, **k))[1])
     write_txt(tmp_path / "notes" / "a.txt")
 
-    sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out",
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model,
                  device="cuda")
 
     assert order == ["asked", "loaded"]
@@ -1073,18 +1073,23 @@ def test_the_build_reports_whether_it_can_offload(monkeypatch):
 def test_the_finish_reason_is_reported_for_every_note(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "a.txt")["finish_reason"] == "stop"
 
 
-def test_an_answer_shaped_wrong_is_a_readable_error():
+def test_an_answer_shaped_wrong_is_a_server_fault_not_the_callers():
+    """The note was fine; the engine answered in the wrong shape. A ValueError
+    would be answered 422 and blamed on the request."""
     class Broken:
         def create_chat_completion(self, **_kwargs):
             return {"choices": []}
 
-    with pytest.raises(ValueError, match="cannot read"):
+    with pytest.raises(RuntimeError, match="cannot read") as raised:
         extraction.complete(Broken(), [], 10, 0.0)
+
+    assert not isinstance(raised.value, ValueError)
+    assert isinstance(raised.value.__cause__, IndexError)
 
 
 # --------------------------------------------------------------------------
@@ -1118,7 +1123,7 @@ def test_an_answer_without_json_is_a_failure_not_a_raw_blob(tmp_path, model, llm
     write_txt(tmp_path / "notes" / "b.txt")
     llm.answers = ["I am unable to help with that.", ANSWER]
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert not (output / "Extraction_a.txt.txt").exists()
     assert "no JSON object" in entry_for(output, "a.txt")["reason"]
@@ -1145,7 +1150,7 @@ def test_booleans_and_nulls_render_without_python_spelling():
 def test_the_field_count_is_reported(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert entry_for(output, "a.txt")["fields"] == 2
 
@@ -1216,7 +1221,7 @@ def test_a_missing_model_path_is_a_file_not_found_error(tmp_path):
 
 @pytest.mark.parametrize("name,hint", [
     ("TMJ/qwen-ft-q4_k_m.gguf", "TMJ"),
-    ("Ortho/model-q4_0.gguf", "Ortho"),
+    ("Ortho/model-q4_k_m.gguf", "Ortho"),
     ("models/generic.gguf", ""),
 ])
 def test_the_model_path_hints_at_the_note_type_it_was_trained_for(name, hint):
@@ -1228,7 +1233,7 @@ def test_a_model_named_for_the_other_note_type_is_warned_about_not_refused(tmp_p
     Ortho weights with the TMJ instruction gives an answer that looks right."""
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "Ortho", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "Ortho", tmp_path / "out", model)
 
     warnings = report_of(output)["warnings"]
     assert len(warnings) == 1 and "TMJ" in warnings[0]
@@ -1238,7 +1243,7 @@ def test_a_model_named_for_the_other_note_type_is_warned_about_not_refused(tmp_p
 def test_a_matching_model_produces_no_warning(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert report_of(output)["warnings"] == []
 
@@ -1246,7 +1251,7 @@ def test_a_matching_model_produces_no_warning(tmp_path, model, llm):
 def test_the_model_file_name_is_recorded_in_the_report(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert report_of(output)["model"] == "qwen-ft-q4_k_m.gguf"
 
@@ -1264,7 +1269,7 @@ def test_the_report_counts_what_was_written_not_what_was_walked_past(tmp_path, m
     write_txt(notes / "b.txt")
     write_pdf(notes / "c.pdf", text="")
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert report_of(output)["summary"] == "2/3 note(s) extracted"
 
@@ -1273,7 +1278,7 @@ def test_a_run_where_nothing_succeeded_raises_instead_of_exiting_zero(tmp_path, 
     write_pdf(tmp_path / "notes" / "a.pdf", text="")
 
     with pytest.raises(ValueError, match="extracted nothing"):
-        sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
 
 def test_the_failure_message_names_every_note_and_its_reason(tmp_path, model, llm):
@@ -1282,7 +1287,7 @@ def test_the_failure_message_names_every_note_and_its_reason(tmp_path, model, ll
     write_pdf(notes / "b.pdf", text="")
 
     with pytest.raises(ValueError) as raised:
-        sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+        sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert "a.pdf" in str(raised.value) and "b.pdf" in str(raised.value)
 
@@ -1292,7 +1297,7 @@ def test_every_note_gets_a_report_entry_whatever_happened(tmp_path, model, llm):
     write_txt(notes / "a.txt")
     write_pdf(notes / "b.pdf", text="")
 
-    output = sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert [entry["input"] for entry in report_of(output)["notes"]] == [
         "a.txt", "b.pdf",
@@ -1302,7 +1307,7 @@ def test_every_note_gets_a_report_entry_whatever_happened(tmp_path, model, llm):
 def test_the_report_records_how_long_the_run_took(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert report_of(output)["duration_seconds"] >= 0
 
@@ -1310,7 +1315,7 @@ def test_the_report_records_how_long_the_run_took(tmp_path, model, llm):
 def test_run_returns_the_output_directory(tmp_path, model, llm):
     write_txt(tmp_path / "notes" / "a.txt")
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", model, tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
 
     assert output == tmp_path / "out"
 
@@ -1320,7 +1325,7 @@ def test_nothing_is_written_outside_the_output_directory(tmp_path, model, llm):
     write_txt(notes / "a.txt")
     before = sorted(path.name for path in notes.iterdir())
 
-    sadt_cne.run(notes, "TMJ", model, tmp_path / "out")
+    sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
 
     assert sorted(path.name for path in notes.iterdir()) == before
 
@@ -1379,18 +1384,64 @@ def test_every_argument_is_documented_for_the_panel():
     import inspect
 
     documented = inspect.getdoc(sadt_cne.run)
-    for name in inspect.signature(sadt_cne.run).parameters:
+    for name, parameter in inspect.signature(sadt_cne.run).parameters.items():
+        # Keyword-only is the server's own injection (`data_root`), never a
+        # field: describe.py does not publish it.
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+            continue
         assert f"{name}:" in documented, name
 
 
 def test_the_model_argument_is_a_path_named_model():
     """That name and that type are what make the server publish it as a hosted
-    NAME the client picks -- never a file a clinician can upload."""
+    NAME the client picks -- never a file a clinician can upload. Optional, so
+    the panel offers "(automatic)" and the note type picks the weights."""
     import inspect
 
     parameter = inspect.signature(sadt_cne.run).parameters["model"]
     assert parameter.annotation is Path
-    assert parameter.default is inspect.Parameter.empty
+    assert parameter.default == ""
+
+
+def test_no_model_named_runs_the_note_types_own_bundle(tmp_path, llm):
+    for notes_type, name in (("TMJ", "qwen-ft-q4_k_m.gguf"),
+                             ("Ortho", "model-q4_k_m.gguf")):
+        bundle = tmp_path / "data" / "CNE" / "models" / notes_type
+        bundle.mkdir(parents=True)
+        (bundle / name).write_bytes(b"GGUF not really")
+    write_txt(tmp_path / "notes" / "note.txt", "Patient reports left TMJ pain.")
+
+    output = sadt_cne.run(tmp_path / "notes", "Ortho", tmp_path / "out",
+                          data_root=tmp_path / "data")
+
+    report = report_of(output)
+    assert report["model"] == "model-q4_k_m.gguf"
+    assert report["warnings"] == []
+
+
+def test_no_model_named_and_none_staged_is_the_deployments_fault(tmp_path, llm):
+    from sadt_cne.dependencies import ToolUnavailableError
+
+    write_txt(tmp_path / "notes" / "note.txt", "Patient reports left TMJ pain.")
+    (tmp_path / "data" / "CNE" / "models").mkdir(parents=True)
+
+    with pytest.raises(ToolUnavailableError, match="No TMJ model is staged"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out",
+                     data_root=tmp_path / "data")
+
+
+def test_no_model_named_and_no_data_root_is_refused(tmp_path, llm):
+    write_txt(tmp_path / "notes" / "note.txt", "Patient reports left TMJ pain.")
+
+    with pytest.raises(ValueError, match="No 'model' given"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out")
+
+
+def test_the_notes_argument_accepts_what_the_readers_read():
+    """Published as the file dialog's filter; derived, never retyped."""
+    from sadt_cne.readers import NOTE_EXTENSIONS
+
+    assert sadt_cne.ACCEPTS == {"notes": NOTE_EXTENSIONS}
 
 
 def test_importing_the_package_loads_no_inference_engine():
@@ -1487,8 +1538,8 @@ def test_a_real_cuda_run_reports_the_offload_and_warns_about_nothing(tmp_path):
         "Clicking on opening. No locking.",
     )
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", Path(bundle),
-                          tmp_path / "out", device="cuda")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out",
+                          Path(bundle), device="cuda")
 
     report = report_of(output)
     assert report["device"] == "cuda"
@@ -1516,7 +1567,7 @@ def test_the_real_model_answers_with_json(tmp_path):
         "Clicking on opening. No locking.",
     )
 
-    output = sadt_cne.run(tmp_path / "notes", "TMJ", Path(bundle), tmp_path / "out")
+    output = sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", Path(bundle))
 
     data = json.loads((output / "Extraction_note.txt.json").read_text())
     assert isinstance(data, dict) and data
@@ -1632,3 +1683,261 @@ def test_an_array_of_several_objects_is_refused_rather_than_spanned():
 def test_blank_lines_between_fields_do_not_break_the_ratio():
     data = extraction.parse_extraction("patient_age: 34\n\n\njaw_locking: false\n")
     assert data == {"patient_age": "34", "jaw_locking": "false"}
+
+
+# --------------------------------------------------------------------------
+# Progress and the run's log: a position, never a note's name
+# --------------------------------------------------------------------------
+
+def read_events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in
+               Path(events_file).read_text().splitlines() if line]
+    progress = [record for record in records if record.get("kind") != "log"]
+    logs = [record for record in records if record.get("kind") == "log"]
+    return progress, logs
+
+
+def test_progress_announces_the_load_then_counts_notes(
+    tmp_path, model, llm, monkeypatch
+):
+    """The load is one opaque call, so it gets a message at the start of the
+    bar and no share of it; each note after it is one call to the model, and
+    the position in the batch is what is counted."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_txt(tmp_path / "notes" / "Smith_John.txt")
+    write_txt(tmp_path / "notes" / "Jones_Mary.txt")
+    write_txt(tmp_path / "notes" / "Brown_Ann.txt")
+
+    sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
+
+    events, logs = read_events(events_file)
+    assert [event["message"] for event in events] == [
+        "loading the language model",
+        "note 1 of 3", "note 2 of 3", "note 3 of 3",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    assert logs == []
+    text = events_file.read_text()
+    assert not any(name in text for name in ("Smith", "Jones", "Brown", ".txt"))
+
+
+def test_a_note_that_fails_is_logged_to_the_clinician_by_position(
+    tmp_path, model, llm, monkeypatch, caplog
+):
+    """The clinician learns that one note of the batch was not extracted and
+    where to look; neither their panel nor the server's log learns its name."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    write_txt(tmp_path / "notes" / "a_Smith_John.txt")
+    write_txt(tmp_path / "notes" / "b_Jones_Mary.txt", text="   ")
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
+
+    _, logs = read_events(events_file)
+    assert [(log["level"], log["audience"]) for log in logs] == [("warning", "user")]
+    assert logs[0]["message"].startswith("note 2 of 2 could not be extracted")
+    assert "Jones" not in events_file.read_text()
+    assert not any("Jones" in record.getMessage() for record in caplog.records)
+    assert entry_for(tmp_path / "out", "b_Jones_Mary.txt")["status"] == "failed"
+
+
+# --------------------------------------------------------------------------
+# What an operator reads when a run fails: where, what and why
+# --------------------------------------------------------------------------
+
+def test_a_failed_note_is_logged_with_position_step_class_and_message(
+    tmp_path, model, llm, caplog
+):
+    notes = tmp_path / "notes"
+    write_txt(notes / "a_Smith_John.txt")
+    write_txt(notes / "b_Jones_Mary.txt", text="   ")
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
+
+    messages = [record.getMessage() for record in caplog.records]
+    failed = [message for message in messages if message.startswith("note 2 of 2")]
+    assert len(failed) == 1
+    assert "reading the note failed" in failed[0]
+    assert "ValueError: no text could be extracted" in failed[0]
+    assert not any("Jones" in message or ".txt" in message for message in messages)
+    assert entry_for(tmp_path / "out", "b_Jones_Mary.txt")["failed_step"] == (
+        "reading the note"
+    )
+
+
+def test_a_partial_run_ends_with_a_warning_summary_by_category(
+    tmp_path, model, llm, caplog
+):
+    notes = tmp_path / "notes"
+    write_txt(notes / "a.txt")
+    write_txt(notes / "b.txt", text="   ")
+
+    with caplog.at_level("INFO", logger="CNE"):
+        sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
+
+    summary = caplog.records[-1]
+    assert summary.levelname == "WARNING"
+    assert summary.getMessage() == (
+        "1 of 2 notes extracted, 1 failed; failures by category: ValueError 1"
+    )
+
+
+def test_a_complete_run_ends_with_an_info_summary(tmp_path, model, llm, caplog):
+    write_txt(tmp_path / "notes" / "a.txt")
+
+    with caplog.at_level("INFO", logger="CNE"):
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
+
+    assert caplog.records[-1].levelname == "INFO"
+    assert caplog.records[-1].getMessage() == "1 of 1 notes extracted"
+
+
+def test_nothing_extracted_because_the_engine_failed_is_a_runtime_error(
+    tmp_path, model, llm
+):
+    """Every note lost to the engine is this server's fault, not the caller's:
+    it must not be answered 422 as the old ValueError was."""
+    notes = tmp_path / "notes"
+    write_txt(notes / "a.txt")
+    write_txt(notes / "b.txt")
+
+    def crash(_messages):
+        raise RuntimeError("llama_decode returned -3")
+
+    llm.answers = crash
+
+    with pytest.raises(RuntimeError) as raised:
+        sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
+
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value).startswith(
+        "0 of 2 notes extracted; most common failure: RuntimeError: "
+        "llama_decode returned -3 (2 of 2)"
+    )
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+def test_nothing_extracted_from_a_mix_of_input_and_engine_faults_is_a_runtime_error(
+    tmp_path, model, llm
+):
+    notes = tmp_path / "notes"
+    write_txt(notes / "a.txt", text="   ")
+    write_txt(notes / "b.txt")
+
+    def crash(_messages):
+        raise RuntimeError("llama_decode returned -3")
+
+    llm.answers = crash
+
+    with pytest.raises(RuntimeError) as raised:
+        sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
+
+    assert not isinstance(raised.value, (ValueError, ToolUnavailableError))
+
+
+def test_nothing_extracted_only_through_the_callers_notes_keeps_a_value_error(
+    tmp_path, model, llm
+):
+    write_pdf(tmp_path / "notes" / "a.pdf", text="")
+
+    with pytest.raises(ValueError) as raised:
+        sadt_cne.run(tmp_path / "notes", "TMJ", tmp_path / "out", model)
+
+    assert "0 of 1 notes extracted; most common failure: ValueError" in str(raised.value)
+
+
+def test_nothing_extracted_from_missing_readers_and_empty_notes_is_unavailable(
+    tmp_path, model, llm, monkeypatch
+):
+    def no_fitz(name):
+        raise ImportError(f"No module named {name!r}")
+
+    monkeypatch.setattr(dependencies.importlib, "import_module", no_fitz)
+    notes = tmp_path / "notes"
+    write_pdf(notes / "a.pdf")
+    write_txt(notes / "b.txt", text="   ")
+
+    with pytest.raises(ToolUnavailableError):
+        sadt_cne.run(notes, "TMJ", tmp_path / "out", model)
+
+
+def test_tool_unavailable_is_a_runtime_error_never_a_value_error():
+    assert issubclass(ToolUnavailableError, RuntimeError)
+    assert not issubclass(ToolUnavailableError, ValueError)
+
+
+def _fake_llama(monkeypatch, raises, printed=""):
+    """A `llama_cpp` whose `Llama` prints to stderr and then refuses to load."""
+    def refuse(**_kwargs):
+        if printed:
+            print(printed, file=sys.stderr)
+        raise raises
+
+    module = types.SimpleNamespace(
+        Llama=refuse, llama_supports_gpu_offload=lambda: 0,
+    )
+    monkeypatch.setattr(extraction, "engine_module", lambda: module)
+
+
+def test_a_model_that_will_not_load_is_a_runtime_error_with_the_settings(
+    tmp_path, monkeypatch, caplog
+):
+    """llama.cpp raises ValueError("Failed to load model from file: <path>")
+    for every failed load: a server fault dressed as the caller's."""
+    model_file = tmp_path / "m.gguf"
+    model_file.write_bytes(b"x" * 2_000_000)
+    _fake_llama(
+        monkeypatch,
+        ValueError(f"Failed to load model from file: {model_file}"),
+        printed="llama_model_load: error loading model: tensor data is truncated",
+    )
+
+    with caplog.at_level("INFO", logger="CNE"):
+        with pytest.raises(RuntimeError) as raised:
+            extraction.load_model(model_file, 6144, 0, -1)
+
+    assert not isinstance(raised.value, (ValueError, ToolUnavailableError))
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert str(raised.value).startswith("loading the language model failed (ValueError")
+    assert "n_ctx=6144, n_gpu_layers=-1" in str(raised.value)
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "model 2 MB, n_ctx=6144, n_gpu_layers=-1" in errors[0]
+    assert "gpu offload compiled in=False" in errors[0]
+    loader = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert loader == [
+        "llama.cpp loader output: llama_model_load: error loading model: "
+        "tensor data is truncated"
+    ]
+
+
+def test_a_model_file_gone_before_the_load_is_tool_unavailable(tmp_path, monkeypatch):
+    missing = tmp_path / "m.gguf"
+    _fake_llama(monkeypatch, ValueError(f"Model path does not exist: {missing}"))
+
+    with pytest.raises(ToolUnavailableError, match="no longer on this server"):
+        extraction.load_model(missing, 2048, 0, 0)
+
+
+def test_a_shipped_cuda_library_that_will_not_open_is_a_warning(
+    tmp_path, monkeypatch, caplog
+):
+    _fake_cuda_wheels(tmp_path, monkeypatch, dependencies.CUDA_RUNTIME_LIBRARIES)
+
+    def refuse(path, mode=None):
+        raise OSError("file too short")
+
+    monkeypatch.setattr(ctypes, "CDLL", refuse)
+
+    with caplog.at_level("WARNING", logger="CNE"):
+        dependencies.preload_cuda_runtime()
+
+    assert len(caplog.records) == len(dependencies.CUDA_RUNTIME_LIBRARIES)
+    assert all(record.levelname == "WARNING" for record in caplog.records)
+    assert "libcudart.so.12 (OSError: file too short)" in caplog.records[0].getMessage()

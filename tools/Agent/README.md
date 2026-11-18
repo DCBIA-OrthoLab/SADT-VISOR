@@ -48,7 +48,16 @@ Two things, and it acquires neither of them:
 
 An absent endpoint or an unpulled model is a `ToolUnavailableError`, which the
 server answers **503** -- a deployment problem, not the caller's. The message
-names the endpoint or the exact model tag.
+names the endpoint or the exact model tag. A server that is up but too slow is
+the same class with a different message, "router call exceeded
+timeout_seconds=N", so a slow model is not mistaken for a stopped one. So is a
+live registry that is unset, unreachable or too slow.
+
+The server maps the exact class name, not its parents, so who is at fault
+decides what is raised: a `catalog_file` the caller sent that cannot be used is
+a plain `ToolInputError` (422); a live registry that answers with something
+that is not a catalogue is a `CatalogError`, and a model answer that is not
+JSON a `ModelAnswerError` -- both server faults, 500.
 
 ## Arguments
 
@@ -62,7 +71,7 @@ names the endpoint or the exact model tag.
 | `history` | earlier turns, `[{"role", "content"}, ...]` as JSON |
 | `candidates` | how many tools the model is shown, best first. `0` = all |
 | `execute` | run the chosen tool as well as proposing it. **Off by default** |
-| `endpoint` | the Ollama server. Empty = `OLLAMA_HOST`, then loopback |
+| `endpoint` | the Ollama server. Empty = `OLLAMA_HOST`, then loopback. Otherwise a loopback address or `OLLAMA_HOST` itself: the server sends requests to no other host a caller names |
 | `model_tag` | the Ollama model, e.g. `qwen3:8b` |
 | `temperature`, `seed` | 0 and 0, so the same request routes the same way twice |
 | `timeout_seconds` | per model call, and for reading the registry |
@@ -105,6 +114,14 @@ So the catalogue is an **input**, and its default source is the registry:
    outbound call.
 
 Neither available is a refusal naming both. It never guesses.
+
+Both shapes are read: the schema `scripts/describe.py` writes (`path`, `str`,
+`int`, `float`, `bool`, `list[...]`, `vec2`), and what `GET /tools` publishes
+after the server folds it into its own vocabulary (`choice`, `multichoice` with
+an `{option: selected}` mapping, `initial` for a default, and server file types
+such as `csv_file` or `folder`). An argument of any other type is kept
+**opaque**: logged, never offered to the model, and still counted as missing
+when required -- one new type never takes the whole catalogue down.
 
 ### Why not the supervisor
 
@@ -151,6 +168,16 @@ Turning it on is not enough. Execution is refused, with the reason recorded in
   up);
 - the router's own confidence is below 0.5 -- a floor against a model that has
   said in its own answer that it is guessing, not a quality bar;
+- a `path` argument does not resolve, links followed, inside one of `folders`.
+  The server refuses a file argument sent as a path -- a file has to be
+  uploaded -- and a supervised call does not pass that check, so without this a
+  prompt naming a path, or a model inventing one, would have the callee read it.
+  `folders` is itself a value the caller chose, so on a server (`SADT_JOB_DIR`
+  set) a folder counts only if it lies inside the run's own job directory;
+- a model-named argument (`model`, `reference`, `*_model`, `*_reference`) is a
+  path rather than a bare name. Nothing on a supervised call resolves it among
+  the hosted models on the way, so a path would load whatever weights sit
+  there;
 - nothing injected a supervisor (`SupervisorRequired`, which names both ways
   forward).
 

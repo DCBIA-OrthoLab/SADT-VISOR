@@ -188,102 +188,16 @@ def test_an_absent_shapeaxi_says_how_to_install_it(monkeypatch):
     assert "missing: shapeaxi" in message
 
 
-def test_the_engine_import_probe_runs_the_workaround(monkeypatch):
-    """The import is the only place the workaround can be applied, because
-    `dental_model_seg` reads the name at call time. Run against a stand-in
-    shapeaxi so it holds in a venv without the extra, which is what CI has."""
+def test_the_engine_import_probe_returns_shapeaxis_own_module(monkeypatch):
+    """Run against a stand-in shapeaxi so it holds in a venv without the
+    extra, which is what CI has. Nothing is patched into it any more: the
+    shapeaxi pinned finds DentalModelSeg on its own."""
     shapeaxi = types.ModuleType("shapeaxi")
     shapeaxi.dental_model_seg = types.ModuleType("shapeaxi.dental_model_seg")
-    shapeaxi.saxi_nets = types.ModuleType("shapeaxi.saxi_nets")
     monkeypatch.setitem(sys.modules, "shapeaxi", shapeaxi)
     monkeypatch.setitem(sys.modules, "shapeaxi.dental_model_seg", shapeaxi.dental_model_seg)
-    monkeypatch.setitem(sys.modules, "shapeaxi.saxi_nets", shapeaxi.saxi_nets)
-
-    called = []
-    monkeypatch.setattr(
-        pipeline, "_restore_moved_class", lambda saxi_nets: called.append(saxi_nets)
-    )
 
     assert pipeline._import_dental_model_seg() is shapeaxi.dental_model_seg
-    assert called == [shapeaxi.saxi_nets]
-
-
-def test_the_shapeaxi_version_is_readable_for_the_warning():
-    """The workaround logs which release needed it, so the report at
-    DCBIA-OrthoLab/ShapeAXI can name a version."""
-    assert isinstance(pipeline._shapeaxi_version(), str)
-
-
-# ---------------------------------------------------------------------------
-# The shapeaxi 2.0.x workaround
-# ---------------------------------------------------------------------------
-
-class _MissingTheClass:
-    """shapeaxi 2.0.x: `dental_model_seg` reads DentalModelSeg off this module,
-    and it is not there."""
-
-
-class _HasTheClass:
-    DentalModelSeg = object()
-
-
-@pytest.fixture
-def moved_class(monkeypatch):
-    """A `shapeaxi.saxi_nets_lightning` holding the class 2.0.x misplaced."""
-    moved = types.ModuleType("shapeaxi.saxi_nets_lightning")
-    moved.DentalModelSeg = object()
-    monkeypatch.setitem(sys.modules, "shapeaxi.saxi_nets_lightning", moved)
-    monkeypatch.setitem(sys.modules, "shapeaxi", types.ModuleType("shapeaxi"))
-    return moved
-
-
-def test_the_workaround_points_the_name_back_at_where_the_class_went(moved_class):
-    """Without it, `dental_model_seg.main()` raises AttributeError before it
-    touches a mesh -- and the pre-port tool fails identically on the deployed
-    image."""
-    broken = _MissingTheClass()
-
-    assert pipeline._restore_moved_class(broken) is True
-    assert broken.DentalModelSeg is moved_class.DentalModelSeg
-
-
-def test_the_workaround_says_which_release_needed_it(moved_class, caplog):
-    """It has to be reported upstream, so the log has to name a version."""
-    import logging
-
-    with caplog.at_level(logging.WARNING):
-        pipeline._restore_moved_class(_MissingTheClass())
-
-    assert "DentalModelSeg" in caplog.text
-    assert "saxi_nets_lightning" in caplog.text
-
-
-def test_the_workaround_is_a_no_op_once_upstream_puts_the_name_back():
-    """The `hasattr` guard is what makes this delete itself rather than
-    linger."""
-    fixed = _HasTheClass()
-    before = fixed.DentalModelSeg
-
-    assert pipeline._restore_moved_class(fixed) is False
-    assert fixed.DentalModelSeg is before
-
-
-def test_the_workaround_does_not_import_anything_when_the_name_is_there(monkeypatch):
-    """A no-op must not drag `saxi_nets_lightning` in behind it."""
-    monkeypatch.setitem(sys.modules, "shapeaxi", None)
-
-    assert pipeline._restore_moved_class(_HasTheClass()) is False
-
-
-def test_a_shapeaxi_with_the_class_in_neither_module_is_unavailable(monkeypatch):
-    """A release that moved it a third time must say so rather than fail later
-    with an AttributeError from inside shapeaxi."""
-    empty = types.ModuleType("shapeaxi.saxi_nets_lightning")
-    monkeypatch.setitem(sys.modules, "shapeaxi.saxi_nets_lightning", empty)
-    monkeypatch.setitem(sys.modules, "shapeaxi", types.ModuleType("shapeaxi"))
-
-    with pytest.raises(ToolUnavailableError, match="2.0.2"):
-        pipeline._restore_moved_class(_MissingTheClass())
 
 
 # ---------------------------------------------------------------------------

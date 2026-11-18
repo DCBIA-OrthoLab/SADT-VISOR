@@ -149,13 +149,14 @@ def test_nothing_matched_raises_instead_of_writing_an_empty_folder(tmp_path):
     _roi(rois / "Gamma_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
     _roi(rois / "Delta_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
 
-    with pytest.raises(ValueError, match="cropped nothing"):
+    with pytest.raises(ValueError, match="0 of 2 scans cropped: none matched an ROI"):
         sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
 
 
-def test_the_no_match_error_names_the_keys_on_both_sides(tmp_path):
-    """A message a user can act on: what the scans are called, what the ROIs
-    are called, and therefore which of the two to rename."""
+def test_the_no_match_error_describes_the_keys_without_naming_them(tmp_path):
+    """A message a user can act on -- how the two sides' names differ, and
+    therefore which to rename -- without listing patient identifiers, which
+    the server would redact into placeholders anyway."""
     scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
     _volume(scans / "Alpha_Scan.nii.gz")
     _roi(rois / "Gamma_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
@@ -165,7 +166,30 @@ def test_the_no_match_error_names_the_keys_on_both_sides(tmp_path):
         sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
 
     message = str(raised.value)
-    assert "Alpha" in message and "Gamma" in message and "Delta" in message
+    assert not any(name in message for name in ("Alpha", "Gamma", "Delta"))
+    assert "none of the 1 scan keys equals any of the 2 ROI keys" in message
+
+
+def test_the_no_match_error_says_when_the_key_shapes_differ(tmp_path):
+    scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
+    _volume(scans / "Alpha_01_Scan.nii.gz")
+    _roi(rois / "Gamma_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+    _roi(rois / "Delta_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+
+    with pytest.raises(ValueError) as raised:
+        sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
+    assert ("Scan names reduce to keys of 2 parts (letters, digits), ROI names "
+            "to keys of 1 part (letters).") in str(raised.value)
+
+
+def test_the_no_match_error_says_when_only_the_case_differs(tmp_path):
+    scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
+    _volume(scans / "alpha_Scan.nii.gz")
+    _roi(rois / "ALPHA_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+    _roi(rois / "Delta_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+
+    with pytest.raises(ValueError, match="differ only in letter case"):
+        sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
 
 
 def test_a_scan_with_no_roi_is_reported_rather_than_logged_and_forgotten(tmp_path):
@@ -521,7 +545,8 @@ def test_a_run_where_every_scan_failed_raises(tmp_path):
     (scans / "A_scan.nii.gz").write_bytes(b"not a volume")
     box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
 
-    with pytest.raises(ValueError, match="all 1 scan"):
+    # An unreadable upload is the caller's to fix, so it stays a ValueError.
+    with pytest.raises(ValueError, match=r"0 of 1 scans cropped; most common failure \(1 of 1\): ValueError: the scan could not be read"):
         sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
 
 
@@ -546,7 +571,7 @@ def test_the_failure_message_says_which_exception_and_why(tmp_path):
 
     sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
 
-    assert "RuntimeError" in _report(out)["failed"]["B_scan.nii.gz"]
+    assert "the scan could not be read" in _report(out)["failed"]["B_scan.nii.gz"]
 
 
 # ===========================================================================
@@ -782,7 +807,7 @@ def test_an_unknown_surfaces_value_is_refused(tmp_path):
     _volume(scans / "A_scan.nii.gz")
     box = _roi(tmp_path / "box.mrk.json", center=(9.5, 9.5, 9.5), size=(18, 18, 18))
 
-    with pytest.raises(ValueError, match="cropped nothing"):
+    with pytest.raises(ValueError, match="0 of 1 scans cropped"):
         sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out, surfaces="sometimes")
     assert "surfaces must be one of" in _report(out)["failed"]["A_scan.nii.gz"]
 
@@ -1069,7 +1094,7 @@ def test_an_roi_that_misses_the_volume_is_refused_with_a_message(tmp_path):
     box = _roi(tmp_path / "box.mrk.json", center=(500.0, 500.0, 500.0), size=(4, 4, 4))
     out = tmp_path / "out"
 
-    with pytest.raises(ValueError, match="cropped nothing"):
+    with pytest.raises(ValueError, match="0 of 1 scans cropped"):
         sadt_autocrop3d.run(scans=scan, roi=box, output_dir=out)
     assert "does not overlap" in _report(out)["failed"]["A_scan.nii.gz"]
 
@@ -1439,3 +1464,186 @@ def test_the_report_names_outputs_relative_to_the_output_folder(tmp_path):
         assert not os.path.isabs(entry["produced"][0]), entry["produced"][0]
         assert (output_dir / entry["produced"][0]).is_file()
         assert "_absolute" not in entry
+
+
+# ===========================================================================
+# Progress and the run's log -- a position in the batch, never a scan's name
+# ===========================================================================
+
+def _events(events_file):
+    """Progress records and log records, apart. Logs carry `kind: log`."""
+    records = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    return ([r for r in records if r.get("kind") != "log"],
+            [r for r in records if r.get("kind") == "log"])
+
+
+def test_progress_counts_scans_and_never_names_one(tmp_path, monkeypatch):
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
+    for subject in ("Smith_John", "Jones_Mary", "Brown_Ann"):
+        _volume(scans / f"{subject}_Scan.nii.gz")
+    _roi(rois / "Any_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+
+    sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
+
+    events, logs = _events(events_file)
+    assert [event["message"] for event in events] == [
+        "scan 1 of 3", "scan 2 of 3", "scan 3 of 3",
+    ]
+    fractions = [event["fraction"] for event in events]
+    assert fractions == sorted(fractions)
+    assert all(0.0 <= fraction < 1.0 for fraction in fractions)
+    assert logs == []
+    text = events_file.read_text()
+    assert not any(name in text for name in ("Smith", "Jones", "Brown", ".nii"))
+
+
+def test_a_scan_that_fails_or_has_no_roi_is_logged_by_position(
+    tmp_path, monkeypatch, caplog
+):
+    """The defect this closes: the warning used to carry the scan's file name,
+    and a tool's stderr ends up in the server's own log on a failed run."""
+    events_file = tmp_path / "events.jsonl"
+    monkeypatch.setenv("SADT_PROGRESS_FILE", str(events_file))
+    scans, rois, out = tmp_path / "scans", tmp_path / "rois", tmp_path / "out"
+    _volume(scans / "Alpha_Scan.nii.gz")
+    (scans / "Beta_Scan.nii.gz").write_bytes(b"not a volume")
+    _volume(scans / "Gamma_Scan.nii.gz")
+    _roi(rois / "Alpha_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+    _roi(rois / "Beta_ROI.mrk.json", center=(5, 5, 5), size=(4, 4, 4))
+
+    with caplog.at_level("WARNING", logger="AutoCrop3D"):
+        sadt_autocrop3d.run(scans=scans, roi=rois, output_dir=out)
+
+    _, logs = _events(events_file)
+    assert [(log["level"], log["audience"], log["message"]) for log in logs] == [
+        ("warning", "user", "scan 2 of 3 could not be cropped; the report says why"),
+        ("warning", "user", "scan 3 of 3 matched no ROI and was not cropped"),
+    ]
+    assert not any("Beta" in record.getMessage() for record in caplog.records)
+    assert "Beta" not in events_file.read_text()
+    assert "Beta_Scan.nii.gz" in _report(out)["failed"], "the report still names it"
+
+
+# ===========================================================================
+# What an operator reads when a run fails
+# ===========================================================================
+
+def test_a_failed_scan_is_logged_with_position_step_class_and_message(tmp_path, caplog):
+    scans, out = tmp_path / "scans", tmp_path / "out"
+    _volume(scans / "Alpha_scan.nii.gz")
+    (scans / "Beta_scan.nii.gz").write_bytes(b"not a volume")
+    box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
+
+    with caplog.at_level("WARNING", logger="AutoCrop3D"):
+        sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
+
+    failures = [m for m in caplog.messages if m.startswith("scan 2 of 2:")]
+    assert len(failures) == 1
+    assert failures[0].startswith(
+        "scan 2 of 2: reading the scan failed (ValueError: the scan could not be read"
+    )
+    assert "Beta" not in caplog.text and "box.mrk" not in caplog.text
+
+
+def test_a_partial_run_ends_with_a_warning_summary(tmp_path, caplog):
+    scans, out = tmp_path / "scans", tmp_path / "out"
+    _volume(scans / "A_scan.nii.gz")
+    (scans / "B_scan.nii.gz").write_bytes(b"not a volume")
+    box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
+
+    with caplog.at_level("INFO", logger="AutoCrop3D"):
+        sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
+
+    summary = [r for r in caplog.records if "scans cropped" in r.getMessage()]
+    assert [(r.levelname, r.getMessage()) for r in summary] == [
+        ("WARNING", "1 of 2 scans cropped, 1 failed, 0 matched no ROI"),
+    ]
+
+
+def test_a_clean_run_ends_with_an_info_summary(tmp_path, caplog):
+    scans, out = tmp_path / "scans", tmp_path / "out"
+    _volume(scans / "A_scan.nii.gz")
+    box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
+
+    with caplog.at_level("INFO", logger="AutoCrop3D"):
+        sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
+
+    assert ("INFO", "1 of 1 scans cropped, 0 failed, 0 matched no ROI") in [
+        (r.levelname, r.getMessage()) for r in caplog.records
+    ]
+
+
+def test_an_internal_failure_on_every_scan_is_not_answered_as_a_bad_request(
+    tmp_path, monkeypatch
+):
+    scans, out = tmp_path / "scans", tmp_path / "out"
+    _volume(scans / "A_scan.nii.gz")
+    _volume(scans / "B_scan.nii.gz")
+    box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("ITK writer exploded")
+
+    monkeypatch.setattr(sitk, "WriteImage", boom)
+
+    with pytest.raises(RuntimeError) as raised:
+        sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value) == (
+        "0 of 2 scans cropped; most common failure (2 of 2): "
+        "RuntimeError: ITK writer exploded"
+    )
+
+
+@pytest.mark.parametrize("argument", ["scans", "roi"])
+def test_a_missing_path_names_the_argument(tmp_path, argument):
+    _volume(tmp_path / "scans" / "A_scan.nii.gz")
+    box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
+    paths = {"scans": tmp_path / "scans", "roi": box}
+    paths[argument] = tmp_path / "absent"
+
+    with pytest.raises(FileNotFoundError) as raised:
+        sadt_autocrop3d.run(output_dir=tmp_path / "out", **paths)
+    assert str(raised.value).startswith(f"'{argument}': no such file or folder")
+
+
+def test_a_folder_of_only_earlier_outputs_is_said_to_be_one(tmp_path, caplog):
+    scans, out = tmp_path / "scans", tmp_path / "out"
+    _volume(scans / "A_scan_cropped.nii.gz")
+    box = _roi(tmp_path / "box.mrk.json", center=(5.5, 5.5, 5.5), size=(4, 4, 4))
+
+    with caplog.at_level("INFO", logger="AutoCrop3D"):
+        sadt_autocrop3d.run(scans=scans, roi=box, output_dir=out)
+
+    assert any(m.startswith("'scans' holds only earlier AutoCrop3D outputs (1 ")
+               for m in caplog.messages)
+
+
+def test_a_rotated_roi_is_warned_about_by_scan_position_not_name(tmp_path, caplog):
+    path = _roi(tmp_path / "Alpha_ROI.mrk.json", center=(1.0, 2.0, 3.0), size=(4, 4, 4),
+                orientation=[0.7071, -0.7071, 0, 0.7071, 0.7071, 0, 0, 0, 1])
+
+    with caplog.at_level("WARNING", logger="AutoCrop3D"):
+        pipeline.read_roi(str(path), "scan 3 of 7")
+
+    assert caplog.messages == [
+        "scan 3 of 7: the ROI is rotated; AutoCrop3D crops an axis-aligned box, "
+        "so the rotation is ignored"
+    ]
+
+
+def test_a_surface_vtk_fails_to_write_raises_instead_of_passing_silently(
+    tmp_path, monkeypatch
+):
+    """`vtkPolyDataWriter.Write()` returns 0 and prints to stderr; nothing
+    raised, so a missing surface used to be reported as written."""
+    image = sitk.ReadImage(str(_labelmap(tmp_path / "s.nii.gz",
+                                         {1: (np.s_[3:8], np.s_[3:8], np.s_[3:8])})))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    with pytest.raises(RuntimeError, match="VTK could not write the surface file"):
+        pipeline.write_surface(image, str(tmp_path / "no" / "such" / "dir" / "s.vtk"),
+                               str(scratch), padding_mm=2.0, smoothing_iterations=0)

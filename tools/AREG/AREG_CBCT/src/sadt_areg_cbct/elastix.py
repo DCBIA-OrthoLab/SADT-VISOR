@@ -18,6 +18,9 @@ oriented data, ASO having recentred it.
 """
 
 import logging
+import os
+import re
+import tempfile
 
 import numpy as np
 import SimpleITK as sitk
@@ -34,7 +37,22 @@ _INSTALL_HINT = (
 
 
 class RegistrationError(Exception):
-    """One patient could not be registered. Reported, and the batch goes on."""
+    """One patient could not be registered. Reported, and the batch goes on.
+
+    `cause` says whose problem it is, because a run where nothing registered
+    has to come back as the caller's fault or the server's, and only the place
+    that raised knows which:
+
+    * "input" -- the caller's data or arguments (a label the mask does not
+      hold, a scan that cannot be read);
+    * "mask" -- the mask does not fit its scan, which is the caller's fault
+      when they sent the mask and the segmentation step's when it made it;
+    * "engine" -- the registration itself.
+    """
+
+    def __init__(self, message: str, cause: str = "engine"):
+        super().__init__(message)
+        self.cause = cause
 
 
 def check_dependencies() -> None:
@@ -150,12 +168,14 @@ def apply_mask(image: sitk.Image, mask: sitk.Image, label: int = None) -> tuple:
     if mask.GetSize() != image.GetSize():
         raise RegistrationError(
             f"the mask is {mask.GetSize()} voxels and the scan is {image.GetSize()}: "
-            f"they are not the same sampling of the same patient."
+            f"they are not the same sampling of the same patient.",
+            cause="mask",
         )
     if not np.allclose(mask.GetSpacing(), image.GetSpacing(), atol=1e-4):
         raise RegistrationError(
             f"the mask's spacing {tuple(round(v, 4) for v in mask.GetSpacing())} differs "
-            f"from the scan's {tuple(round(v, 4) for v in image.GetSpacing())}."
+            f"from the scan's {tuple(round(v, 4) for v in image.GetSpacing())}.",
+            cause="mask",
         )
     # Same sampling: any remaining origin/direction difference is the float
     # drift a round trip through a segmentation tool leaves behind.
@@ -169,7 +189,8 @@ def apply_mask(image: sitk.Image, mask: sitk.Image, label: int = None) -> tuple:
             raise RegistrationError(
                 f"the mask holds no label {label} (it has "
                 f"{', '.join(str(int(value)) for value in present)}). Set "
-                f"'segmentation_label' to 0 to use the whole mask."
+                f"'segmentation_label' to 0 to use the whole mask.",
+                cause="input",
             )
         binary = sitk.GetImageFromArray((array == label).astype(np.uint8))
         binary.CopyInformation(image)
@@ -187,8 +208,13 @@ def apply_mask(image: sitk.Image, mask: sitk.Image, label: int = None) -> tuple:
 # Registration
 # ---------------------------------------------------------------------------
 
-def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Transform:
+def register(fixed: sitk.Image, moving: sitk.Image, cost: list = None) -> sitk.Transform:
     """Rigidly register `moving` onto `fixed`; return the resampling transform.
+
+    `cost`, when given a list, receives what elastix's own log says the
+    optimiser did: one list of per-iteration metric values per resolution,
+    coarse to fine (see `read_cost`). Read from the log this function already
+    keeps, so asking for it costs a parse of a few hundred lines.
 
     The returned transform maps a point of the FIXED image's space to the
     corresponding point of the MOVING image's space, which is the direction
@@ -202,11 +228,137 @@ def register(fixed: sitk.Image, moving: sitk.Image) -> sitk.Transform:
     """
     itk = _import_elastix()
 
+    # Said BEFORE the call: when elastix fails, what it was asked to do is the
+    # half of the diagnosis its own message never carries.
+    logger.info(
+        "elastix rigid registration: fixed %s voxels at %s mm, moving %s voxels at "
+        "%s mm (%s, %s resolutions, up to %s iterations)",
+        "x".join(str(v) for v in fixed.GetSize()),
+        "x".join(f"{v:.3g}" for v in fixed.GetSpacing()),
+        "x".join(str(v) for v in moving.GetSize()),
+        "x".join(f"{v:.3g}" for v in moving.GetSpacing()),
+        _RIGID_PARAMETERS["Metric"][0],
+        _RIGID_PARAMETERS["NumberOfResolutions"][0],
+        _RIGID_PARAMETERS["MaximumNumberOfIterations"][0],
+    )
+
     registration = itk.ElastixRegistrationMethod.New(_to_itk(fixed), _to_itk(moving))
     registration.SetParameterObject(rigid_parameter_map())
     registration.SetLogToConsole(False)
-    registration.UpdateLargestPossibleRegion()
+    # The log goes to a private temporary directory, removed on return. The
+    # exception elastix raises says only "Internal elastix error: See elastix
+    # log", so without the log a failure has no cause at all; with it the ITK
+    # `Description:` line names one ("fewer than four pixels along direction
+    # 0"). The log holds parameters and metric values, never image data, and the
+    # directory is unique per call, so concurrent runs cannot share it.
+    with tempfile.TemporaryDirectory(prefix="areg_elastix_") as log_dir:
+        registration.SetLogToFile(True)
+        registration.SetOutputDirectory(log_dir)
+        try:
+            registration.UpdateLargestPossibleRegion()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"elastix rigid registration failed: {_failure_description(exc, log_dir)}"
+            ) from exc
+        if cost is not None:
+            cost.extend(read_cost(log_dir))
     return retrieve_transform(registration.GetTransformParameterObject())
+
+
+def read_cost(log_dir: str) -> list:
+    """The metric value of every iteration, one list per resolution, from an
+    elastix output directory; `[]` when there is nothing to read.
+
+    elastix writes its iteration table to `IterationInfo.<n>.R<r>.txt` when
+    asked to, and always into `elastix.log`: the same tab-separated table,
+    under a header whose `2:Metric` column is the cost. The per-resolution
+    files win when present. Never raises: a metric the user does not get is
+    no reason to fail a registration that worked.
+    """
+    try:
+        names = sorted(
+            (name for name in os.listdir(log_dir)
+             if re.fullmatch(r"IterationInfo\.0\.R\d+\.txt", name)),
+            key=lambda name: int(name.rsplit(".R", 1)[1].split(".")[0]),
+        )
+        texts = []
+        for name in names or ["elastix.log"]:
+            with open(os.path.join(log_dir, name), encoding="utf-8", errors="replace") as handle:
+                texts.append(handle.read())
+    except OSError:
+        return []
+    levels = []
+    for text in texts:
+        levels += parse_iterations(text)
+    return levels
+
+
+def parse_iterations(text: str) -> list:
+    """Every iteration table in `text`, as one list of metric values per table.
+
+    A table starts at a header line beginning `1:ItNr` and runs as long as the
+    lines that follow start with an iteration number.
+    """
+    levels, column, values = [], None, None
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if fields[0].strip() == "1:ItNr":
+            if values:
+                levels.append(values)
+            names = [field.strip() for field in fields]
+            column = names.index("2:Metric") if "2:Metric" in names else None
+            values = []
+            continue
+        if values is None:
+            continue
+        if not fields[0].strip().isdigit():
+            if values:
+                levels.append(values)
+            column, values = None, None
+            continue
+        if column is not None and column < len(fields):
+            try:
+                values.append(float(fields[column]))
+            except ValueError:
+                pass
+    if values:
+        levels.append(values)
+    return levels
+
+
+# "ITK ERROR: RecursiveGaussianImageFilter(0x59508e2d5540): " -- the class and
+# the object's address say nothing an operator can act on, and the address
+# changes every run.
+_ITK_PREFIX = re.compile(r"^(ITK ERROR:\s*)?\w+\(0x[0-9a-fA-F]+\):\s*")
+
+
+def describe(exc: BaseException) -> str:
+    """The one meaningful line of an ITK exception.
+
+    ITK's message is the C++ source file and line it was raised at, then the
+    object, then the sentence. Only the sentence is kept: the source path is
+    the build machine's, and the whole thing would be cut by the log line's
+    length long before reaching the cause. A `Description:` line wins when
+    there is one, the last non-empty line otherwise.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("Description:"):
+            return _ITK_PREFIX.sub("", line[len("Description:"):].strip())
+    return _ITK_PREFIX.sub("", lines[-1]) if lines else type(exc).__name__
+
+
+def _failure_description(exc: BaseException, log_dir: str) -> str:
+    """The `Description:` line of elastix's log, or of the exception itself."""
+    try:
+        with open(os.path.join(log_dir, "elastix.log"), encoding="utf-8",
+                  errors="replace") as handle:
+            for line in handle:
+                if line.strip().startswith("Description:"):
+                    return describe(RuntimeError(line))
+    except OSError:
+        pass
+    return describe(exc)
 
 
 def retrieve_transform(parameter_object) -> sitk.Transform:

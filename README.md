@@ -71,9 +71,11 @@ venv, and it would solve a problem that does not exist.
 
 A tool that needs another tool **mid-run** declares `*, sup` and is handed a
 supervisor; the call re-enters the same runner with the sibling's interpreter.
-`ASO` and `AREG` are the two that do. Everything the server has to hold up on
-its side of that -- and everything else it took over when the tools stopped
-doing it -- is in [docs/SERVER_CONTRACT.md](docs/SERVER_CONTRACT.md).
+`ASO`, `AREG` and `VFACE` are the ones that do, and `VFACE` is the widest: six
+tools, two of them supervised in their own right, so a full run is four deep
+against the runner's cap of five. Everything the server has to hold up on its
+side of that -- and everything else it took over when the tools stopped doing it
+-- is in [docs/SERVER_CONTRACT.md](docs/SERVER_CONTRACT.md).
 
 The full set of rules -- annotations, defaults, batch inputs, where output may be
 written -- is in [CONTRIBUTING.md](CONTRIBUTING.md). `tools/_template/` is a
@@ -163,7 +165,8 @@ out/
 The second command is the whole point: ASO needs landmarks mid-run, so it is
 given a **supervisor**, and `sup.run("ALI_CBCT", ...)` re-enters this same
 script with that tool's interpreter. Chaining and nesting are the same
-recursion -- `AREG → ASO → ALI_CBCT` is three levels of it with no special case.
+recursion -- `VFACE → AREG_CBCT → ASO → ALI_CBCT` is four levels of it with
+no special case, and it is the deepest chain here.
 
 **Developer convenience, not the deployment path.** In production the server's
 `execution/runner.py` does this, and a tool cannot tell the two apart: five

@@ -200,13 +200,18 @@ class FakeSup:
         self.out = Path(tmp_path) if tmp_path else None
         self.tmp = Path(tmp_path) if tmp_path else None
         self.calls = []
+        self.spans = []
         self.messages = []
+        self.logs = []
         self._result = result
         self._fail = fail
 
     def run(self, tool_name, **params):
         from pathlib import Path
 
+        # The caller's span of its own bar. The server's supervisor removes it
+        # before the callee sees it, so it is recorded apart, never passed on.
+        self.spans.append((tool_name, params.pop("_progress", None)))
         self.calls.append((tool_name, params))
         if self._fail is not None:
             raise self._fail
@@ -218,5 +223,6 @@ class FakeSup:
     def progress(self, fraction, message):
         self.messages.append((fraction, message))
 
-    def log(self, message):
+    def log(self, message, level="info", user=False):
         self.messages.append((None, message))
+        self.logs.append((level, user, message))

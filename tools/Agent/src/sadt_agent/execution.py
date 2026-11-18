@@ -30,6 +30,7 @@ missing venv.
 """
 
 import logging
+import os
 
 from .errors import SupervisorRequired
 
@@ -39,6 +40,118 @@ logger = logging.getLogger("Agent")
 # directory. A subdirectory rather than the directory itself, so the routing
 # decision and the run it produced never collide over a file name.
 RUN_DIRECTORY = "run"
+
+# The slice of this tool's bar the chosen tool fills. Passed to the supervisor
+# as `_progress`, so the server folds the callee's own 0..1 into it and the
+# clinician sees one bar rather than the router's and then the callee's. The
+# routing before it is a few model round-trips, seconds against the minutes or
+# the hour of whatever imaging tool it picks, so the run takes nearly all of it:
+# starting the callee at 60%, as the waypoint used to, left the bar parked
+# there for almost the whole job.
+EXECUTION_SPAN = (0.1, 1.0)
+
+# The argument types that name a file or a folder on this server, as the
+# catalogue reads them (`catalog.canonical_type` folds the server's file types
+# into these two).
+PATH_TYPES = ("path", "list[path]")
+
+# Names the server reads as a hosted bundle it resolves itself: `model`,
+# `reference`, and anything ending in `_model` or `_reference`. The rule the
+# server applies (VISOR-serve `registry/conventions.is_model`), restated here
+# because a tool imports nothing from the server.
+MODEL_NAMES = ("model", "reference")
+
+# The job directory the server runs this tool in (VISOR-serve,
+# `execution/dispatch.py`), inherited unchanged by a supervised call. Set means
+# "on a server", where the folders are confinement roots only inside it.
+JOB_DIR_ENV = "SADT_JOB_DIR"
+
+
+def is_model_named(argument: str) -> bool:
+    return any(argument == name or argument.endswith("_" + name) for name in MODEL_NAMES)
+
+
+def confinement_refusal(tool, arguments: dict, folders) -> str:
+    """Why `arguments` may not be run as they stand, or "" when they may.
+
+    The server refuses a file argument sent as a path: a file has to be
+    uploaded, or a workstation could point a tool at another run's inputs, at
+    the server's own secrets, or at weights of its own making. What the model
+    extracted reaches `supervisor.run` without passing that check -- a
+    supervised call is not a request -- so a prompt that names a path, or a
+    model that invents one, would have the callee read it. Two rules close
+    that, checked on the values themselves:
+
+    - a `path` argument must resolve, links followed, inside one of the
+      folders this request was given: the only paths the model was shown;
+    - a model-named argument must be a bare NAME, never a path. On a
+      supervised call nothing resolves it against the server's hosted models
+      on the way -- the callee gets the string as it was written, and resolves
+      it from its own data root -- so a path there would load whatever weights
+      sit at it, and weights are pickles. Not even a path inside the folders:
+      those hold what the request is about, not code to run.
+
+    The folders themselves are the CALLER's to name: a list is a plain value
+    on the wire, not an upload, so whoever holds the API token chooses them,
+    and `folders=["/"]` would make every path one "inside a folder". So on a
+    server -- `SADT_JOB_DIR` set -- a folder is a root only if it resolves
+    inside the run's own job directory, and any other is ignored: confined to
+    no root, nothing runs. Outside a server the folders are the caller's own
+    machine, and they stay the roots.
+
+    The reason names the argument and never its value, which is a patient's
+    file name.
+    """
+    roots = _confinement_roots(folders)
+    for name, value in arguments.items():
+        items = value if isinstance(value, (list, tuple)) else [value]
+        if is_model_named(name):
+            if not all(_is_bare_name(item) for item in items):
+                return (
+                    "'{}' names a model by a path. A model is given by its "
+                    "name alone, among those the server hosts.".format(name)
+                )
+            continue
+        declared = (tool.get("arguments", {}).get(name) or {}).get("type")
+        if declared not in PATH_TYPES:
+            continue
+        if not all(_is_inside(item, roots) for item in items):
+            return (
+                "'{}' points outside the folders this request was given. Only "
+                "a path inside one of them can be run, and on a server only a "
+                "folder inside this run's own job counts.".format(name)
+            )
+    return ""
+
+
+def _confinement_roots(folders) -> list:
+    """The folders a path may lie in, links resolved: on a server, only those
+    inside the job directory (see `confinement_refusal`)."""
+    roots = [os.path.realpath(str(folder)) for folder in folders or ()
+             if str(folder).strip()]
+    job_dir = os.environ.get(JOB_DIR_ENV, "").strip()
+    if not job_dir:
+        return roots
+    return [root for root in roots if _is_inside(root, [os.path.realpath(job_dir)])]
+
+
+def _is_bare_name(value) -> bool:
+    text = str(value)
+    return (bool(text.strip()) and text not in (".", "..") and "\0" not in text
+            and "/" not in text and "\\" not in text
+            and not (os.altsep and os.altsep in text))
+
+
+def _is_inside(value, roots) -> bool:
+    """Whether `value`, every link resolved, is one of `roots` or under one.
+
+    Resolved rather than compared as written: `<folder>/../elsewhere` and a
+    link inside a folder pointing out of it both read as inside until they are.
+    A relative path resolves against the directory this tool runs in, which is
+    none of the folders, so it is refused too.
+    """
+    resolved = os.path.realpath(str(value))
+    return any(os.path.commonpath([root, resolved]) == root for root in roots)
 
 
 def invoke(supervisor, tool_name: str, arguments: dict, output_dir):
@@ -63,11 +176,11 @@ def invoke(supervisor, tool_name: str, arguments: dict, output_dir):
 
     logger.info("running '%s' through the supervisor", tool_name)
     if hasattr(supervisor, "progress"):
-        supervisor.progress(0.6, "running {}".format(tool_name))
+        supervisor.progress(EXECUTION_SPAN[0], "running {}".format(tool_name))
 
     # `supervisor`, not `sup` -- see this module's docstring. The name is the
     # only thing that differs; this is an ordinary supervised call.
-    produced = supervisor.run(tool_name, **parameters)
+    produced = supervisor.run(tool_name, **parameters, _progress=EXECUTION_SPAN)
 
     return destination, _describe(produced)
 

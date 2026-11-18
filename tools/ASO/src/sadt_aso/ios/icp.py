@@ -21,7 +21,7 @@ Ported from `ASO_IOS/ASO_IOS_utils/icp.py`, with three things changed:
 import numpy as np
 import vtk
 
-from .. import geometry
+from .. import geometry, user_metrics
 from . import surfaces
 
 
@@ -63,11 +63,16 @@ def register(
     target: dict,
     max_triplets: int = 2500,
     seed: int = 0,
+    stats: dict = None,
 ) -> np.ndarray:
     """The 4x4 matrix taking `source` points onto `target` points.
 
     Both dicts must be keyed identically -- tooth ids for the fully-automated
     mode, `<tooth><landmark type>` labels for the semi-automated one.
+
+    `stats`, when given, is filled with what the fit measured: the labels, the
+    distance of each point to its target after the three-point fit and after
+    the ICP, and the ICP's iterations and closest-point RMS distance.
     """
     if set(source) != set(target):
         only_source = sorted(set(source) - set(target))
@@ -95,7 +100,24 @@ def register(
     coarse, coarse_matrix, _ = geometry.init_icp(
         ordered_source, ordered_target, picks, include_translation=True
     )
-    return _icp_matrix(coarse, ordered_target) @ coarse_matrix
+    icp_matrix, iterations = _icp_matrix(coarse, ordered_target)
+    matrix = icp_matrix @ coarse_matrix
+    if stats is not None:
+        labels = list(ordered_source)
+        final = geometry.transform_landmarks(ordered_source, matrix)
+        stats.update({
+            "labels": labels,
+            "stages": [
+                {"after": user_metrics.STEP_THREE_POINT,
+                 "distances_mm": user_metrics.distances(coarse, ordered_target, labels)},
+                {"after": user_metrics.STEP_ORIENTATION,
+                 "distances_mm": user_metrics.distances(final, ordered_target, labels)},
+            ],
+            "icp": {"iterations": iterations,
+                    "rms_closest_mm": user_metrics.closest_point_rms(
+                        final.values(), ordered_target.values())},
+        })
+    return matrix
 
 
 def geometry_min_points() -> int:
@@ -103,7 +125,8 @@ def geometry_min_points() -> int:
     return 3
 
 
-def _icp_matrix(source: dict, target: dict) -> np.ndarray:
+def _icp_matrix(source: dict, target: dict) -> tuple:
+    """`(4x4 ICP matrix, iterations it ran)`."""
     icp = vtk.vtkIterativeClosestPointTransform()
     icp.SetSource(_to_polydata(source))
     icp.SetTarget(_to_polydata(target))
@@ -116,7 +139,7 @@ def _icp_matrix(source: dict, target: dict) -> np.ndarray:
     matrix = icp.GetMatrix()
     return np.array(
         [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
-    )
+    ), int(icp.GetNumberOfIterations())
 
 
 def _to_polydata(points: dict) -> vtk.vtkPolyData:

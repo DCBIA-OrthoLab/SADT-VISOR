@@ -104,12 +104,13 @@ def test_the_pytorch3d_wheel_tag_names_the_torch_that_is_pinned():
     assert f"+pt{major}{int(minor):02d}0" in wheel
 
 
-def test_shapeaxi_is_asked_for_at_least_the_release_the_workaround_targets():
-    """`_restore_moved_class` is written against 2.0.x, and its error message
-    names 2.0.2."""
+def test_shapeaxi_is_asked_for_at_least_the_release_that_finds_its_own_class():
+    """2.0.0 to 2.0.2 looked DentalModelSeg up in `saxi_nets`, where it no
+    longer was; the tool patched it back and logged a warning on every run.
+    2.0.3 reads it from `saxi_nets_lightning`, so nothing here patches it."""
     extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
-    assert "shapeaxi>=2.0.2" in extra
-    assert "2.0.2" in pipeline._restore_moved_class.__doc__
+    assert "shapeaxi>=2.0.3" in extra
+    assert not hasattr(pipeline, "_restore_moved_class")
 
 
 def test_torch_is_pinned_although_upstream_leaves_it_unpinned():
@@ -171,7 +172,10 @@ def test_the_gpu_semaphore_is_gone():
     """Each call is its own process now, so an in-process semaphore would cap
     nothing. `MAX_CONCURRENT_GPU_JOBS` is one counter across tools, server-side."""
     assert "Semaphore" not in source_text()
-    assert "threading" not in imported_names()
+    # `threading` is imported, but only for the daemon thread that counts
+    # finished meshes for the progress bar; nothing here takes a lock that
+    # could cap concurrency.
+    assert "Lock(" not in source_text()
 
 
 def test_no_temporary_directory_is_created_outside_the_output_directory():
@@ -220,7 +224,14 @@ def test_the_tool_reads_no_server_setting():
     """A packaged tool is its own process and shares no configuration; what
     used to be `settings.CROWNSEG_MODEL` is an argument of `run()`."""
     assert "settings" not in imported_names()
-    assert "os.environ" not in source_text()
+    # The vendored `progress.py` is the one exception: it reads the path of
+    # the progress channel the server names, which is a protocol every tool
+    # speaks rather than a setting of this one.
+    assert "os.environ" not in "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (TOOL_DIR / "src").rglob("*.py")
+        if path.name != "progress.py"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +365,7 @@ def test_the_public_surface_is_run_alone():
 def test_the_installed_engine_is_the_documented_release():
     """Only checkable where the extra is installed; the pin above is what CI
     can see."""
-    assert version("shapeaxi") == "2.0.2"
+    assert version("shapeaxi") == "2.0.3"
     for package, pin in EXTRA_PINS.items():
         try:
             assert version(package).split("+")[0] == pin.split("+")[0], package

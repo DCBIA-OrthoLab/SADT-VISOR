@@ -28,10 +28,11 @@ import json
 import logging
 import os
 import shutil
+import statistics
 
 from sadt_areg_common.errors import ToolInputError
 
-from sadt_areg_common import catalogs, pairing
+from sadt_areg_common import catalogs, metrics_table, pairing
 from . import progress, tools
 
 logger = logging.getLogger(__name__)
@@ -78,15 +79,18 @@ class RegistrationRun:
 # unpacks those archives to.
 #
 # Resolved here rather than asked of the caller. `models/` holds every AREG
-# bundle together, around sixty checkpoints, so an unset field arrived as the
-# WHOLE folder and the run died on "has to name an entry holding exactly one"
-# after it had already segmented and oriented both timepoints. Neither of these
-# is a clinical choice: `AREG_model` holds exactly one checkpoint and
-# `IOS_Gold_files` is the frame the published test data is oriented into. A
-# deployment that wants another still names it, and what it names wins.
+# bundle together, so an unset field arrived as the WHOLE folder and the run
+# died on "has to name an entry holding exactly one" after it had already
+# segmented and oriented both timepoints. It is not a clinical choice:
+# `AREG_model` holds exactly one checkpoint. A deployment that wants another
+# still names it, and what it names wins.
+#
+# The orientation reference is NOT resolved here. The intraoral reference
+# arches are ASO's own bundle, and ASO resolves it from its own data folder
+# when it is asked to orient with none named -- there is one intraoral
+# reference. `ios_reference` stays an override a caller may still name.
 _DATA_NAME = "AREG"
 _REGISTRATION_BUNDLE = "AREG_model"
-_ORIENTATION_REFERENCE = "IOS_Gold_files"
 
 
 def _own_bundle(data_root, name):
@@ -97,7 +101,44 @@ def _own_bundle(data_root, name):
     return candidate if os.path.isdir(candidate) else ""
 
 
-def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, height,
+def derive_automation(automation: str, t1_root: str) -> tuple:
+    """The mode this request really is, read off the meshes it sends.
+
+    Returns `(mode, source)`, `source` being "from the data" or "requested".
+
+    IOS has two modes and the difference is written in the file: a
+    Semi-Automated registration takes crown-segmented meshes, a Fully-Automated
+    one labels them with Crown_Seg first. Asking the clinician meant the answer
+    could disagree with the folder, and when it did a run either relabelled
+    meshes that were already labelled or failed on meshes that were not.
+
+    Read off T1 alone. The two timepoints are one cohort of one patient group
+    and are labelled together or not at all; a T2 in a different state is a
+    mixed cohort, which `pipeline` already refuses by patient with a message
+    about the pair.
+
+    NOT read off `ios_reference`, unlike the CBCT engine's `reference`: ASO
+    resolves its own intraoral reference, so naming one is an override and its
+    presence says nothing about which mode the caller wants.
+    """
+    if automation and automation != catalogs.AUTOMATION_AUTO:
+        return automation, "requested"
+
+    # Before the read, which opens every T1 mesh: on a large cohort it takes
+    # long enough that a failure in it would otherwise be reported against
+    # whatever stage the previous message named.
+    progress.emit(0.0, "reading the T1 meshes to tell whether they are already labelled")
+
+    # Imported here, not at module level: this pulls in vtk, and AREG_IOS is
+    # loaded on servers that answer for CBCT alone.
+    from . import surfaces
+
+    if surfaces.all_meshes_carry_labels(t1_root):
+        return catalogs.AUTOMATION_SEMI, "from the data"
+    return catalogs.AUTOMATION_FULLY, "from the data"
+
+
+def _check_ios(automation, patch, registration_model, mgl_landmarks, height,
                sup=None) -> None:
     if patch not in catalogs.PATCH_CHOICES:
         raise ToolInputError(
@@ -131,19 +172,174 @@ def _check_ios(automation, patch, registration_model, reference, mgl_landmarks, 
         return
     tools.require(sup, "Crown_Seg", "Fully-Automated IOS registration")
     tools.require(sup, "ASO", "Fully-Automated IOS registration")
-    if not reference:
-        raise ToolInputError(
-            "Fully-Automated IOS orients both timepoints before registering, which "
-            "needs an orientation reference: name one in 'ios_reference' (see "
-            "GET /tools/AREG_IOS/data)."
-        )
+    # No orientation reference is required: ASO orients onto its own.
+
+
+# How an IOS run shares its bar, as fractions of the whole, per supervised call
+# and per timepoint. The calls come first because they run first, and the
+# per-subject registration takes what is left. Crown_Seg and ALI_IOS each run a
+# network over every mesh of a timepoint; ASO's IOS mode is a tooth-centroid
+# alignment and costs little. A weighting, not a measurement: what is exact is
+# the counter in each message.
+CROWN_SHARE = 0.1
+ORIENT_SHARE = 0.05
+MGL_SHARE = 0.1
+
+
+def _ios_spans(label_and_orient: bool, predict_mgl: bool) -> dict:
+    """{step: (start, end)} for the steps this run makes, in the order it makes
+    them, ending with "register" on whatever is left.
+
+    ONE span per call: the two timepoints are two calls of each tool, so each
+    gets its own slice rather than both filling the same one -- which would
+    show the second as the bar going back.
+    """
+    steps = []
+    if label_and_orient:
+        steps += [("crowns_t1", CROWN_SHARE), ("crowns_t2", CROWN_SHARE),
+                  ("orient_t1", ORIENT_SHARE), ("orient_t2", ORIENT_SHARE)]
+    if predict_mgl:
+        steps += [("mgl_t1", MGL_SHARE), ("mgl_t2", MGL_SHARE)]
+    spans, position = {}, 0.0
+    for name, share in steps:
+        spans[name] = (round(position, 6), round(position + share, 6))
+        position += share
+    spans["register"] = (round(position, 6), 1.0)
+    return spans
+
+
+def _log(sup, message: str, level: str = "info", user: bool = False) -> None:
+    """`sup.log` when there is a supervisor, the progress file's log otherwise.
+
+    Never a file name: the line reaches the operator page, and with `user`
+    the clinician's panel.
+    """
+    if sup is not None and hasattr(sup, "log"):
+        sup.log(message, level=level, user=user)
+    else:
+        progress.log(message, level=level, user=user)
+
+
+def _spread(values) -> str:
+    """`mean ± std mm` for a list of distances (the population std)."""
+    values = [float(value) for value in values]
+    return "{:.2f} ± {:.2f} mm".format(statistics.fmean(values), statistics.pstdev(values))
+
+
+def metric_lines(entry: dict) -> list:
+    """What the registration measured, one quantity per line, for the user.
+
+    - The ICP's cost, the mean squared point-to-point distance in mm^2 from
+      each point of the T2 patch to the closest point of the T1 patch: what
+      `vtkIterativeClosestPointTransform` minimises. VTK keeps no history of
+      it, so it is given where the ICP started (centroids matched) and where
+      it ended.
+    - The surface distance after registration: those same closest-point
+      distances, unsquared, mean ± standard deviation. The VTK ICP keeps every
+      point, so there is no share of matched points to report.
+    - With the mucogingival band, the landmark displacement T1 to T2 after
+      registration: each T2 landmark moved by the registration, against the
+      T1 landmark of the same label; mean ± standard deviation and the
+      landmark furthest from its T1 position.
+
+    Numbers and landmark names only, never a file name.
+    """
+    lines = []
+    metrics = entry.get("metrics") or {}
+    fit = metrics.get("icp") or {}
+    milestones = fit.get("cost_milestones") or []
+    if milestones:
+        # No iteration count: this ICP has no stopping test and always runs
+        # its fixed maximum, which says nothing about the case. Two values,
+        # start and end, since VTK keeps no history in between.
+        lines.append("ICP cost, mean squared {} distance: {:.4f} at the start > {:.4f} "
+                     "at the end mm²".format(fit.get("cost", "point-to-point"),
+                                            milestones[0][1], milestones[-1][1]))
+    if fit.get("surface_mean_mm") is not None:
+        lines.append("surface distance after registration: {:.2f} ± {:.2f} mm".format(
+            fit["surface_mean_mm"], fit["surface_std_mm"]))
+    moved = metrics.get("landmark_displacement") or {}
+    distances, labels = moved.get("distances_mm") or [], moved.get("labels") or []
+    if distances:
+        worst = max(range(len(distances)), key=distances.__getitem__)
+        lines.append("landmark displacement T1 to T2 after registration: {}, "
+                     "max {:.2f} mm ({}), {} pairs".format(
+                         _spread(distances), distances[worst], labels[worst], len(distances)))
+    return lines
+
+
+# The region a report's `patch` names, as one word a spreadsheet filters on.
+_REGION = {catalogs.PATCH_PALATE: "palate", catalogs.PATCH_MGL: "mucogingival"}
+
+
+def metric_tables(report: dict) -> dict:
+    """The run's metrics as two tables, read off the report it already wrote.
+
+    `cases`: one row per patient, the numbers `metric_lines` showed.
+    `landmarks`: one row per patient and landmark, the distance from its T1
+    position once T2 is registered. Only the mucogingival band reads
+    landmarks, so on the palate this table is empty and `metrics_table.write`
+    leaves its sheet out.
+
+    Built from the report rather than collected on the way, so the
+    spreadsheet can never say something the JSON does not. Named by patient
+    key: this file stays with the caller's own results.
+    """
+    region = _REGION.get(report.get("patch"))
+    cases, landmarks = [], []
+    for patient, entry in (report.get("patients") or {}).items():
+        row = {"patient": patient, "status": entry.get("status")}
+        if region:
+            row["region"] = region
+        if entry.get("status") == "failed":
+            row["error"] = entry.get("reason") or entry.get("error")
+            cases.append(row)
+            continue
+        metrics = entry.get("metrics") or {}
+        fit = metrics.get("icp") or {}
+        milestones = fit.get("cost_milestones") or []
+        if milestones:
+            row["icp_cost"] = fit.get("cost", "point-to-point")
+            row["icp_cost_start_mm2"] = milestones[0][1]
+            row["icp_cost_end_mm2"] = milestones[-1][1]
+        if fit.get("surface_mean_mm") is not None:
+            row["surface_mean_mm"] = fit["surface_mean_mm"]
+            row["surface_std_mm"] = fit.get("surface_std_mm")
+        moved = metrics.get("landmark_displacement") or {}
+        distances, labels = moved.get("distances_mm") or [], moved.get("labels") or []
+        if distances:
+            values = [float(value) for value in distances]
+            worst = max(range(len(values)), key=values.__getitem__)
+            row["landmark_displacement_mean_mm"] = statistics.fmean(values)
+            row["landmark_displacement_std_mm"] = statistics.pstdev(values)
+            row["landmark_displacement_max_mm"] = values[worst]
+            row["landmark_displacement_max_label"] = labels[worst]
+            for label, distance in zip(labels, values):
+                landmarks.append({"patient": patient, "landmark": label,
+                                  "displacement_mm": distance})
+        cases.append(row)
+    return {"cases": cases, "landmarks": landmarks}
+
+
+def report_metrics(here: str, entry: dict) -> None:
+    """Send `metric_lines` to the user, under one line saying which subject."""
+    lines = metric_lines(entry)
+    if lines:
+        progress.log(here, level="metric", user=True)
+    for line in lines:
+        progress.log(line, level="metric", user=True)
 
 
 def _run_ios(
     t1_root, t2_root, automation, registration_model, crown_model, mgl_model, orientation_reference,
     ios_patch, mgl_landmarks_path, mgl_patch_height,
-    output_dir, work_dir, suffix, report, sup=None,
-) -> None:
+    output_dir, work_dir, suffix, report, sup=None, registration_model_named=True,
+) -> list:
+    """Run the IOS chain and register every matched subject.
+
+    Returns `[(exception, caller_input), ...]`, one per subject that failed, for
+    `_summarize` to decide whether the run as a whole succeeded.
+    """
     # Imported here rather than at module level: the IOS engine pulls in torch,
     # monai and pytorch3d, and AREG must load (and register CBCT scans) on a
     # server without them.
@@ -164,21 +360,26 @@ def _run_ios(
     if on_palate:
         net.check_dependencies()
 
+    spans = _ios_spans(
+        label_and_orient=automation == catalogs.AUTOMATION_FULLY,
+        predict_mgl=not on_palate and not mgl_landmarks_path,
+    )
+
     prior_transforms: dict = {}
     if automation == catalogs.AUTOMATION_FULLY:
         # Label the crowns, then orient -- the order the Slicer chain used, and
         # the necessary one: ASO's fully-automated IOS mode aligns a mesh by its
         # tooth centroids, so the labels have to exist first.
-        t1_root = tools.label_crowns(sup, t1_root, crown_model or "")
-        t2_root = tools.label_crowns(sup, t2_root, crown_model or "")
-        t1_root = tools.orient_scans(
-            sup,
-            t1_root, orientation_reference, catalogs.MODALITY_IOS
-        )
-        t2_root = tools.orient_scans(
-            sup,
-            t2_root, orientation_reference, catalogs.MODALITY_IOS
-        )
+        progress.emit(spans["crowns_t1"][0], "labelling the crowns with Crown_Seg")
+        t1_root = _counted("Crown_Seg", "labelled meshes", "T1", t1_root, lambda: tools.label_crowns(
+            sup, t1_root, crown_model or "", span=spans["crowns_t1"]))
+        t2_root = _counted("Crown_Seg", "labelled meshes", "T2", t2_root, lambda: tools.label_crowns(
+            sup, t2_root, crown_model or "", span=spans["crowns_t2"]))
+        progress.emit(spans["orient_t1"][0], "orienting the meshes with ASO")
+        t1_root = _counted("ASO", "oriented meshes", "T1", t1_root, lambda: tools.orient_scans(
+            sup, t1_root, orientation_reference, catalogs.MODALITY_IOS, span=spans["orient_t1"]))
+        t2_root = _counted("ASO", "oriented meshes", "T2", t2_root, lambda: tools.orient_scans(
+            sup, t2_root, orientation_reference, catalogs.MODALITY_IOS, span=spans["orient_t2"]))
         report["labelled_and_oriented"] = True
         prior_transforms = _collect_transforms(t2_root, suffix="Or")
 
@@ -195,9 +396,26 @@ def _run_ios(
             f"{len(matched.no_jaw)} mesh(es) named no jaw, "
             f"{len(matched.unpaired)} subject(s) appear at one timepoint only."
         )
+    if matched.no_jaw:
+        # Left out of the run because nothing says which arch they are; until
+        # now only the report said so, and the report goes with a failed job.
+        _log(sup, f"{len(matched.no_jaw)} mesh(es) do not name their jaw (Upper/Lower "
+                  "token) and are not registered", level="warning", user=True)
+    if matched.unpaired:
+        # The run goes on without them, and the clinician who sent them would
+        # otherwise learn it only from the report. A count, never a key: the
+        # key is built from the caller's file names.
+        _log(sup, f"{len(matched.unpaired)} subject(s) appear at one timepoint only "
+                  "and are not registered", level="warning", user=True)
 
     if on_palate:
-        predictor = butterfly.PatchPredictor(registration_model)
+        # The first time this run touches the checkpoint, and the slowest step
+        # before the loop: without a message here a broken bundle is reported
+        # against "orienting the meshes" or whatever came last.
+        progress.emit(spans["register"][0], "loading the palate patch checkpoint")
+        predictor = butterfly.PatchPredictor(
+            registration_model, named_by_caller=registration_model_named
+        )
         painter = ios_pipeline.PalatePainter(predictor)
         report["device"] = predictor.device
         # Which weights placed this patch has to have an answer next to the
@@ -216,25 +434,31 @@ def _run_ios(
             # -- and one call is one model load instead of two.
             landmark_root = os.path.join(work_dir, "mgl_predicted")
             os.makedirs(landmark_root, exist_ok=True)
-            for root in (t1_root, t2_root):
+            progress.emit(spans["mgl_t1"][0], "predicting the mucogingival landmarks with ALI_IOS")
+            for timepoint, root, span in (("T1", t1_root, spans["mgl_t1"]),
+                                          ("T2", t2_root, spans["mgl_t2"])):
                 # No model named: ALI picks the hosted bundle matching the input
                 # from the models hosted for IT, which is the right default and
                 # the only one a caller can express -- AREG's own model list
                 # holds the palatal checkpoint and the orientation references,
                 # none of which is a landmark bundle.
-                _merge_into(
-                    tools.predict_mucogingival(sup, root, mgl_model or ""),
-                    landmark_root,
-                )
+                produced = tools.predict_mucogingival(sup, root, mgl_model or "", span=span)
+                _report_landmarks(root, produced, timepoint)
+                _merge_into(produced, landmark_root)
             report["mgl_landmarks"] = "predicted by 'ALI_IOS'"
 
-        painter = ios_pipeline.MGLPainter(landmark_root, height=mgl_patch_height)
+        painter = ios_pipeline.MGLPainter(
+            landmark_root, height=mgl_patch_height, predicted=not mgl_landmarks_path
+        )
         report["mgl_patch_height_mm"] = mgl_patch_height
 
+    failures = []
+    total = len(matched.matched)
     for index, (key, jaws) in enumerate(sorted(matched.matched.items()), start=1):
         # The counter, never the patient key: the key is built from the file
         # names the caller sent, and a progress message is stored and shown.
-        progress.report(index, len(matched.matched), "subject")
+        progress.report(index, total, "subject",
+                        start=spans["register"][0], end=spans["register"][1])
         try:
             report["patients"][key] = ios_pipeline.register_patient(
                 jaws=jaws,
@@ -244,7 +468,10 @@ def _run_ios(
                 relative_key=key,
                 suffix=suffix,
                 prior_transforms=prior_transforms,
+                position=f"subject {index} of {total}",
             )
+            # The header AREG IOS-CBCT uses, so every registration reads alike.
+            report_metrics(f"patient {index}/{total}", report["patients"][key])
         except (
             icp.RegistrationError,
             surfaces.SurfaceError,
@@ -252,6 +479,78 @@ def _run_ios(
             landmark_files.LandmarkError,
         ) as exc:
             report["patients"][key] = {"status": "failed", "reason": str(exc)}
+            step = _STEP_OF.get(type(exc).__name__, "registration")
+            # Position, step, class and message; never the key, which is the
+            # caller's file name. The report holds the same reason, but the
+            # report is deleted with the job when the run fails.
+            logger.warning("subject %d of %d: %s failed (%s: %s)",
+                           index, total, step, type(exc).__name__, exc)
+            # Landmarks the CALLER sent being unusable is theirs to fix; the
+            # same error on landmarks ALI_IOS predicted, a mesh the patch
+            # network found nothing on, or an ICP that did not converge is not.
+            caller_input = bool(mgl_landmarks_path) and isinstance(
+                exc, (landmark_files.LandmarkError, mgl.PatchError))
+            failures.append((exc, caller_input))
+    return failures
+
+
+# Which step of `register_patient` each per-subject error comes from, for the
+# warning line. By class name so the table needs no import of the IOS stack.
+_STEP_OF = {
+    "LandmarkError": "matching the mucogingival landmarks",
+    "PatchError": "building the mucogingival patch",
+    "SurfaceError": "reading the mesh or painting its patch",
+    "RegistrationError": "the ICP alignment",
+}
+
+
+def _count_meshes(root: str, jaw: str = None) -> int:
+    """How many surface files are under `root`, of one jaw when `jaw` is set."""
+    from . import surfaces
+
+    return sum(
+        1
+        for _directory, _subdirs, names in os.walk(str(root))
+        for name in names
+        if not name.startswith(".") and surfaces.is_surface_file(name)
+        and (jaw is None or surfaces.jaw_of(name) == jaw)
+    )
+
+
+def _counted(tool: str, produced_what: str, timepoint: str, before_root: str, call) -> str:
+    """Run one nested tool call and log how many meshes went in and came out.
+
+    A tool that returns cleanly with fewer meshes than it was given is the
+    failure that otherwise surfaces only later, as subjects "at one timepoint
+    only" -- which points at the caller's files rather than at the tool.
+    """
+    before = _count_meshes(before_root)
+    produced = call()
+    after = _count_meshes(produced)
+    level = logging.WARNING if after < before else logging.INFO
+    logger.log(level, "%s produced %d %s for %d %s mesh(es)",
+               tool, after, produced_what, before, timepoint)
+    return produced
+
+
+def _report_landmarks(mesh_root: str, produced: str, timepoint: str) -> None:
+    """Log how many landmark files ALI_IOS wrote for the lower meshes it was given.
+
+    ALI restricts the mucogingival network to mandibles itself, so the lower
+    meshes are what to compare against, not every mesh in the folder.
+    """
+    from . import landmarks as landmark_files
+
+    lower = _count_meshes(mesh_root, jaw=catalogs.JAW_LOWER)
+    written = sum(
+        1
+        for _directory, _subdirs, names in os.walk(str(produced))
+        for name in names
+        if not name.startswith(".") and landmark_files.is_markups_file(name)
+    )
+    level = logging.WARNING if written < lower else logging.INFO
+    logger.log(level, "ALI_IOS produced %d landmark file(s) for %d lower %s mesh(es)",
+               written, lower, timepoint)
 
 
 def _collect_transforms(oriented_root: str, suffix: str) -> dict:
@@ -329,19 +628,38 @@ def _as_directory(path: str, destination: str) -> str:
     return destination
 
 
-def _summarize(report: dict) -> None:
+def _summarize(report: dict, failures: list = ()) -> None:
+    """Count the outcome into the report, log it, and refuse an empty run.
+
+    A run where no subject registered is a failure, not a success with a report
+    of failures: the server would otherwise return an archive holding nothing
+    but that report, and the operator would see a green run. The exception is
+    built from the most common failure, because that is the one to fix first.
+    """
     statuses = [entry.get("status") for entry in report["patients"].values()]
-    report["summary"] = {
-        "patients": len(statuses),
-        "registered": statuses.count("ok"),
-        "failed": statuses.count("failed"),
-    }
-    logger.info(
-        "AREG %s %s: %d/%d registered",
-        report["modality"],
-        report["automation"],
-        report["summary"]["registered"],
-        report["summary"]["patients"],
+    total, registered, failed = len(statuses), statuses.count("ok"), statuses.count("failed")
+    report["summary"] = {"patients": total, "registered": registered, "failed": failed}
+
+    if failed and not registered:
+        by_class: dict = {}
+        for exc, _caller_input in failures:
+            by_class.setdefault(type(exc).__name__, []).append(exc)
+        name, examples = max(by_class.items(), key=lambda item: len(item[1]))
+        first = examples[0]
+        message = (
+            f"0 of {total} subjects registered; most common failure: "
+            f"{name}: {str(first)[:160]} ({len(examples)} of {total})"
+        )
+        # The caller's fault only when EVERY failure was: one subject failing
+        # on the server's side makes the run a server problem.
+        if failures and all(caller_input for _exc, caller_input in failures):
+            raise ToolInputError(message) from first
+        raise RuntimeError(message) from first
+
+    logger.log(
+        logging.WARNING if failed else logging.INFO,
+        "AREG %s %s: %d of %d subjects registered, %d failed",
+        report["modality"], report["automation"], registered, total, failed,
     )
 
 
@@ -359,11 +677,24 @@ def register(
     output_suffix: str = "Reg",
     output_dir: str = None,
     sup=None,
+    registration_model_named: bool = True,
+    outputs=(),
 ) -> RegistrationRun:
     """Register every T2 under `t2_path` onto its T1 under `t1_path`.
 
     Each path is a directory or a `.zip`.
     declared in `catalogs.REGION_CHOICES` (CBCT only).
+
+    `registration_model_named` is False when the deployment filled
+    `registration_model` itself, which makes a broken bundle a server fault
+    rather than a bad request.
+
+    `outputs` is the Extra outputs ticked: with `catalogs.OUTPUT_METRICS`,
+    `metric_tables` is written beside the report and listed in it as
+    `metrics_files`.
+
+    Raises RuntimeError (ToolInputError when every failure was the caller's)
+    when no subject at all could be registered.
     """
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -373,16 +704,23 @@ def register(
     t1_root = _as_directory(t1_path, os.path.join(work_dir, "t1_input"))
     t2_root = _as_directory(t2_path, os.path.join(work_dir, "t2_input"))
 
+    # After extraction, because the answer is inside the meshes: a zip has to
+    # become a directory before anything can be read out of it.
+    automation, automation_source = derive_automation(automation, t1_root)
+
     report = {
         "modality": MODALITY,
         "automation": automation,
+        # Which of the two it was: "Semi-Automated" in a report does not say
+        # whether anybody chose it.
+        "automation_source": automation_source,
         "output_suffix": output_suffix,
         "patients": {},
     }
 
     from . import mgl
 
-    _run_ios(
+    failures = _run_ios(
         t1_root=t1_root,
         t2_root=t2_root,
         automation=automation,
@@ -400,6 +738,7 @@ def register(
         suffix=output_suffix,
         report=report,
         sup=sup,
+        registration_model_named=registration_model_named,
     )
 
     # Extracted inputs, converted DICOM, the oriented copies and whatever the
@@ -407,7 +746,11 @@ def register(
     # left under output_dir is results and nothing else.
     shutil.rmtree(work_dir, ignore_errors=True)
 
-    _summarize(report)
+    _summarize(report, failures)
+    if catalogs.OUTPUT_METRICS in set(outputs or ()):
+        report["metrics_files"] = [
+            os.path.relpath(path, output_dir) for path in metrics_table.write(
+                output_dir, catalogs.METRICS_STEM, metric_tables(report))]
     with open(os.path.join(output_dir, REPORT_NAME), "w") as handle:
         json.dump(report, handle, indent=2)
     return RegistrationRun(output_dir, report)
@@ -428,6 +771,7 @@ def main(
     output_dir=None,
     sup=None,
     data_root=None,
+    outputs=(),
 ) -> str:
     """Translate the schema's arguments into `register()` and return its output
     directory, which main.py zips and streams.
@@ -454,10 +798,25 @@ def main(
     # checks below then see a real bundle and their message stays about what is
     # missing from the DEPLOYMENT rather than about a field the panel no longer
     # shows.
+    registration_model_named = bool(registration_model)
     registration_model = registration_model or _own_bundle(
         data_root, _REGISTRATION_BUNDLE)
-    reference = ios_reference or _own_bundle(data_root, _ORIENTATION_REFERENCE)
-    _check_ios(automation, patch, registration_model, reference,
+    # Forwarded only when a caller named one: ASO owns the intraoral reference.
+    reference = ios_reference
+    # The mode is read off the meshes, and the meshes are not extracted yet --
+    # so what is checked here is FULLY's requirements, which are the superset:
+    # everything Semi needs, plus Crown_Seg and ASO.
+    # Checking the superset keeps the promise this function's docstring makes,
+    # that a request which cannot work comes back in a second rather than after
+    # an hour of registration.
+    #
+    # The one case it costs: a deployment WITHOUT Crown_Seg, handed meshes that
+    # are already labelled, is refused although Semi-Automated would have run.
+    # Naming 'Semi-Automated' in `automation` is the override for exactly that,
+    # and `tools.require` says so.
+    checked = (catalogs.AUTOMATION_FULLY
+               if automation in ("", catalogs.AUTOMATION_AUTO) else automation)
+    _check_ios(checked, patch, registration_model,
                mgl_landmarks, mgl_patch_height, sup)
 
     run = register(
@@ -474,6 +833,8 @@ def main(
         output_suffix=suffix,
         output_dir=output_dir,
         sup=sup,
+        registration_model_named=registration_model_named,
+        outputs=outputs,
     )
 
     return run.output_dir

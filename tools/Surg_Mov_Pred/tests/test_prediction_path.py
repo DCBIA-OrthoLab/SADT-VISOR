@@ -110,7 +110,7 @@ def test_the_t0_fallback_only_applies_to_the_suffix_it_names():
     and a model wanting it is skipped rather than fed the wrong timepoint."""
     scaler, model, package = recording_package(["f1_T1"])
 
-    with pytest.raises(RuntimeError, match="produced a prediction"):
+    with pytest.raises(ValueError, match="produced a prediction"):
         predict_all_targets(pd.DataFrame({"f1": [0.0, 10.0]}), {"t": package})
 
     assert model.seen == []
@@ -230,17 +230,84 @@ def test_predicting_nothing_at_all_names_how_many_models_were_loaded():
     message has to say how far the run got."""
     packages = {name: build_package(["absent"]) for name in ("a", "b", "c")}
 
-    with pytest.raises(RuntimeError) as failure:
+    with pytest.raises(ValueError) as failure:
         predict_all_targets(pd.DataFrame({"f1": [0.0]}), packages)
 
     assert "3 loaded model(s)" in str(failure.value)
+
+
+def test_every_target_skipped_for_missing_features_is_the_callers_input_error():
+    """Nothing errored: the table simply lacks what the models were trained on.
+    That is the caller's to fix, so it is a ValueError (a 422) that names the
+    argument and the columns most often missing."""
+    packages = {name: build_package(["absent", "f1"]) for name in ("a", "b")}
+
+    with pytest.raises(ValueError) as failure:
+        predict_all_targets(pd.DataFrame({"f1": [0.0]}), packages)
+
+    message = str(failure.value)
+    assert "2 skipped for missing input features, 0 errored" in message
+    assert "'measurements'" in message
+    assert "absent (2 of 2)" in message
+
+
+def test_predicting_nothing_counts_the_errored_apart_and_quotes_the_first_error():
+    """The old message blamed missing features even when every target had
+    raised. An errored target is counted on its own, and the first error is
+    what an operator reads first."""
+    class Exploding:
+        def predict(self, frame):
+            raise ZeroDivisionError("boom")
+
+    bad = build_package(["f1"])
+    bad["model"] = Exploding()
+    packages = {"bad": bad, "thin": build_package(["absent"])}
+
+    with pytest.raises(RuntimeError) as failure:
+        predict_all_targets(pd.DataFrame({"f1": [0.0, 10.0]}), packages)
+
+    message = str(failure.value)
+    assert "1 skipped for missing input features, 1 errored" in message
+    assert "first error: ZeroDivisionError: boom" in message
+
+
+def test_a_failed_target_is_logged_by_position_class_and_message(caplog):
+    class Exploding:
+        def predict(self, frame):
+            raise ZeroDivisionError("boom")
+
+    good = build_package(["f1"])
+    bad = build_package(["f1"])
+    bad["model"] = Exploding()
+
+    predict_all_targets(pd.DataFrame({"f1": [0.0, 10.0]}), {"bad": bad, "good": good})
+
+    assert "target 1 of 2 ('bad'): prediction failed (ZeroDivisionError: boom)" in caplog.text
+    assert "1 of 2 target(s) predicted" in caplog.text
+
+
+def test_skipped_targets_are_one_aggregated_warning_not_one_each(caplog):
+    """112 targets over a thin table used to be up to 112 warnings."""
+    import logging
+
+    packages = {f"t{index}_Pred": build_package(["absent"]) for index in range(10)}
+    packages["ok_Pred"] = build_package(["f1"])
+
+    with caplog.at_level(logging.INFO, logger="sadt_surgmovpred.pipeline"):
+        predict_all_targets(pd.DataFrame({"f1": [0.0, 10.0]}), packages)
+
+    skips = [r for r in caplog.records if "skipped for missing input features" in r.getMessage()
+             and r.levelno == logging.WARNING]
+    assert len(skips) == 1
+    assert "10 of 11 target(s) skipped" in skips[0].getMessage()
+    assert "absent (10 of 11)" in skips[0].getMessage()
 
 
 def test_a_skipped_target_says_which_features_were_missing(caplog):
     """The warning is the only place a caller learns why a column is absent."""
     package = build_package(["a_T0", "b_T0", "c_T0"])
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         predict_all_targets(pd.DataFrame({"unrelated": [0.0]}), {"SNA_Pred": package})
 
     assert "SNA_Pred" in caplog.text
@@ -357,7 +424,9 @@ def test_the_pipeline_imports_nothing_heavy_at_module_level():
     for node in tree.body:
         if isinstance(node, ast.Import):
             top_level.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        # A relative import is this package's own stdlib-only modules
+        # (progress, errors), which cost nothing to load.
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             top_level.add(node.module.split(".")[0])
 
-    assert top_level == {"logging", "re", "pathlib"}
+    assert top_level == {"logging", "re", "collections", "pathlib"}

@@ -152,6 +152,10 @@ def test_a_batch_says_where_it_has_got_to(tmp_path, stubbed, monkeypatch):
                   output_dir=tmp_path / "out", device="cpu")
 
     events = [json.loads(line) for line in events_file.read_text().splitlines() if line]
+    # The checkpoint load is announced first, with no fraction: it is the stage
+    # a failed run is most often found dead in.
+    assert events[0] == {"fraction": None, "message": "loading checkpoint"}
+    events = events[1:]
     assert [e["message"] for e in events] == ["scan 1 of 2", "scan 2 of 2"]
     assert [e["fraction"] for e in events] == [0.0, 0.5]
 
@@ -174,7 +178,7 @@ def test_a_failure_names_the_position_and_never_the_scan(tmp_path, stubbed, capl
 
     A tool's stderr is captured to a file in the job directory, and on a FAILED
     run the server copies its tail into its own persistent log. Every one of
-    these `logger.exception` calls is on a failure path, so a name written here
+    these warnings is on a failure path, so a name written here
     is a patient identifier that outlives the run and its job directory.
 
     Asserted on the composed message: an exception raised inside a third-party
@@ -184,12 +188,12 @@ def test_a_failure_names_the_position_and_never_the_scan(tmp_path, stubbed, capl
     _write_scan(tmp_path / "in" / "healthy.nii.gz")
     (tmp_path / "in" / "Smith_John_T1.nii.gz").write_bytes(b"not a nifti")
 
-    with caplog.at_level(logging.INFO, logger="CLIC"):
+    with caplog.at_level(logging.INFO, logger="sadt_clic"):
         sadt_clic.run(scans=tmp_path / "in", model=tmp_path / "m.pth",
                       output_dir=tmp_path / "out", device="cpu")
 
     messages = [record.getMessage() for record in caplog.records]
-    assert any(m.startswith("CLIC failed on scan ") and m.endswith(" of 2")
+    assert any(m.startswith("scan ") and " of 2: reading failed (ValueError: " in m
                for m in messages), messages
     assert not any("Smith_John" in m for m in messages), messages
 

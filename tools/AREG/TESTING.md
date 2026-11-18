@@ -32,9 +32,12 @@ server's `scripts/data-manifest.yml` holds the URLs and sizes.
 
 | Argument | What it names |
 |---|---|
-| `segmentation_model` | the AMASSS bundle used to segment the T1 masks |
-| `cbct_reference` / `ios_reference` | the orientation reference |
 | `registration_model` | the network that finds the IOS patch |
+| `segmentation_model` | an override of the AMASSS bundle; left empty, AMASSS uses its own |
+| `cbct_reference` / `ios_reference` | an override of the orientation reference; left empty, ASO uses its own |
+
+Only `registration_model` is AREG's own bundle. AMASSS and ASO resolve theirs
+from `/DATA/AMASSS/` and `/DATA/ASO/`, so AREG keeps no copy of either.
 
 All four are named `*_model` or `*_reference` on purpose: whatever serves the
 tool publishes those as names picked from the data it already holds, never as a

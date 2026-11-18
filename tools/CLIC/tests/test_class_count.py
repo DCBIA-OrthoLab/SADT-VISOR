@@ -99,3 +99,52 @@ def test_a_checkpoint_directory_is_not_globbed_for_a_model(tmp_path):
 
     with pytest.raises(IsADirectoryError):
         pipeline.build_model(str(folder), "cpu")
+
+
+def _save(tmp_path, state):
+    path = tmp_path / "model.pth"
+    torch.save(state, str(path))
+    return str(path)
+
+
+def test_a_checkpoint_without_the_head_is_a_server_fault_when_loaded(tmp_path):
+    """`class_count` refuses with a ValueError, but the checkpoint is installed
+    by whoever runs the server: loading it must not be answered as the
+    caller's mistake."""
+    path = _save(tmp_path, {"backbone.body.conv1.weight": torch.zeros(1)})
+
+    with pytest.raises(RuntimeError) as raised:
+        pipeline.build_model(path, "cpu")
+
+    assert not isinstance(raised.value, ValueError)
+    assert str(raised.value).startswith("checkpoint is unusable: ")
+    assert isinstance(raised.value.__cause__, ValueError)
+
+
+def test_an_unreadable_checkpoint_is_a_runtime_error(tmp_path):
+    path = tmp_path / "model.pth"
+    path.write_bytes(b"these bytes are not a torch checkpoint")
+
+    with pytest.raises(RuntimeError) as raised:
+        pipeline.build_model(str(path), "cpu")
+
+    assert str(raised.value).startswith("checkpoint could not be read (")
+
+
+def test_weights_of_the_wrong_shape_put_the_cause_first(tmp_path):
+    """torch lists every mismatched tensor on its own line; the operator sees
+    the first few hundred characters, so the cause has to lead."""
+    path = _save(tmp_path, {"roi_heads.box_predictor.cls_score.bias": torch.zeros(4)})
+
+    with pytest.raises(RuntimeError) as raised:
+        pipeline.build_model(path, "cpu")
+
+    message = str(raised.value)
+    assert message.startswith("checkpoint weights do not fit the Mask R-CNN layout (")
+    assert "\n" not in message
+
+
+def test_a_missing_checkpoint_stays_a_file_not_found_error(tmp_path):
+    """A wrong name is the caller's to fix, and stays answered as such."""
+    with pytest.raises(FileNotFoundError):
+        pipeline.build_model(str(tmp_path / "absent.pth"), "cpu")

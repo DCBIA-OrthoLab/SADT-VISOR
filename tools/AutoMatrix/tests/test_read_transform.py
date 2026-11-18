@@ -178,7 +178,8 @@ def test_a_singular_matrix_fails_where_the_inverse_is_actually_needed(tmp_path):
     source.write_text(json.dumps({"markups": [{"controlPoints": [
         {"label": "A", "position": [1.0, 2.0, 3.0], "positionStatus": "defined"}]}]}))
 
-    with pytest.raises(RuntimeError, match="inverse"):
+    # A ValueError: the matrix is what the caller sent, theirs to fix.
+    with pytest.raises(ValueError, match="no inverse"):
         pipeline.apply_to_landmarks(
             str(source), pipeline.read_transform(str(path)),
             str(tmp_path / "out.mrk.json"),

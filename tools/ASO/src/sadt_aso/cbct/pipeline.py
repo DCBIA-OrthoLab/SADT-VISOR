@@ -55,6 +55,35 @@ OUTPUT_SUFFIXES = PATIENT_SUFFIXES
 _SEPARATOR = re.compile(r"[_\-.\s]")
 
 
+
+def as_one_affine(transform):
+    """`transform` as a single AffineTransform, when it is one.
+
+    The orientation is a chain of translations and rotations, and SimpleITK
+    writes a chain as a CompositeTransform whose members are
+    `MatrixOffsetTransformBase` -- a class 3D Slicer's reader does not know,
+    so the file failed to load there ("Failed to read transform from file").
+    A linear chain is one 4x4: read off the transform itself, by where it sends
+    the origin and the three unit vectors, so no member type has to be known.
+
+    Checked on points spread over a head before it is trusted; a chain that is
+    not linear after all is returned unchanged rather than approximated.
+    """
+    origin = np.array(transform.TransformPoint((0.0, 0.0, 0.0)))
+    columns = [np.array(transform.TransformPoint(tuple(unit))) - origin
+               for unit in np.eye(3)]
+    affine = sitk.AffineTransform(3)
+    affine.SetMatrix(np.column_stack(columns).flatten().tolist())
+    affine.SetTranslation(origin.tolist())
+
+    probes = np.array([[x, y, z] for x in (-150.0, 150.0)
+                       for y in (-150.0, 150.0) for z in (-150.0, 150.0)])
+    for point in probes:
+        expected = np.array(transform.TransformPoint(tuple(point)))
+        if np.linalg.norm(np.array(affine.TransformPoint(tuple(point))) - expected) > 1e-6:
+            return transform
+    return affine
+
 def _token_aligned_index(stem: str, suffix: str) -> int:
     """Where `suffix` occurs in `stem` as WHOLE tokens, or -1.
 
@@ -229,13 +258,17 @@ def discover(input_root: str, output_suffix: str = "Or") -> dict:
     return found
 
 
-def load_landmarks(paths: list) -> dict:
+def load_landmarks(paths: list, patient=None) -> dict:
     """Merge every markups file a patient has into one landmark dict.
 
     Later files win on a repeated label, which only happens when a caller sends
     overlapping groups. An unreadable file is skipped with a warning giving its
     position and the failure's type -- never its name, and never the data.
+
+    `patient`, when given, is `(index, total)` and leads the warning, so a
+    skipped file can be traced to the patient it cost.
     """
+    where = f"patient {patient[0]} of {patient[1]}: " if patient else ""
     merged: dict = {}
     for index, path in enumerate(paths, start=1):
         try:
@@ -247,8 +280,8 @@ def load_landmarks(paths: list) -> dict:
             # diagnosis anyway -- JSONDecodeError, ValueError and
             # FileNotFoundError are three different mistakes.
             logger.warning(
-                "Skipping markups file %d of %d: %s",
-                index, len(paths), type(exc).__name__,
+                "%sSkipping markups file %d of %d: %s",
+                where, index, len(paths), type(exc).__name__,
             )
     return merged
 
@@ -261,15 +294,23 @@ def load_reference(reference_dir: str) -> dict:
     requiring one to be present -- so a reference bundle holding just the
     landmarks it actually registers against was rejected with an IndexError.
     """
+    # A RuntimeError, not a ValueError: the reference is a bundle this server
+    # hosts, so an unreadable one is the deployment's to fix -- answering 422
+    # would tell the caller to change a request that is fine.
     for directory, _, file_names in sorted(os.walk(reference_dir)):
         for file_name in sorted(file_names):
             if markups.is_markups_file(file_name) and not file_name.startswith("."):
-                landmarks = markups.load_landmarks(os.path.join(directory, file_name))
+                try:
+                    landmarks = markups.load_landmarks(os.path.join(directory, file_name))
+                except (ValueError, OSError) as exc:
+                    raise RuntimeError(
+                        f"reference bundle unreadable: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if landmarks:
                     return landmarks
-    raise ValueError(
-        "The reference bundle holds no readable landmark file (.mrk.json). A CBCT "
-        "reference is one already-oriented case's landmarks."
+    raise RuntimeError(
+        "reference bundle unreadable: it holds no readable landmark file "
+        "(.mrk.json). A CBCT reference is one already-oriented case's landmarks."
     )
 
 
@@ -309,7 +350,11 @@ def prepare(scan_path: str, destination: str = None) -> tuple:
     centered, translation = recenter(sitk.ReadImage(scan_path))
     if destination:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
-        sitk.WriteImage(centered, destination, useCompression=True)
+        # Compressed only when the name asks for it: the caller's scratch copy
+        # for the landmark tool is a plain .nii, because gzip on one core is
+        # most of what this step costs -- 20.9 s for a 732x732x647 CBCT against
+        # 0.5 s uncompressed, for a file read once and deleted with the run.
+        sitk.WriteImage(centered, destination, useCompression=destination.endswith(".gz"))
     return centered, translation
 
 
@@ -371,12 +416,13 @@ def orient_patient(
     markups.write_landmarks(registration.landmarks, landmark_output)
 
     transform_output = os.path.join(destination, f"{patient}_{suffix}_transform.tfm")
-    sitk.WriteTransform(registration.full_transform, transform_output)
+    sitk.WriteTransform(as_one_affine(registration.full_transform), transform_output)
 
     return {
         "status": "ok",
         "landmarks_used": registration.used,
         "landmarks_dropped": registration.dropped,
+        "metrics": registration.metrics,
         "produced": sorted(
             os.path.relpath(path, output_dir)
             for path in (scan_output, landmark_output, transform_output)

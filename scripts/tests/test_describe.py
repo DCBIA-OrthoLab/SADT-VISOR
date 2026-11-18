@@ -1031,3 +1031,53 @@ def test_something_that_is_not_an_extension_is_refused(tmp_path):
 
     assert result.returncode != 0
     assert "not an extension" in result.stderr, result.stderr
+
+
+PAIRED_BODY = """
+from pathlib import Path
+
+PAIRED = {"axes": ["t1", "t2"]}
+
+
+def pairs(t1, t2):
+    return {"groups": [], "shared": {}, "unpaired": {}}
+
+
+def run(t1: Path, t2: Path, output_dir: Path) -> Path:
+    \"\"\"Register.
+
+    Args:
+        t1: Baseline.
+        t2: Follow-up.
+        output_dir: Where to write.
+
+    Returns:
+        The output directory.
+    \"\"\"
+    return output_dir
+"""
+
+
+def test_a_tool_says_which_inputs_hold_the_same_patients(tmp_path):
+    """Published so a client splits both folders by the same patients."""
+    result = describe(make_tool(tmp_path, PAIRED_BODY))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["paired"] == {"axes": ["t1", "t2"]}
+
+
+@pytest.mark.parametrize("change, message", [
+    (('"axes": ["t1", "t2"]', '"axes": ["t1"]'), "two or more"),
+    (('"axes": ["t1", "t2"]', '"axes": ["t1", "nope"]'), "no argument 'nope'"),
+    (("def pairs(t1, t2):", "def answer(t1, t2):"), "defines no pairs()"),
+    (("def pairs(t1, t2):", "def pairs(t1):"), "lacks t2"),
+])
+def test_a_paired_declaration_that_cannot_be_honoured_is_refused(tmp_path, change, message):
+    """A split the tool cannot answer for would send patients unpaired."""
+    result = describe(make_tool(tmp_path, PAIRED_BODY.replace(*change)))
+    assert result.returncode != 0
+    assert message in result.stderr, result.stderr
+
+
+def test_a_tool_without_paired_inputs_publishes_nothing_about_them(tmp_path):
+    result = describe(make_tool(tmp_path, ACCEPTS_BODY))
+    assert "paired" not in json.loads(result.stdout)

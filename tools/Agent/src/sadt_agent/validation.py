@@ -80,6 +80,8 @@ def validate(tool, arguments, extracted):
 def coerce(name: str, spec, value):
     """One value, as the argument's declared type. Raises `ToolInputError`."""
     declared = spec["type"]
+    if declared == "vec2":
+        return _vec2(name, spec, value)
     if declared.startswith("list["):
         element = declared[len("list["):-1]
         items = _as_list(name, value)
@@ -133,6 +135,29 @@ def _scalar(name: str, declared: str, value):
     raise ToolInputError(
         "'{}' is of type {!r}, which this agent cannot fill.".format(name, declared)
     )
+
+
+def _vec2(name: str, spec, value):
+    """Exactly two numbers, inside the ranges the tool declared for each axis."""
+    items = _as_list(name, value)
+    if len(items) != 2:
+        raise ToolInputError(
+            "'{}' takes exactly two numbers, and the model answered {!r}.".format(
+                name, value
+            )
+        )
+    numbers = [_number(name, item) for item in items]
+    for number, axis in zip(numbers, ("x_range", "y_range")):
+        bounds = spec.get(axis)
+        if not bounds or len(bounds) != 2:
+            continue
+        low, high = min(bounds), max(bounds)
+        if not low <= number <= high:
+            raise ToolInputError(
+                "'{}' must lie within {} on its {} axis. The model answered "
+                "{!r}.".format(name, list(bounds), axis[0], number)
+            )
+    return numbers
 
 
 def _boolean(name: str, value):

@@ -31,7 +31,9 @@ def choose_tool(client, prompt, candidates, folders, history):
             ),
         }]
     )
-    answer = llm.parse_json_object(client(messages, json_format=True), "routing")
+    answer = llm.parse_json_object(
+        client(messages, json_format=True, call="router call"), "routing"
+    )
 
     name = answer.get("tool")
     confidence = _confidence(answer.get("confidence"))
@@ -69,7 +71,13 @@ def extract_arguments(client, prompt, tool, folders, history):
             "content": prompts.extractor_user(prompt, tool, arguments, folders),
         }]
     )
-    answer = llm.parse_json_object(client(messages, json_format=True), "extraction")
+    answer = llm.parse_json_object(
+        client(
+            messages, json_format=True,
+            call="extraction call (tool {})".format(tool["name"]),
+        ),
+        "extraction",
+    )
 
     values, errors, unknown = validation.validate(
         tool, arguments, answer.get("extracted", {})
@@ -98,7 +106,7 @@ def advise(client, prompt, candidates, history) -> str:
     # then stripped every `*` and `#` from it (`Agent_CLI.py:215-216`) to make
     # it look like plain text in a Qt label; the answer is written to a `.md`
     # file here, so the Markdown is kept.
-    return client(messages, json_format=False).strip()
+    return client(messages, json_format=False, call="advice call").strip()
 
 
 def can_execute(decision):

@@ -20,6 +20,8 @@ The same reasoning is why Batch_Dental_Seg has one `model` argument rather than
 a bundle plus a label table.
 """
 
+from .errors import ToolInputError
+
 # The `nn` values upstream resolves out of `shapeaxi.saxi_nets_lightning`.
 CLASSIFICATION = "SaxiMHAFBClassification"
 REGRESSION = "SaxiMHAFBRegression"
@@ -74,7 +76,7 @@ ANALYSES = {
 def analysis_for(checkpoint_name: str) -> Analysis:
     """The row for a checkpoint, by file name.
 
-    Raises ValueError naming what IS known rather than falling through with an
+    Raises ToolInputError (a ValueError) naming what IS known rather than falling through with an
     unbound `model_name`, which is what upstream did when no branch matched:
     it logged "no model found for undefined task" and carried on to a
     NameError.
@@ -82,7 +84,21 @@ def analysis_for(checkpoint_name: str) -> Analysis:
     known = ANALYSES.get(checkpoint_name)
     if known is not None:
         return known
-    raise ValueError(
-        f"'{checkpoint_name}' is not a checkpoint this tool knows how to read. "
-        f"Expected one of: {', '.join(sorted(ANALYSES))}."
+    # The analyses are described in words first: the server redacts file
+    # names, so the list of checkpoints at the end reaches an operator's log
+    # as a row of placeholders, while the anatomy and task pairs survive.
+    raise ToolInputError(
+        f"'model' is not a checkpoint this tool knows how to read. Known "
+        f"analyses: {describe_known()}. Expected one of: "
+        f"{', '.join(sorted(ANALYSES))}."
+    )
+
+
+def describe_known() -> str:
+    """Every anatomy with the tasks it has a checkpoint for, in words."""
+    tasks = {}
+    for analysis in ANALYSES.values():
+        tasks.setdefault(analysis.anatomy, []).append(analysis.task)
+    return "; ".join(
+        f"{anatomy} ({', '.join(names)})" for anatomy, names in tasks.items()
     )

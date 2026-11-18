@@ -1,15 +1,17 @@
 """The modules every tool carries a copy of must stay byte-identical.
 
-`progress.py` and `scans.py` are vendored into each tool rather than imported
-from a shared package, because no package is common to every tool: they are
+`progress.py` and `scans.py` are vendored into each tool, and
+`metrics_table.py` into each that writes a metrics spreadsheet, rather than
+imported from a shared package, because no package is common to every tool: they are
 isolated projects on purpose, and an import between two of them would make one
 tool's missing dependency take out the other. CONTRIBUTING.md sets that rule.
 
-But what these two files hold is a FORMAT, not an implementation. `progress.py`
+But what these files hold is a FORMAT, not an implementation. `progress.py`
 writes the one-JSON-object-per-line stream the SERVER parses, and `scans.py`
 names the extensions a caller's data is recognised by. A copy that drifts does
 not fail loudly -- it reports progress the server silently ignores, or accepts a
-scan its neighbour refuses. Copying is the accepted cost; drifting is not, and
+scan its neighbour refuses, or a spreadsheet one tool writes that another
+does not. Copying is the accepted cost; drifting is not, and
 this is what stops it.
 
 When a copy has to change, change every copy.
@@ -24,7 +26,7 @@ TOOLS = Path(__file__).resolve().parents[2] / "tools"
 
 # Vendored by copy, and required to stay identical. Keyed by file name, since
 # that is how each lands in its own tool's package.
-VENDORED = ("progress.py", "scans.py")
+VENDORED = ("progress.py", "scans.py", "metrics_table.py")
 
 
 def copies(name):

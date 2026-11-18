@@ -4,20 +4,9 @@ import numpy as np
 from .utils import ReadSurf, LoadJsonLandmarks, VTKMatrixToNumpy
 from .transformation import ApplyTransform
 
-import sys
 import logging
 
-# ===== Logging Configuration =====
-logger = logging.getLogger("FlexReg_ICP")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-if logger.handlers:
-    logger.handlers.clear()
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(name)s - %(levelname)s - (%(filename)s:%(lineno)d) - %(message)s')
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+logger = logging.getLogger(__name__)
 
 
 class ICP:
@@ -74,9 +63,13 @@ class ICP:
         matrix_final = np.identity(4)
 
         source_icp = self.copy(source_int)
+        # The last pass's residual is the one that describes the result: an
+        # earlier pass is superseded by the one after it.
+        residual = None
         for icp in self.list_icp:
             source_icp, matrix = icp(source_icp, target_int)
             matrix_final = matrix_final @ matrix
+            residual = getattr(icp, "residual", residual)
 
         dic_out = {
             "source": source,
@@ -86,6 +79,7 @@ class ICP:
             "source_int": source_int,
             "source_icp": source_icp,
             "target_int": target_int,
+            "residual": residual,
         }
 
         return dic_out
@@ -103,6 +97,17 @@ class vtkICP:
         icp.StartByMatchingCentroidsOn()
         icp.Modified()
         icp.Update()
+
+        # RMS closest-point distance at the last iteration (the transform's
+        # default mean-distance mode), in the surfaces' unit: millimetres.
+        # Kept on the instance so the caller can report how well the patches
+        # actually met, which the matrix alone does not say.
+        self.residual = float(icp.GetMeanDistance())
+        self.iterations = int(icp.GetNumberOfIterations())
+        logger.info(
+            "ICP: RMS residual %.3f mm after %d iteration(s) on %d moving and %d fixed patch points",
+            self.residual, self.iterations, source.GetNumberOfPoints(), target.GetNumberOfPoints(),
+        )
 
         # ============ apply ICP transform ==============
         transformFilter = vtk.vtkTransformPolyDataFilter()

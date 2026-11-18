@@ -13,8 +13,11 @@ linearly invents labels that were never in it.
 import json
 import logging
 import os
+import re
 
-logger = logging.getLogger("AutoMatrix")
+# Named after the module, not the tool: the server shows the records of the
+# loggers under the tool's own package, and "AutoMatrix" is not one of them.
+logger = logging.getLogger(__name__)
 
 # Tokens that name what a file IS rather than whose it is, and so must not end
 # up in the patient key. The shared `patient_stem` already drops the scan
@@ -68,6 +71,28 @@ def is_transform_file(name: str) -> bool:
     return name.lower().endswith(TRANSFORM_EXTENSIONS)
 
 
+# What SimpleITK puts before the cause in every exception it raises: which C++
+# function threw, at which line of which source file, and the ITK object's
+# address. None of it helps whoever reads the message, the address makes two
+# identical failures differ, and the server cuts a long reason before the
+# cause at its end is reached.
+_ITK_PREAMBLE = re.compile(
+    r"Exception thrown in SimpleITK \w+: \S+:\d+:\s*"
+    r"|(?:ITK |sitk::)ERROR: (?:\w+(?:\(0x[0-9a-fA-F]+\))?: )?"
+)
+
+
+def itk_cause(message: str) -> str:
+    """A SimpleITK exception's message, reduced to the cause on one line.
+
+    `Exception thrown in SimpleITK ImageFileReader_Execute: .../x.cxx:99:
+    sitk::ERROR: Unable to determine ImageIO reader for "..."` becomes
+    `Unable to determine ImageIO reader for "..."`. Any other text comes back
+    with only its whitespace collapsed.
+    """
+    return " ".join(_ITK_PREAMBLE.sub("", str(message)).split())
+
+
 def apply_to_landmarks(source: str, transform, destination: str) -> int:
     """Move a Slicer markups file's points. Returns how many moved.
 
@@ -76,11 +101,21 @@ def apply_to_landmarks(source: str, transform, destination: str) -> int:
     transform that cannot be inverted is an error rather than a warning and a
     file copied unchanged -- upstream logged and returned, so the output looked
     like a result.
+
+    That refusal is a ValueError: a matrix with no inverse is what the caller
+    sent, and the server answers a ValueError as the caller's to fix. A markups
+    file that is not JSON already raises one (`json.JSONDecodeError`).
     """
     with open(source) as handle:
         markups = json.load(handle)
 
-    inverse = transform.GetInverse()
+    try:
+        inverse = transform.GetInverse()
+    except RuntimeError as itk_error:
+        raise ValueError(
+            "the transform has no inverse, which moving landmark points "
+            f"needs. ITK said: {itk_cause(itk_error)}"
+        ) from itk_error
 
     moved = 0
     for group in markups.get("markups", []):
@@ -104,6 +139,25 @@ def apply_to_landmarks(source: str, transform, destination: str) -> int:
     return moved
 
 
+def is_pure_translation(transform, tolerance: float = 1e-6) -> bool:
+    """True when `transform` only shifts, with no rotation, scale or reflection.
+
+    Probed rather than read off a matrix, because a transform arrives as any of
+    half a dozen ITK classes -- Translation, Euler, Affine, a Composite of
+    several, a bare 4x4 GreedyReg wrote -- and only some of them answer
+    `GetMatrix`. What is asked here is the only property the caller cares about:
+    does this transform move the three basis directions?
+    """
+    import numpy as np
+
+    at_origin = np.asarray(transform.TransformPoint((0.0, 0.0, 0.0)))
+    for axis in np.eye(3):
+        moved = np.asarray(transform.TransformPoint(tuple(axis))) - at_origin
+        if not np.allclose(moved, axis, atol=tolerance):
+            return False
+    return True
+
+
 def resample(image, transform, reference=None, is_segmentation: bool = False):
     """The resampled image.
 
@@ -111,9 +165,27 @@ def resample(image, transform, reference=None, is_segmentation: bool = False):
     and the one that matters: interpolating a label map linearly produces
     labels that were never in it.
 
-    With no reference, the output keeps the input's grid and only its origin
-    moves. That mimics what `ResampleScalarVectorDWIVolume` did without one,
-    which is the behaviour the Slicer module was written against.
+    With no reference the output keeps the input's grid. Its origin also moves
+    by the transform, but ONLY when the transform is a pure translation -- which
+    is the case the behaviour was ported for, and the only one it is
+    self-consistent in.
+
+    **Moving the origin of a grid whose direction is left alone throws the
+    output box away from the content whenever the transform turns or flips it.**
+    VFACE's mirror is `x -> -x` about x = 0; on a scan spanning x in
+    [-84.15, 84.15] the transformed origin is +84.15, so the output grid ran
+    from +84.15 to +252.45 -- past the far side of the head -- and the resampled
+    volume came out with **not one non-zero voxel**. AREG_CBCT then registered
+    that empty volume onto the original, found the 168.30 mm translation that
+    brings an empty box back over a head, and reported a success; the mirrored
+    landmarks inherited that translation, and an asymmetry measurement between
+    a midline point and its own mirror came out at 164 mm instead of nothing.
+
+    The shipped reference output settles what the right answer is:
+    `V_FACE/Test_Output/T2_Scan/CB/C_0001_T1_CB_Or_mir.nii.gz` spans the same
+    x as the scan it was mirrored from and holds 20 910 456 non-zero voxels,
+    which is exactly what keeping the grid produces here. So the origin move was
+    never the Slicer module's behaviour for anything but a translation.
     """
     import SimpleITK as sitk
 
@@ -130,7 +202,11 @@ def resample(image, transform, reference=None, is_segmentation: bool = False):
         resampler.SetSize(image.GetSize())
         resampler.SetOutputSpacing(image.GetSpacing())
         resampler.SetOutputDirection(image.GetDirection())
-        resampler.SetOutputOrigin(transform.TransformPoint(image.GetOrigin()))
+        resampler.SetOutputOrigin(
+            transform.TransformPoint(image.GetOrigin())
+            if is_pure_translation(transform)
+            else image.GetOrigin()
+        )
 
     return resampler.Execute(image)
 
@@ -156,7 +232,7 @@ def read_transform(path: str):
         if matrix is None:
             raise RuntimeError(
                 f"{os.path.basename(path)} is neither an ITK transform nor a "
-                f"4x4 matrix in text. ITK said: {itk_error}"
+                f"4x4 matrix in text. ITK said: {itk_cause(itk_error)}"
             ) from itk_error
         affine = sitk.AffineTransform(3)
         affine.SetMatrix([value for row in matrix[:3] for value in row[:3]])

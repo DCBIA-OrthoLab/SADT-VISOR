@@ -74,7 +74,9 @@ def quiet_stderr():
     `with` statement compiles to. It redirects Python's `sys.stderr` only, which
     is deliberate -- what the C library writes to file descriptor 2 goes to the
     server's per-job stderr file, where a failed load is meant to be readable.
-    Anything captured here is logged at DEBUG rather than dropped.
+    Anything captured here is logged at DEBUG rather than dropped; when the
+    load FAILS, `load_model` logs its last lines again at WARNING, where an
+    operator can see them.
     """
     buffer = io.StringIO()
     try:
@@ -126,6 +128,35 @@ def resolve_model_file(model) -> Path:
             f"run rather than leaving the choice to sort order."
         )
     return candidates[0]
+
+
+# The DATA folder this tool's weights live in. Written rather than derived, as
+# CLIC's is: which folder holds which bundle is a deployment fact.
+DATA_NAME = "CNE"
+
+
+def default_model(notes_type: str, data_root) -> Path:
+    """The bundle a run uses when the caller names none: the note type's own.
+
+    `scripts/data-manifest.yml` stages each fine-tune in a folder named after
+    its note type (`DATA/CNE/models/TMJ/`, `DATA/CNE/models/Ortho/`), so the
+    type alone picks the matching weights -- which is how upstream's panel
+    worked, and what keeps the Ortho model from ever being paired with the TMJ
+    prompt by a slip of the model dropdown.
+    """
+    if data_root is None:
+        raise ValueError(
+            "No 'model' given and no data root to look in. Name the model, or "
+            "run this through a server that hosts one."
+        )
+    bundle = Path(data_root) / DATA_NAME / "models" / notes_type
+    if not bundle.is_dir():
+        # The deployment's to fix, not the caller's: 503, not 422.
+        raise ToolUnavailableError(
+            f"No {notes_type} model is staged on this server. Stage it with "
+            f"`setup-models.sh --tool CNE`, or name another model."
+        )
+    return bundle
 
 
 def model_type_hint(model_file) -> str:
@@ -190,17 +221,101 @@ def supports_gpu_offload() -> bool:
     return bool(engine_module().llama_supports_gpu_offload())
 
 
+# How many trailing lines of the loader's own output are worth a log line.
+# llama.cpp prints its reason for refusing a file last; the screen above it is
+# tensor metadata.
+_LOADER_TAIL_LINES = 5
+
+
 def load_model(model_file, context_tokens: int, seed: int, n_gpu_layers: int):
-    """The llama.cpp engine, loaded once for the whole batch."""
+    """The llama.cpp engine, loaded once for the whole batch.
+
+    llama.cpp answers every failed load with the same `ValueError("Failed to
+    load model from file: <path>")`, whether the file is corrupt, the card ran
+    out of memory or the build cannot read the quantisation. That message
+    carries nothing but a path, which redaction then removes, and its class is
+    the one the server reads as "the caller's fault". So what was ATTEMPTED is
+    logged here, and the error is re-raised as the server-side fault it is.
+    """
+    # Outside the `try` on purpose: a missing `llama_cpp` is already a
+    # ToolUnavailableError, raised by `require` and naming the package.
     llama_cpp = engine_module()
-    with quiet_stderr():
-        return llama_cpp.Llama(
-            model_path=str(model_file),
-            n_ctx=context_tokens,
-            n_gpu_layers=n_gpu_layers,
-            seed=seed,
-            verbose=False,
-        )
+    attempted = _load_settings(llama_cpp, model_file, context_tokens, n_gpu_layers)
+    # Logged BEFORE the call as well as on failure: a load that kills the
+    # process outright (a segfault in the CUDA backend) raises nothing, and
+    # this line is then the only record of what was being tried.
+    logger.info("loading the language model: %s", attempted)
+    failure = None
+    with quiet_stderr() as captured:
+        try:
+            engine = llama_cpp.Llama(
+                model_path=str(model_file),
+                n_ctx=context_tokens,
+                n_gpu_layers=n_gpu_layers,
+                seed=seed,
+                verbose=False,
+            )
+        except Exception as exc:  # noqa: BLE001 -- re-raised below, classified.
+            # Handled after the `with`, once stderr is back: a logging handler
+            # that writes to `sys.stderr` would otherwise log into the buffer.
+            failure = exc
+    if failure is None:
+        return engine
+
+    kind = type(failure).__name__
+    reason = _last_line(str(failure)) or kind
+    logger.error(
+        "the language model could not be loaded (%s: %s); attempted %s",
+        kind, reason, attempted,
+    )
+    tail = [line for line in captured.getvalue().splitlines()
+            if line.strip()][-_LOADER_TAIL_LINES:]
+    if tail:
+        logger.warning("llama.cpp loader output: %s", " | ".join(tail))
+    # Which class decides what the server answers. A model file that is no
+    # longer there is a deployment that has lost its weights: nothing the
+    # caller sends will bring them back, so ToolUnavailableError and a 503.
+    # Anything else -- a corrupt or truncated file, a quantisation this build
+    # cannot read, the card out of memory -- is this server crashing mid-run,
+    # so a plain RuntimeError and a 500. Never the ValueError llama.cpp
+    # raised: that would be answered 422 and blamed on the request.
+    if not Path(model_file).is_file():
+        raise ToolUnavailableError(
+            f"the language model is no longer on this server ({kind}: "
+            f"{reason}). Stage it again with `setup-models.sh --tool CNE`."
+        ) from failure
+    raise RuntimeError(
+        f"loading the language model failed ({kind}: {reason}); "
+        f"n_ctx={context_tokens}, n_gpu_layers={n_gpu_layers}"
+    ) from failure
+
+
+def _load_settings(llama_cpp, model_file, context_tokens: int,
+                   n_gpu_layers: int) -> str:
+    """What a load is about to ask of llama.cpp, in one loggable line.
+
+    The size says whether the file is the whole model or a truncated copy; the
+    GPU fields say whether `n_gpu_layers` could have meant anything on this
+    build. No path: it is an argument value, and redaction would drop it.
+    """
+    try:
+        size = f"{Path(model_file).stat().st_size / 1e6:.0f} MB"
+    except OSError:
+        size = "size unknown (the file cannot be read)"
+    try:
+        offload = bool(llama_cpp.llama_supports_gpu_offload())
+    except Exception:  # noqa: BLE001 -- a diagnostic must not mask the load.
+        offload = "unknown"
+    return (
+        f"model {size}, n_ctx={context_tokens}, n_gpu_layers={n_gpu_layers}, "
+        f"gpu offload compiled in={offload}"
+    )
+
+
+def _last_line(text: str) -> str:
+    """The last non-blank line of a message, which is where the cause sits."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 def complete(model, messages: list, max_tokens: int, temperature: float) -> tuple:
@@ -219,7 +334,13 @@ def complete(model, messages: list, max_tokens: int, temperature: float) -> tupl
         choice = output["choices"][0]
         content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as error:
-        raise ValueError(f"the model returned an answer CNE cannot read: {error}")
+        # A RuntimeError, not a ValueError: the note was fine, the ENGINE
+        # answered in a shape it should not have, and that is this server's
+        # fault rather than the caller's.
+        raise RuntimeError(
+            f"the model returned an answer CNE cannot read "
+            f"({type(error).__name__}: {error})"
+        ) from error
     return (content or "").strip(), choice.get("finish_reason")
 
 
