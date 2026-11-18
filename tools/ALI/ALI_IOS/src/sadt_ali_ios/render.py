@@ -17,6 +17,7 @@ imports and publishes its schema, and only an IOS run fails.
 """
 
 import math
+import sys
 
 import numpy as np
 
@@ -82,6 +83,13 @@ FACES_PER_PIXEL = 1
 
 
 def import_pytorch3d():
+    if sys.platform == "darwin":
+        # macOS: no pytorch3d at all. `render_native` provides the three names
+        # the engine takes from it (Meshes, TexturesVertex, look_at_rotation)
+        # and checks that Embree is installed.
+        from . import render_native
+
+        return render_native.namespace()
     try:
         from pytorch3d.renderer import (
             FoVPerspectiveCameras,
@@ -129,6 +137,18 @@ def build_renderer(device, image_size: int = IMAGE_SIZE, blur_radius: float = BL
     reference mesh: 238 views rendered, 476 rasterizations, 3.57 s of a 21.6 s
     run spent recomputing fragments the shading pass had just thrown away.
     """
+    if sys.platform == "darwin":
+        # Same camera, settings and lights as below, rendered without pytorch3d.
+        from . import render_native
+
+        if blur_radius != 0 or faces_per_pixel != 1:
+            raise ValueError("the macOS renderer rasterizes one face per pixel, without blur")
+        render_native.require_embree()
+        return render_native.Renderer(
+            render_native.PointLights(), fov=90, znear=0.01, size=image_size, zfar=10,
+            background=(0.0, 0.0, 0.0),
+        )
+
     p3d = import_pytorch3d()
 
     cameras = p3d["FoVPerspectiveCameras"](znear=0.01, zfar=10, fov=90, device=device)
@@ -136,6 +156,14 @@ def build_renderer(device, image_size: int = IMAGE_SIZE, blur_radius: float = BL
         image_size=image_size, blur_radius=blur_radius, faces_per_pixel=faces_per_pixel
     )
     rasterizer = p3d["MeshRasterizer"](cameras=cameras, raster_settings=raster_settings)
+    from . import embree_raster
+
+    if embree_raster.wanted(device):
+        # macOS / MPS: pytorch3d has no Metal rasterizer. Same cameras and settings,
+        # fragments from Embree; the shader below is pytorch3d's, unchanged.
+        rasterizer = embree_raster.rasterizer_class()(
+            cameras=cameras, raster_settings=raster_settings
+        )
     shader = p3d["HardPhongShader"](
         device=device,
         cameras=cameras,

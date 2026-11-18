@@ -54,6 +54,9 @@ def resolve_device(requested: str) -> str:
             "warning",
         )
         return "cpu"
+    if wanted == "mps" and not torch.backends.mps.is_available():
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
+        return "cpu"
     return wanted
 
 

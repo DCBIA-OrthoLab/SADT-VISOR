@@ -12,6 +12,7 @@ the other. They share their output format and their input vocabulary, both in
 `sadt_ali_common`, and nothing else.
 """
 
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -59,6 +60,10 @@ def _own_models(data_root):
             "bundle, or run this through a server that publishes one."
         )
     return Path(data_root) / _DATA_NAME / "models"
+
+
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
 
 
 def run(
@@ -113,7 +118,7 @@ def run(
             "LR2MG", "LR3MG", "LR4MG", "LR5MG", "LR6MG",
         ]
     ] = [],
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
     *,
     sup=None,
     data_root=None,

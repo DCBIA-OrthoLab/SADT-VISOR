@@ -326,7 +326,8 @@ def test_importing_the_package_pulls_in_no_engine():
 
     # `errors` is this package's own ToolInputError, not an engine: it is what
     # lets the module refuse a request without the segmentation stack loaded.
-    assert top_level == {"pathlib", "typing", "pipeline", "errors"}
+    # `sys` is the standard library, read only to publish `mps` on macOS.
+    assert top_level == {"pathlib", "typing", "pipeline", "errors", "sys"}
 
 
 def test_the_pipeline_defers_every_heavy_import():

@@ -7,6 +7,7 @@ Ported from SlicerAutomatedDentalTools' `DOCShapeAXI` module and
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -19,13 +20,17 @@ __all__ = ["run"]
 PREDICTION_SHARE = 0.25
 
 
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+
+
 def run(
     surfaces: Path,
     model: Path,
     output_dir: Path,
     explain: bool = True,
     output_suffix: str = "_pred",
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
 ) -> Path:
     """Classify each 3D surface, and paint the reason for it onto the mesh.
 

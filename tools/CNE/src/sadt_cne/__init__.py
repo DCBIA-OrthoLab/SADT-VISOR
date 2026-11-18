@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -51,6 +52,10 @@ ACCEPTS = {"notes": NOTE_EXTENSIONS}
 __all__ = ["run"]
 
 
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cpu", "cuda", "mps"] if sys.platform == "darwin" else Literal["cpu", "cuda"]
+
+
 def run(
     notes: Path,
     notes_type: Literal["TMJ", "Ortho"],
@@ -63,7 +68,7 @@ def run(
     temperature: float = 0.0,
     context_tokens: int = 0,
     seed: int = 0,
-    device: Literal["cpu", "cuda"] = "cpu",
+    device: _DEVICES = "cpu",
     *,
     data_root=None,
 ) -> Path:
@@ -164,7 +169,7 @@ def run(
         )
 
     window = context_for(notes_type, context_tokens)
-    wants_gpu = device.startswith("cuda")
+    wants_gpu = device.startswith("cuda") or device == "mps"  # mps: llama.cpp offloads through Metal
     # Asked BEFORE the 4.4 GB load, so a deployment that cannot honour "cuda"
     # says so in the same second rather than after the weights are in memory.
     offloading = wants_gpu and supports_gpu_offload()

@@ -1901,3 +1901,19 @@ def test_a_scan_with_a_flipped_axis_gives_its_surface_in_place():
 
     np.testing.assert_allclose(points, expected_points, atol=1e-4)
     assert sign == expected_sign
+
+
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):
+    """`mps` is only published on macOS, but a direct call can still name it
+    anywhere: it must run on the CPU and say why, not die inside torch."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with caplog.at_level("WARNING"):
+        assert nnunet_runner.resolve_device("mps") == "cpu"
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert nnunet_runner.resolve_device("mps") == "mps"

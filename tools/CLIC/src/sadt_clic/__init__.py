@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -81,6 +82,10 @@ def _resolve_checkpoint(model, data_root) -> str:
     return str(_sole_checkpoint(path) if path.is_dir() else path)
 
 
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+
+
 def run(
     scans: Path,
     output_dir: Path,
@@ -90,7 +95,7 @@ def run(
     model: Path = "",
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
     output_suffix: str = "seg",
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
     *,
     data_root=None,
 ) -> Path:

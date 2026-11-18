@@ -1665,3 +1665,23 @@ def test_the_corrected_scan_is_in_the_axis_order_the_agents_were_trained_on(tmp_
         point = image.TransformIndexToPhysicalPoint(index)
         moved = written.TransformPhysicalPointToIndex(point)
         assert clamped[moved[::-1]] == np.clip(original[index[::-1]], low, high)
+
+
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):
+    """`mps` is only published on macOS, but a direct call can still name it
+    anywhere: it must run on the CPU and say why, not die inside torch."""
+    torch = pytest.importorskip("torch")
+    from sadt_ali_cbct import brain
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with caplog.at_level("WARNING"):
+        assert brain.resolve_device("mps") == "cpu"
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from sadt_ali_cbct import brain
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert brain.resolve_device("mps") == "mps"

@@ -124,6 +124,9 @@ def resolve_device(requested: str) -> str:
             "a GPU was requested but none is visible; running on the CPU", "warning"
         )
         return "cpu"
+    if requested == "mps" and not torch.backends.mps.is_available():
+        logger.warning("mps requested but MPS is unavailable; running on cpu")
+        return "cpu"
     return requested
 
 
@@ -205,6 +208,10 @@ def load_network(checkpoint: str, network_name: str, device: str,
         )
     check_backbone_is_staged()
     allow_checkpoint_globals()
+    from . import embree_raster
+
+    if embree_raster.wanted(device):
+        use_embree_and_cdist(saxi_nets_lightning)
     # Said before the call: a failed load's own message is a long Lightning or
     # pickle traceback whose useful part is its last line, and the operator
     # needs to know what was being attempted to read it.
@@ -229,6 +236,77 @@ def last_line(exc: BaseException) -> str:
     """
     lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
     return f"{type(exc).__name__}: {lines[-1] if lines else ''}".rstrip(": ")
+
+
+def use_embree_and_cdist(saxi_nets_lightning) -> None:
+    """Swap the three pytorch3d pieces that have no Metal kernel, in this process.
+
+    Only reached on macOS (`embree_raster.wanted`). shapeaxi looks these
+    names up in its own module namespaces at call time, so rebinding them is
+    enough and shapeaxi's files are untouched:
+
+    * `MeshRasterizer`, which `SaxiMHAFBClassification` and `...Regression` use
+      to build their renderer: the Embree subclass.
+    * `sample_points_from_meshes`, a compiled op that refuses any tensor not on
+      the CPU: run on the CPU (7 ms for a scan), results moved back.
+    * `knn_points` in `MHA_KNN` (256 channels, which the compiled kernel
+      handles in 1.7 s on the CPU): `torch.cdist` plus `topk`, 24 ms, the same
+      indices on 99.99 % of the entries.
+    """
+    if not hasattr(saxi_nets_lightning, "MeshRasterizer"):
+        # Not a shapeaxi renderer module (the tests stand a stub in its place):
+        # nothing to replace, and the rendering stays as it is.
+        logger.warning("shapeaxi has no MeshRasterizer to replace; rendering unchanged")
+        return
+
+    from shapeaxi import saxi_layers
+
+    from . import embree_raster
+
+    saxi_nets_lightning.MeshRasterizer = embree_raster.rasterizer_class()
+    if not hasattr(saxi_nets_lightning.sample_points_from_meshes, "_sadt_wrapped"):
+        saxi_nets_lightning.sample_points_from_meshes = _on_cpu(
+            saxi_nets_lightning.sample_points_from_meshes
+        )
+        saxi_layers.knn_points = _knn_by_cdist(saxi_layers.knn_points)
+    logger.info("Rasterizing with Embree, knn with cdist, sampling on the CPU")
+
+
+def _to(value, device):
+    if hasattr(value, "_fields"):  # a namedtuple, as pytorch3d's knn returns
+        return type(value)(*(_to(item, device) for item in value))
+    if isinstance(value, (tuple, list)):
+        return type(value)(_to(item, device) for item in value)
+    return value.to(device) if hasattr(value, "to") else value
+
+
+def _on_cpu(original):
+    def sample_points_from_meshes(meshes, *args, **kwargs):
+        if meshes.device.type == "cpu":
+            return original(meshes, *args, **kwargs)
+        return _to(original(meshes.to("cpu"), *args, **kwargs), meshes.device)
+
+    sample_points_from_meshes._sadt_wrapped = True
+    return sample_points_from_meshes
+
+
+def _knn_by_cdist(original):
+    def knn_points(p1, p2, lengths1=None, lengths2=None, norm=2, K=1, version=-1,
+                   return_nn=False, return_sorted=True):
+        import torch
+        from pytorch3d.ops.knn import _KNN
+
+        plain = (lengths1 is None and lengths2 is None and norm == 2 and not return_nn
+                 and K <= p2.shape[1])
+        if plain and p1.dtype == torch.float32:
+            squared = torch.cdist(p1, p2).pow(2)
+            dists, idx = squared.topk(K, dim=-1, largest=False, sorted=True)
+            return _KNN(dists=dists, idx=idx, knn=None)
+        result = original(p1.cpu(), p2.cpu(), lengths1, lengths2, norm, K, version,
+                          return_nn, return_sorted)
+        return _to(result, p1.device)
+
+    return knn_points
 
 
 def _shapeaxi_version() -> str:
