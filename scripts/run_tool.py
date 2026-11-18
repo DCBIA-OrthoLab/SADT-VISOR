@@ -61,9 +61,20 @@ class ToolNotBuilt(Exception):
 # Layer 1: find the tool's interpreter
 # ---------------------------------------------------------------------------
 
+def tool_root(name):
+    """The folder of a tool: `tools/<name>`, or `tools/<group>/<name>` for a tool that lives in a grouping
+    folder (`ALI_CBCT` is `tools/ALI/ALI_CBCT`). A path such as `ALI/ALI_CBCT` is taken as given. This is how
+    the server names a tool, so a tool that calls another one by its name finds it here as well."""
+    direct = TOOLS_DIR / name
+    if (direct / "pyproject.toml").is_file():
+        return direct
+    grouped = sorted(path.parent for path in TOOLS_DIR.glob("*/" + name + "/pyproject.toml"))
+    return grouped[0] if grouped else direct
+
+
 def tool_python(name):
-    """The interpreter of `tools/<name>/.venv`."""
-    root = TOOLS_DIR / name
+    """The interpreter of the tool's own `.venv`."""
+    root = tool_root(name)
     if not root.is_dir():
         available = sorted(
             path.name for path in TOOLS_DIR.iterdir()
@@ -326,6 +337,9 @@ class LocalSupervisor:
         params.pop("_progress", None)
         self._say("running {}".format(tool))
         scratch = Path(tempfile.mkdtemp(prefix="sup_", dir=str(self.tmp)))
+        # A callee declares `output_dir` as required, and a caller does not name one: where a supervised
+        # tool writes is the supervisor's, as on the server. A caller that does name one is obeyed.
+        params.setdefault("output_dir", scratch / "out")
         params_file, result_file = scratch / "params.json", scratch / "result.json"
         params_file.write_text(json.dumps(_jsonable(params)), encoding="utf-8")
 
@@ -390,7 +404,7 @@ def _jsonable(value):
 
 def call(name, params, depth):
     """Import the tool, inject a supervisor if it wants one, call `run()`."""
-    src = TOOLS_DIR / name / "src"
+    src = tool_root(name) / "src"
     run = describe.load_run(src, describe.find_package(src))
     hints = typing.get_type_hints(run)
     arguments = {
@@ -440,7 +454,7 @@ def main(argv=None):
     # then be imported into its CALLER's environment, which is precisely the
     # dependency mixing this repository exists to prevent. `sys.prefix` is the
     # venv root inside a venv, so it is the thing that actually differs.
-    if Path(sys.prefix).resolve() != (TOOLS_DIR / name / ".venv").resolve():
+    if Path(sys.prefix).resolve() != (tool_root(name) / ".venv").resolve():
         return subprocess.run(
             [str(interpreter), str(Path(__file__).resolve()), name] + rest
         ).returncode
@@ -452,7 +466,7 @@ def main(argv=None):
     machine.add_argument("--depth", type=int, default=0)
     known, remaining = machine.parse_known_args(rest)
 
-    src = TOOLS_DIR / name / "src"
+    src = tool_root(name) / "src"
     try:
         run = describe.load_run(src, describe.find_package(src))
     except describe.SchemaError as error:
