@@ -17,6 +17,8 @@ fits. It skips unless both tools are built with their heavy extras -- see
 tests/data/README.md.
 """
 
+import sys
+
 import numpy as np
 import pytest
 import SimpleITK as sitk
@@ -76,7 +78,9 @@ def test_the_published_schema_matches_the_callable(cohort, tmp_path):
     # And the options the schema publishes are options the tool really takes.
     assert "Cranial base" in schema["arguments"]["regions"]["choices"]
     assert "Ba" in schema["arguments"]["landmarks"]["choices"]
-    assert schema["arguments"]["device"]["choices"] == ["cuda", "cpu"]
+    assert schema["arguments"]["device"]["choices"] == (
+        ["cuda", "cpu", "mps"] if sys.platform == "darwin" else ["cuda", "cpu"]
+    )
 
 
 @needs_venv
