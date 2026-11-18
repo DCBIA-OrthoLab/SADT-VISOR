@@ -1355,3 +1355,23 @@ def test_the_ask_is_capped_at_the_widest_width_worth_having():
 
     # A busy machine still narrows it further; the cap is not a floor.
     assert cbct_engine._channels_for(_Stingy(), 119) == 2
+
+
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):
+    """`mps` is only published on macOS, but a direct call can still name it
+    anywhere: it must run on the CPU and say why, not die inside torch."""
+    torch = pytest.importorskip("torch")
+    from sadt_ali_cbct import brain
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with caplog.at_level("WARNING"):
+        assert brain.resolve_device("mps") == "cpu"
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from sadt_ali_cbct import brain
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert brain.resolve_device("mps") == "mps"

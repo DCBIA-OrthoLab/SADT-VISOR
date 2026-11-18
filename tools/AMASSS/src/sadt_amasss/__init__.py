@@ -4,11 +4,15 @@ One nnUNet v2 model per anatomical structure, run over one scan or a whole
 folder of them. The pipeline is in pipeline.py; only `run` is public.
 """
 
+import sys
 from pathlib import Path
 from typing import Literal
 
 from .catalog import merge_modes, structure_codes
 from .pipeline import segment
+
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
 
 
 # Two caveats that used to sit in `run()`'s docstring, and so in the panel:
@@ -33,7 +37,7 @@ def run(
     generate_surface: bool = False,
     surface_smoothing: int = 5,
     surface_decimation: int = 90,
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
     num_workers: int = 0,

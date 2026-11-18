@@ -3,6 +3,7 @@
 The pipeline is in pipeline.py; only `run` is public.
 """
 
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -29,6 +30,10 @@ def _own_models(data_root):
     return Path(data_root) / _DATA_NAME / "models"
 
 
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+
+
 def run(
     meshes: Path,
     output_dir: Path,
@@ -45,7 +50,7 @@ def run(
     suffix: str = "Seg",
     numbering: Literal["Universal", "FDI"] = "Universal",
     skip_segmented: bool = True,
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = "cuda",
     num_workers: int = 2,
     *,
     data_root=None,
