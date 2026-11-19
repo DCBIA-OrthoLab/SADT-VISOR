@@ -1,0 +1,41 @@
+[project]
+name = "sadt-tmj-crop"
+version = "0.1.0"
+description = "Crop the temporomandibular joints of a CBCT into fixed-size volumes."
+requires-python = ">=3.11,<3.12"
+# No torch, no nnUNet: this tool predicts nothing. The orientation comes from
+# ASO (which runs ALI_CBCT itself) and the mandible from AMASSS, each in its own
+# virtualenv, reached through the supervisor. What is left here is geometry and
+# resampling -- the same shape as AREG_IOSCBCT, which is why the pins below are
+# the ones that family already uses.
+dependencies = [
+    "matplotlib==3.10.6",
+    "nibabel==5.3.2",
+    "numpy==2.3.2",
+    "scipy==1.16.2",
+]
+
+[tool.sadt]
+tool = true
+name = "TMJ_Crop"
+
+[dependency-groups]
+dev = ["pytest==8.3.4", "sadt-testkit"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sadt_tmj_crop"]
+
+[tool.uv.sources]
+sadt-testkit = { path = "../../testkit", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not gpu and not models'"
+markers = [
+    "gpu: needs a CUDA device. Deselected by default; run it by hand and report the result in the PR.",
+    "models: needs the real bundles the supervised tools run with.",
+]
