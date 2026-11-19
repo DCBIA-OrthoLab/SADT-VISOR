@@ -875,6 +875,14 @@ def _run_cbct(
     reference_landmarks = cbct_pipeline.load_reference(reference_root)
     report["requested_landmarks"] = list(requested)
     report["reference_landmarks"] = sorted(reference_landmarks)
+    # The positions too, not only the names: a caller that works in the oriented
+    # frame (a crop around the porion, say) needs to know where the reference
+    # puts each landmark, and the bundle is this tool's, not the caller's. In
+    # the frame of the markups file, the one `_lm_Or.mrk.json` is written in.
+    report["reference_positions"] = {
+        name: [round(float(value), 4) for value in reference_landmarks[name]]
+        for name in sorted(reference_landmarks)
+    }
 
     patients = cbct_pipeline.discover(input_root, suffix)
     if not patients:
