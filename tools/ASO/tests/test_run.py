@@ -1503,6 +1503,10 @@ def test_the_matching_selection_runs_against_the_same_reference(tmp_path):
     )
     assert run.report["cases"]["patient1"]["status"] == "ok"
     assert run.report["reference_landmarks"] == sorted(points)
+    # Where the reference puts each landmark travels with the names.
+    assert run.report["reference_positions"] == {
+        name: [round(float(v), 4) for v in points[name]] for name in sorted(points)
+    }
 
 
 def test_an_empty_input_says_what_was_expected(tmp_path):
