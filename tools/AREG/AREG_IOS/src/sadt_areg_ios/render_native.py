@@ -215,8 +215,10 @@ def rasterize(mesh, R, T, fov, znear, size):
     """
     size = int(size)
     device = mesh.device
-    rotation = R.detach().double().cpu().numpy()
-    translation = T.detach().double().cpu().numpy()
+    # `.cpu()` BEFORE `.double()`: MPS has no float64, so the cast must happen
+    # on the host, where the ray maths wants double precision anyway.
+    rotation = R.detach().cpu().double().numpy()
+    translation = T.detach().cpu().double().numpy()
     directions = _view_directions(fov, size) @ rotation.T
     origins = -translation @ rotation.T + (znear / 2) * directions
 
