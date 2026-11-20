@@ -12,7 +12,7 @@ from conftest import phantom
 from sadt_areg_cbct import elastix, gpu_rigid, pipeline
 from test_run import _moved
 
-needs_gpu = pytest.mark.skipif(not gpu_rigid.available(), reason="no CUDA device")
+needs_gpu = pytest.mark.skipif(not gpu_rigid.available(), reason="no GPU (CUDA or MPS)")
 
 
 def _probes(image):
@@ -86,6 +86,89 @@ def test_a_failure_on_the_card_falls_back_to_elastix(monkeypatch):
     assert pipeline._register(None, None) == ("elastix transform", "elastix")
 
 
+def test_the_device_is_chosen_on_availability_cuda_first(monkeypatch):
+    mps = torch.backends.mps
+    for cuda, apple, expected in ((True, True, "cuda"), (True, False, "cuda"),
+                                  (False, True, "mps"), (False, False, None)):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda cuda=cuda: cuda)
+        monkeypatch.setattr(mps, "is_available", lambda apple=apple: apple)
+        device = gpu_rigid._device()
+        assert (device.type if device else None) == expected
+        assert gpu_rigid.available() is (expected is not None)
+
+
+def test_the_cache_emptied_is_the_one_of_the_device_used(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cuda"))
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: calls.append("mps"))
+    gpu_rigid._empty_cache(torch.device("cuda"))
+    gpu_rigid._empty_cache(torch.device("mps"))
+    gpu_rigid._empty_cache(torch.device("cpu"))
+    assert calls == ["cuda", "mps"]
+
+
+def test_registering_without_a_gpu_raises_so_that_elastix_takes_over(monkeypatch):
+    monkeypatch.setattr(gpu_rigid, "_device", lambda: None)
+    fixed = phantom(size=16)
+    with pytest.raises(RuntimeError, match="no GPU"):
+        gpu_rigid.register(fixed, fixed)
+
+
+def test_a_failure_on_mps_falls_back_with_the_same_message(monkeypatch, caplog):
+    def refused(fixed, moving, cost=None):
+        raise RuntimeError("index_put_with_accumulate_mps does not have a deterministic implementation")
+
+    monkeypatch.setattr(gpu_rigid, "available", lambda: True)
+    monkeypatch.setattr(gpu_rigid, "register", refused)
+    monkeypatch.setattr(elastix, "register", lambda fixed, moving, cost=None: "elastix transform")
+    with caplog.at_level("WARNING"):
+        assert pipeline._register(None, None) == ("elastix transform", "elastix")
+    assert "GPU registration failed" in caplog.text
+    assert "registering with elastix" in caplog.text
+
+
+def test_the_edges_are_replicated_as_replicate_pad_does_to_the_bit():
+    """MPS's own replicate pad is wrong on a large volume, so `_blur_axis`
+    builds the padding itself; on CPU the two must agree exactly."""
+    import torch.nn.functional as F
+
+    volume = torch.from_numpy(np.random.default_rng(1).random((14, 17, 19)).astype(np.float32))
+    kernel, radius = gpu_rigid._gaussian(4, volume.device)
+    for axis in range(3):
+        shape = [1, 1, 1, 1, 1]
+        shape[2 + axis] = kernel.numel()
+        pad = [0] * 6
+        pad[2 * (2 - axis)] = pad[2 * (2 - axis) + 1] = radius
+        expected = F.conv3d(F.pad(volume[None, None], pad, mode="replicate"), kernel.view(shape))
+        index = [slice(None)] * 5
+        index[2 + axis] = slice(None, None, 4)
+        expected = expected[tuple(index)][0, 0]
+        assert torch.equal(gpu_rigid._blur_axis(volume, axis, 4, kernel, radius), expected)
+
+
+def test_the_mutual_information_and_its_gradient_are_those_of_boolean_indexing_to_the_bit():
+    """`masked_select` replaced `joint[present]` (whose gradient MPS refuses in
+    deterministic mode): the value and the gradient must not move."""
+    rng = np.random.default_rng(2)
+    values = torch.from_numpy(rng.random((64, 64)).astype(np.float32))
+    values[values < 0.4] = 0
+
+    def old(joint):
+        joint = joint / joint.sum()
+        marginal = joint.sum(1, keepdim=True) @ joint.sum(0, keepdim=True)
+        present = joint > 0
+        return -(joint[present] * (joint[present] / marginal[present]).log()).sum()
+
+    results = []
+    for function in (old, gpu_rigid._Registration._negative_mi):
+        joint = values.clone().requires_grad_(True)
+        value = function(joint)
+        value.backward()
+        results.append((value.detach(), joint.grad))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+
+
 # ---------------------------------------------------------------------------
 # On the card
 # ---------------------------------------------------------------------------
@@ -135,7 +218,7 @@ def test_a_level_built_slab_by_slab_is_the_whole_volume_blurred(monkeypatch):
     """The slabs are cut across an axis the blur does not run along, so none
     needs its neighbours: put back together they are the whole volume."""
     array = np.random.default_rng(0).random((40, 36, 44)).astype(np.float32)
-    device = torch.device("cuda")
+    device = gpu_rigid._device()
     kernel, radius = gpu_rigid._gaussian(2, device)
     whole = torch.from_numpy(array).to(device)
     for axis in range(3):
@@ -153,9 +236,9 @@ def test_the_batched_gradient_is_the_whole_histogram_s_gradient(monkeypatch):
     give the gradient one pass over every sample gives, by the chain rule."""
     fixed = phantom(size=48)
     moving, _truth = _moved(fixed)
-    registration = gpu_rigid._Registration(fixed, moving, torch.device("cuda"))
+    registration = gpu_rigid._Registration(fixed, moving, gpu_rigid._device())
     level = gpu_rigid._Level(registration, factor=1, stride=1)
-    params = torch.tensor([0.5, -0.3, 0.2, 0.4, -0.6, 0.3], device="cuda", requires_grad=True)
+    params = torch.tensor([0.5, -0.3, 0.2, 0.4, -0.6, 0.3], device=gpu_rigid._device(), requires_grad=True)
 
     whole = registration._batch_joint(level, params, 0, level.points.shape[0])
     registration._negative_mi(whole).backward()
@@ -166,3 +249,21 @@ def test_the_batched_gradient_is_the_whole_histogram_s_gradient(monkeypatch):
     assert len(level.batches()) > 5
     registration._gradient(level, params)
     assert torch.allclose(params.grad, expected, rtol=1e-4, atol=1e-7)
+
+
+# The 48-voxel phantom's six parameters, measured on the RTX 6000 Ada before
+# the device became a parameter. Other cards sum in another order and land a
+# few bits away, so this pins that one and skips elsewhere.
+PHANTOM_CUDA_BITS = ["0x1.41d7ca3d70a3dp-5", "-0x1.8c618f5c28f5cp-6", "0x1.ecd1147ae147bp-6",
+                     "0x1.3b524c0000000p+0", "-0x1.9b5a480000000p+0", "0x1.c2fc8e0000000p-1"]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or "RTX 6000 Ada" not in torch.cuda.get_device_name(0),
+    reason="the reference bits were measured on an RTX 6000 Ada")
+def test_the_cuda_path_still_gives_the_bits_it_gave():
+    fixed = phantom(size=48)
+    moving, _truth = _moved(fixed)
+    bits = [float(v).hex() for v in gpu_rigid.register(fixed, moving).GetParameters()]
+    assert bits == PHANTOM_CUDA_BITS
