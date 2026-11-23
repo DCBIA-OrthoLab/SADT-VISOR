@@ -308,7 +308,9 @@ def test_describe_publishes_the_schema_this_tool_promises():
         "output_dir", "skip_segmented", "suffix",
     ]
     assert schema["arguments"]["numbering"]["choices"] == ["Universal", "FDI"]
-    assert schema["arguments"]["device"]["choices"] == ["cuda", "cpu"]
+    assert schema["arguments"]["device"]["choices"] == (
+        ["cuda", "cpu", "mps"] if sys.platform == "darwin" else ["cuda", "cpu"]
+    )
     assert schema["arguments"]["skip_segmented"]["default"] is True
     assert schema["arguments"]["num_workers"]["default"] == 2
 

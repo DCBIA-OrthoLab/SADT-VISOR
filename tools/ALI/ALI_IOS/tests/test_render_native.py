@@ -337,6 +337,49 @@ def test_a_quad_in_front_of_the_camera_fills_its_footprint_with_the_right_depth(
     assert torch.allclose(zbuf[inside], torch.full((int(inside.sum()),), 2.0), atol=1e-4)
 
 
+class _MpsLike(torch.Tensor):
+    """A stand-in for a tensor living on MPS, usable on any machine.
+
+    MPS refuses float64 (`.double()`, `.to(torch.float64)`) and cannot be
+    turned into numpy without a trip through the CPU, and that is all this
+    class models: `.cpu()` hands back an ordinary tensor. It does NOT model
+    Metal kernels, memory or any other MPS behaviour.
+    """
+
+    def _refuse(self):
+        raise TypeError("Cannot convert a MPS Tensor to float64 dtype as the MPS framework "
+                        "doesn't support float64")
+
+    def double(self):
+        self._refuse()
+
+    def to(self, *args, **kwargs):
+        wanted = [a for a in (*args, kwargs.get("dtype")) if isinstance(a, torch.dtype)]
+        if torch.float64 in wanted:
+            self._refuse()
+        return super().to(*args, **kwargs)
+
+    def numpy(self, *args, **kwargs):
+        raise TypeError("can't convert mps:0 device type tensor to numpy")
+
+    def cpu(self, *args, **kwargs):
+        return torch.Tensor.cpu(self.as_subclass(torch.Tensor))
+
+
+def test_the_pose_is_cast_to_float64_on_the_cpu_never_on_the_device(embree):
+    """`device=mps` answered 500 on a real Mac: the pose went through `.double()`
+    while still on MPS. Here the pose is an `_MpsLike` tensor, which raises
+    exactly there; and the image must be the one the plain CPU pose gives."""
+    rotation = torch.eye(3).as_subclass(_MpsLike)
+    translation = torch.zeros(3).as_subclass(_MpsLike)
+    with pytest.raises(TypeError, match="MPS"):
+        rotation.double()
+    got = native.rasterize(quad(2.0), rotation, translation, fov=90.0, znear=0.01, size=32)
+    want = native.rasterize(quad(2.0), *IDENTITY, fov=90.0, znear=0.01, size=32)
+    for a, b in zip(got, want):
+        assert torch.equal(a, b)
+
+
 def test_plus_x_in_view_space_is_on_the_left_of_the_image(embree):
     """pytorch3d's convention: a quad on the camera's +x side lands on the LEFT columns."""
     verts = np.array([[0.2, -0.5, 2], [1.0, -0.5, 2], [1.0, 0.5, 2], [0.2, 0.5, 2]], np.float32)

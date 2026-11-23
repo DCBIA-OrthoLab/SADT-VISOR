@@ -250,10 +250,32 @@ def test_every_published_default_is_one_of_its_own_options():
             assert value in options, (argument, value)
 
 
-def test_the_published_devices_are_the_two_the_engine_resolves():
-    """`resolve_device` falls back to CPU when no card is visible, so both
-    values are always runnable -- but a third would reach torch verbatim."""
-    assert _choices("device") == ["cuda", "cpu"]
+@pytest.mark.parametrize("platform, expected", [
+    ("linux", ["cuda", "cpu"]),
+    ("win32", ["cuda", "cpu"]),
+    ("darwin", ["cuda", "cpu", "mps"]),
+])
+def test_the_published_devices_are_the_ones_the_engine_resolves(platform, expected, monkeypatch):
+    """`resolve_device` falls back to CPU when no card is visible, so `cuda` and
+    `cpu` are always runnable. `mps` is published on macOS only, where the
+    engine can resolve it; anywhere else a third value would reach torch
+    verbatim.
+
+    The list is built when the package is imported, so each platform is
+    simulated by reloading it, and the real one is restored afterwards."""
+    import importlib
+    import sys
+
+    import sadt_ali_ios
+
+    monkeypatch.setattr(sys, "platform", platform)
+    try:
+        reloaded = importlib.reload(sadt_ali_ios)
+        hint = typing.get_type_hints(reloaded.run)["device"]
+        assert list(typing.get_args(hint)) == expected
+    finally:
+        monkeypatch.undo()
+        importlib.reload(sadt_ali_ios)
 
 
 def test_the_marker_is_constant_and_no_caller_can_move_it():

@@ -48,6 +48,6 @@ torch = { index = "pytorch-cu128" }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "gpu: needs a CUDA device. Skipped in CI (`-m 'not gpu'`); run it by hand and report the result in the PR.",
+    "gpu: needs a GPU (CUDA or MPS). Skipped in CI (`-m 'not gpu'`); run it by hand and report the result in the PR.",
     "models: needs a real model bundle and is skipped without it. See tests/data/README.md.",
 ]

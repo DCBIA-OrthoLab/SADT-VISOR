@@ -32,6 +32,10 @@ def _own_models(data_root):
 
 # "mps" is published on macOS only: every other platform keeps the options it always had.
 _DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+# What a caller that names no device gets. Not only the published default: a
+# tool another tool runs through `sup.run` is sent none, and `cuda` on a Mac is
+# a request the CPU answers, many times slower than the Apple GPU it could use.
+_DEFAULT_DEVICE = "mps" if sys.platform == "darwin" else "cuda"
 
 
 def run(
@@ -50,7 +54,7 @@ def run(
     suffix: str = "Seg",
     numbering: Literal["Universal", "FDI"] = "Universal",
     skip_segmented: bool = True,
-    device: _DEVICES = "cuda",
+    device: _DEVICES = _DEFAULT_DEVICE,
     num_workers: int = 2,
     *,
     data_root=None,
