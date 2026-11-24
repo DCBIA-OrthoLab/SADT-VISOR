@@ -54,6 +54,11 @@ __all__ = ["run"]
 
 # "mps" is published on macOS only: every other platform keeps the options it always had.
 _DEVICES = Literal["cpu", "cuda", "mps"] if sys.platform == "darwin" else Literal["cpu", "cuda"]
+# The default is what a caller gets when it names no device (a tool calling
+# this one sends none): on macOS that is the Metal GPU, never a request for
+# a card the machine cannot have.
+# Elsewhere the CPU: the pinned llama.cpp build there offloads nothing.
+_DEFAULT_DEVICE = "mps" if sys.platform == "darwin" else "cpu"
 
 
 def run(
@@ -68,7 +73,7 @@ def run(
     temperature: float = 0.0,
     context_tokens: int = 0,
     seed: int = 0,
-    device: _DEVICES = "cpu",
+    device: _DEVICES = _DEFAULT_DEVICE,
     *,
     data_root=None,
 ) -> Path:

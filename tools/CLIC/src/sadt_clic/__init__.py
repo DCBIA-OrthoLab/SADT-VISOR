@@ -84,6 +84,10 @@ def _resolve_checkpoint(model, data_root) -> str:
 
 # "mps" is published on macOS only: every other platform keeps the options it always had.
 _DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+# The default is what a caller gets when it names no device (a tool calling
+# this one sends none): on macOS that is the Metal GPU, never a request for
+# a card the machine cannot have.
+_DEFAULT_DEVICE = "mps" if sys.platform == "darwin" else "cuda"
 
 
 def run(
@@ -95,7 +99,7 @@ def run(
     model: Path = "",
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
     output_suffix: str = "seg",
-    device: _DEVICES = "cuda",
+    device: _DEVICES = _DEFAULT_DEVICE,
     *,
     data_root=None,
 ) -> Path:
