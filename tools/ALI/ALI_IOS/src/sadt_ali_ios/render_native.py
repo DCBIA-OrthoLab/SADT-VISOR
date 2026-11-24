@@ -1,4 +1,4 @@
-"""Mesh rendering without pytorch3d: Embree for the rays, torch for the rest.
+"""Mesh rendering without pytorch3d: OpenGL for the faces, torch for the rest.
 
 On macOS the IOS engines of this repository (ALI_IOS, AREG_IOS) render a tooth
 or an arch from fixed viewpoints, run a 2D UNet on the images and read back
@@ -9,9 +9,8 @@ whole forward renderer instead and pytorch3d is never imported.
 NOTHING HERE RUNS OFF macOS. The callers choose this module with
 `sys.platform == "darwin"` and nothing else (no environment variable); on Linux
 and Windows they keep pytorch3d's renderer and this file is never imported. It
-imports `torch` and `numpy` at load time and `embreex` on first use, and
-`embreex` is not a dependency of the package: the macOS install recipe
-provides it.
+imports `torch` and `numpy` at load time; the rasterization is `gl_raster`'s
+(OpenGL on the GPU, PyTorch alone when no OpenGL context can be made).
 
 What is reproduced, each part measured against pytorch3d 0.7.9 on CUDA (518 ALI
 views and 7 AREG views of the public `T1_01_U_segmented.vtk`: RGB within 1e-3
@@ -24,8 +23,8 @@ hit a neighbouring face):
   +Y up, pixel (row r, column c) sampled at its centre
   `x = 1 - (2c + 1) / S`, `y = 1 - (2r + 1) / S`;
 * the near-plane cut: pytorch3d clips the geometry at `z_view = znear / 2`, so
-  the rays start ON that plane (without it 45 % of the pixels of a close view
-  differ, with it 99.999 % agree);
+  nothing closer than that plane is seen (without it 45 % of the pixels of a
+  close view differ, with it 99.999 % agree);
 * one face per pixel, `pix_to_face = -1` and `zbuf = -1` where nothing is hit,
   back faces not culled, barycentrics `(1 - u - v, u, v)`;
 * `Meshes` reduced to one mesh: vertex normals are the sum of the unnormalized
@@ -55,25 +54,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-_INSTALL_HINT = (
-    "The macOS renderer needs the `embreex` package, which the macOS install "
-    "recipe provides: `uv pip install embreex` in this tool's environment. It "
-    "is not a dependency of the Linux deployments, which render with pytorch3d."
-)
-
-
 class ToolUnavailableError(RuntimeError):
     """The server maps this class by NAME to a 503 (see runner.CALLER_FACING_ERRORS)."""
-
-
-def require_embree():
-    """The two embreex classes, or a ToolUnavailableError saying how to install it."""
-    try:
-        from embreex import rtcore_scene
-        from embreex.mesh_construction import TriangleMesh
-    except ImportError as exc:
-        raise ToolUnavailableError(f"{_INSTALL_HINT} (missing: {exc.name or 'embreex'})") from exc
-    return rtcore_scene, TriangleMesh
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +102,7 @@ def pose(eye, at=(0.0, 0.0, 0.0), up=(0.0, 1.0, 0.0)):
 class Mesh:
     """One triangle mesh: `verts` (V, 3), `faces` (F, 3) int64, `colors` (V, 3).
 
-    Everything lives on `device`; the Embree scene is built on first use and
-    kept, so the second view of a mesh costs no BVH build.
+    Everything lives on `device`.
     """
 
     def __init__(self, verts, faces, colors, device=None):
@@ -139,7 +120,6 @@ class Mesh:
         if self.f.numel() and (int(self.f.min()) < 0 or int(self.f.max()) >= len(self.v)):
             raise ValueError("a face names a vertex that does not exist")
         self.device = self.v.device
-        self._scene = None
         self._normals = None
 
     def to(self, device):
@@ -161,18 +141,6 @@ class Mesh:
             self._normals = F.normalize(total, eps=1e-6, dim=1)
         return self._normals
 
-    @property
-    def scene(self):
-        if self._scene is None:
-            rtcore_scene, triangle_mesh = require_embree()
-            self._scene = rtcore_scene.EmbreeScene()
-            triangle_mesh(
-                scene=self._scene,
-                vertices=np.ascontiguousarray(self.v.cpu().numpy(), np.float32),
-                indices=np.ascontiguousarray(self.f.cpu().numpy(), np.int32),
-            )
-        return self._scene
-
 
 class TexturesVertex:
     """What `pytorch3d.renderer.TexturesVertex` is here: a (1, V, 3) colour table."""
@@ -192,54 +160,17 @@ def Meshes(verts, faces, textures):  # noqa: N802 - the name callers already use
 # Rasterization
 # ---------------------------------------------------------------------------
 
-_DIRECTIONS = {}
-
-
-def _view_directions(fov, size):
-    """Ray directions in view space with z = 1, one per pixel, row-major."""
-    key = (float(fov), int(size))
-    if key not in _DIRECTIONS:
-        centres = 1 - (2 * np.arange(size) + 1) / size
-        x, y = np.meshgrid(centres, centres)
-        scale = np.tan(np.deg2rad(fov) / 2)
-        _DIRECTIONS[key] = np.stack([x * scale, y * scale, np.ones_like(x)], -1).reshape(-1, 3)
-    return _DIRECTIONS[key]
-
-
 def rasterize(mesh, R, T, fov, znear, size):
     """`(pix_to_face (S, S) int64, zbuf (S, S), bary (S, S, 3))`, -1 where empty.
 
-    `R` (3, 3) and `T` (3,) are the pose. Rays start on the plane
-    `z_view = znear / 2`, where pytorch3d cuts the geometry, so Embree's `tfar`
-    plus `znear / 2` is the view-space depth, which is pytorch3d's `zbuf`.
+    `R` (3, 3) and `T` (3,) are the pose. pytorch3d cuts the geometry at
+    `z_view = znear / 2`, and `zbuf` is the view-space depth, which is
+    pytorch3d's `zbuf`. The work is `gl_raster.rasterize`'s.
     """
-    size = int(size)
-    device = mesh.device
-    # `.cpu()` BEFORE `.double()`: MPS has no float64, so the cast must happen
-    # on the host, where the ray maths wants double precision anyway.
-    rotation = R.detach().cpu().double().numpy()
-    translation = T.detach().cpu().double().numpy()
-    directions = _view_directions(fov, size) @ rotation.T
-    origins = -translation @ rotation.T + (znear / 2) * directions
+    from . import gl_raster
 
-    if len(mesh.f) == 0:
-        miss = torch.full((size, size), -1, dtype=torch.int64, device=device)
-        return miss, miss.to(torch.float32), torch.zeros(size, size, 3, device=device)
-
-    hits = mesh.scene.run(
-        np.ascontiguousarray(origins, np.float32),
-        np.ascontiguousarray(directions, np.float32),
-        output=1,
-    )
-    face = np.asarray(hits["primID"]).astype(np.int64)
-    hit = (face >= 0) & (np.asarray(hits["geomID"]) >= 0)
-    u, v = np.asarray(hits["u"]), np.asarray(hits["v"])
-    depth = np.where(hit, np.asarray(hits["tfar"]) + znear / 2, -1.0).astype(np.float32)
-
-    pix_to_face = torch.from_numpy(np.where(hit, face, -1)).to(device).reshape(size, size)
-    zbuf = torch.from_numpy(depth).to(device).reshape(size, size)
-    bary = torch.from_numpy(np.stack([1 - u - v, u, v], -1).astype(np.float32)).to(device)
-    return pix_to_face, zbuf, bary.reshape(size, size, 3)
+    scale = 1.0 / np.tan(np.deg2rad(fov) / 2)
+    return gl_raster.rasterize(mesh.v, mesh.f, R, T, (scale, scale, 0.0, 0.0), znear / 2, size)
 
 
 def interpolate(mesh, attribute, pix_to_face, bary):
@@ -326,6 +257,5 @@ class Renderer:
 
 
 def namespace():
-    """The three names the engines take from pytorch3d, here, after checking Embree."""
-    require_embree()
+    """The three names the engines take from pytorch3d, here."""
     return {"Meshes": Meshes, "TexturesVertex": TexturesVertex, "look_at_rotation": look_at_rotation}

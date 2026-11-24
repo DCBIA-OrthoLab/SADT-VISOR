@@ -208,10 +208,10 @@ def load_network(checkpoint: str, network_name: str, device: str,
         )
     check_backbone_is_staged()
     allow_checkpoint_globals()
-    from . import embree_raster
+    from . import gl_raster
 
-    if embree_raster.wanted(device):
-        use_embree_and_cdist(saxi_nets_lightning)
+    if gl_raster.wanted(device):
+        use_gl_and_cdist(saxi_nets_lightning)
     # Said before the call: a failed load's own message is a long Lightning or
     # pickle traceback whose useful part is its last line, and the operator
     # needs to know what was being attempted to read it.
@@ -238,15 +238,15 @@ def last_line(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {lines[-1] if lines else ''}".rstrip(": ")
 
 
-def use_embree_and_cdist(saxi_nets_lightning) -> None:
+def use_gl_and_cdist(saxi_nets_lightning) -> None:
     """Swap the three pytorch3d pieces that have no Metal kernel, in this process.
 
-    Only reached on macOS (`embree_raster.wanted`). shapeaxi looks these
+    Only reached on macOS (`gl_raster.wanted`). shapeaxi looks these
     names up in its own module namespaces at call time, so rebinding them is
     enough and shapeaxi's files are untouched:
 
     * `MeshRasterizer`, which `SaxiMHAFBClassification` and `...Regression` use
-      to build their renderer: the Embree subclass.
+      to build their renderer: the OpenGL subclass.
     * `sample_points_from_meshes`, a compiled op that refuses any tensor not on
       the CPU: run on the CPU (7 ms for a scan), results moved back.
     * `knn_points` in `MHA_KNN` (256 channels, which the compiled kernel
@@ -261,15 +261,15 @@ def use_embree_and_cdist(saxi_nets_lightning) -> None:
 
     from shapeaxi import saxi_layers
 
-    from . import embree_raster
+    from . import gl_raster
 
-    saxi_nets_lightning.MeshRasterizer = embree_raster.rasterizer_class()
+    saxi_nets_lightning.MeshRasterizer = gl_raster.rasterizer_class()
     if not hasattr(saxi_nets_lightning.sample_points_from_meshes, "_sadt_wrapped"):
         saxi_nets_lightning.sample_points_from_meshes = _on_cpu(
             saxi_nets_lightning.sample_points_from_meshes
         )
         saxi_layers.knn_points = _knn_by_cdist(saxi_layers.knn_points)
-    logger.info("Rasterizing with Embree, knn with cdist, sampling on the CPU")
+    logger.info("Rasterizing with OpenGL, knn with cdist, sampling on the CPU")
 
 
 def _to(value, device):

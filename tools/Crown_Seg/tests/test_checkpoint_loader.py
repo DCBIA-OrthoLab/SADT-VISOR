@@ -78,4 +78,4 @@ def test_the_installer_is_only_called_inside_the_darwin_block():
 
     body = inspect.getsource(pipeline._run_shapeaxi)
     before_call = body.split("_install_checkpoint_loader()")[0]
-    assert "if embree_raster.wanted(device):" in before_call
+    assert "if gl_raster.wanted(device):" in before_call

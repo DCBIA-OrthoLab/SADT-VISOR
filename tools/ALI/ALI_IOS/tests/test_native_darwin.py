@@ -1,14 +1,14 @@
 """On macOS, ALI_IOS renders without importing pytorch3d, and only there.
 
-The platform is simulated the way `test_embree_raster.py` does it, by setting
+The platform is simulated the way `test_gl_raster.py` does it, by setting
 `sys.platform`. pytorch3d is not merely absent from the checks: `sys.modules`
 holds `None` under its name while the tests run, so ANY attempt to import it
 raises, and the tests then assert that nothing named `pytorch3d` was loaded.
 The fresh-interpreter test at the end is the same claim with nothing else
 imported before it.
 
-The renderer needs `embreex` (not a dependency of the Linux deployments), so
-the tests that render skip without it.
+The rasterization is `gl_raster`'s: OpenGL where a context can be made, the
+PyTorch fallback elsewhere, so these tests run on any machine with torch.
 """
 
 import subprocess
@@ -20,7 +20,6 @@ import torch
 
 from sadt_ali_ios import render, render_native
 
-pytest.importorskip("embreex")
 
 
 def bumpy(device="cpu"):
@@ -63,23 +62,6 @@ def test_the_engine_dependency_check_passes_without_pytorch3d(darwin):
     from sadt_ali_ios import engine
 
     engine.check_dependencies()
-
-
-def test_a_missing_embreex_is_reported_by_the_dependency_check(darwin, monkeypatch):
-    import builtins
-
-    real_import = builtins.__import__
-
-    def refuse(name, *args, **kwargs):
-        if name.startswith("embreex"):
-            raise ImportError("no embreex", name="embreex")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", refuse)
-    with pytest.raises(render_native.ToolUnavailableError, match="embreex"):
-        render.import_pytorch3d()
-    with pytest.raises(render_native.ToolUnavailableError, match="embreex"):
-        render.build_renderer("cpu")
 
 
 def test_the_trained_rasterisation_settings_are_the_only_ones_offered(darwin):

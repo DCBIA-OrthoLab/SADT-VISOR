@@ -85,8 +85,7 @@ FACES_PER_PIXEL = 1
 def import_pytorch3d():
     if sys.platform == "darwin":
         # macOS: no pytorch3d at all. `render_native` provides the three names
-        # the engine takes from it (Meshes, TexturesVertex, look_at_rotation)
-        # and checks that Embree is installed.
+        # the engine takes from it (Meshes, TexturesVertex, look_at_rotation).
         from . import render_native
 
         return render_native.namespace()
@@ -143,7 +142,6 @@ def build_renderer(device, image_size: int = IMAGE_SIZE, blur_radius: float = BL
 
         if blur_radius != 0 or faces_per_pixel != 1:
             raise ValueError("the macOS renderer rasterizes one face per pixel, without blur")
-        render_native.require_embree()
         return render_native.Renderer(
             render_native.PointLights(), fov=90, znear=0.01, size=image_size, zfar=10,
             background=(0.0, 0.0, 0.0),
@@ -156,12 +154,12 @@ def build_renderer(device, image_size: int = IMAGE_SIZE, blur_radius: float = BL
         image_size=image_size, blur_radius=blur_radius, faces_per_pixel=faces_per_pixel
     )
     rasterizer = p3d["MeshRasterizer"](cameras=cameras, raster_settings=raster_settings)
-    from . import embree_raster
+    from . import gl_raster
 
-    if embree_raster.wanted(device):
+    if gl_raster.wanted(device):
         # macOS / MPS: pytorch3d has no Metal rasterizer. Same cameras and settings,
-        # fragments from Embree; the shader below is pytorch3d's, unchanged.
-        rasterizer = embree_raster.rasterizer_class()(
+        # fragments from OpenGL; the shader below is pytorch3d's, unchanged.
+        rasterizer = gl_raster.rasterizer_class()(
             cameras=cameras, raster_settings=raster_settings
         )
     shader = p3d["HardPhongShader"](

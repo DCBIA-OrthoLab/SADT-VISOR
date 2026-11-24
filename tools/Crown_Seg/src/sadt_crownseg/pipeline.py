@@ -337,17 +337,17 @@ def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: s
     """
     dental_model_seg = _import_dental_model_seg()
 
-    from . import embree_raster
+    from . import gl_raster
 
-    if embree_raster.wanted(device):
+    if gl_raster.wanted(device):
         # macOS / MPS: pytorch3d has no Metal rasterizer. DentalModelSeg builds
         # its renderer from the module-level `MeshRasterizer` name, so pointing
-        # that name at the Embree subclass is enough; `render` and the shader
+        # that name at the OpenGL subclass is enough; `render` and the shader
         # are shapeaxi's, unchanged. Only this process is affected.
         from shapeaxi import saxi_nets_lightning
 
-        saxi_nets_lightning.MeshRasterizer = embree_raster.rasterizer_class()
-        logger.info("Rasterizing with Embree instead of pytorch3d (device=%s)", device)
+        saxi_nets_lightning.MeshRasterizer = gl_raster.rasterizer_class()
+        logger.info("Rasterizing with OpenGL instead of pytorch3d (device=%s)", device)
 
         # shapeaxi 2.0.2 reads the checkpoint with `torch.load(path)` and no
         # `map_location` (saxi_nets_lightning.py, `dental_model_seg_args`). The

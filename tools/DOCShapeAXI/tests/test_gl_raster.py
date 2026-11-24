@@ -1,11 +1,12 @@
-"""The Embree rasterizer against pytorch3d's own, on a synthetic mesh.
+"""The OpenGL rasterizer against pytorch3d's own, on a synthetic mesh.
 
-The reference is pytorch3d on the CPU, which every Linux build has. The test
-skips when `embreex` is absent (it is not a dependency of the Linux
-deployments) or when pytorch3d is not importable, so a CI run without them is
+The reference is pytorch3d on the CPU, which every Linux build has. Each check
+runs twice: through OpenGL, which skips where no OpenGL context can be made
+(no `moderngl`, which is a macOS-only dependency, or no GPU), and through the
+PyTorch fallback, which runs wherever torch does. A run without pytorch3d is
 green and reports a skip rather than a failure.
 
-`embree_raster.py` is a byte-identical copy in ALI_IOS, AREG_IOS, Crown_Seg and
+`gl_raster.py` is a byte-identical copy in ALI_IOS, AREG_IOS, Crown_Seg and
 DOCShapeAXI (the tools share no package); so is this file, apart from the
 import below. Change one, change all four.
 """
@@ -14,7 +15,7 @@ import sys
 
 import numpy as np
 import pytest
-from sadt_areg_ios import embree_raster
+from sadt_docshapeaxi import gl_raster
 
 # ---------------------------------------------------------------------------
 # The switch: nothing changes unless it is asked for
@@ -24,31 +25,30 @@ from sadt_areg_ios import embree_raster
 @pytest.mark.parametrize("device", ["cpu", "cuda", "cuda:0", "mps", None])
 def test_off_macos_the_default_is_pytorch3d_whatever_the_device(platform, device, monkeypatch):
     monkeypatch.setattr(sys, "platform", platform)
-    assert embree_raster.wanted(device) is False
-    assert embree_raster.wanted() is False
+    assert gl_raster.wanted(device) is False
+    assert gl_raster.wanted() is False
 
 
 @pytest.mark.parametrize("device", ["cpu", "mps", None])
-def test_on_macos_embree_is_used_whatever_the_device(device, monkeypatch):
+def test_on_macos_opengl_is_used_whatever_the_device(device, monkeypatch):
     """Crown_Seg and AREG_IOS never name `mps`: the platform decides."""
     monkeypatch.setattr(sys, "platform", "darwin")
-    assert embree_raster.wanted(device) is True
-    assert embree_raster.wanted() is True
+    assert gl_raster.wanted(device) is True
+    assert gl_raster.wanted() is True
 
 
-def test_a_missing_embreex_says_how_to_install_it(monkeypatch):
-    import builtins
-
-    real_import = builtins.__import__
-
-    def refuse(name, *args, **kwargs):
-        if name.startswith("embreex"):
-            raise ImportError("no embreex", name="embreex")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", refuse)
-    with pytest.raises(embree_raster.ToolUnavailableError, match="uv pip install embreex"):
-        embree_raster._embreex()
+def test_without_opengl_the_same_faces_come_from_pytorch(monkeypatch):
+    """No GPU, no OpenGL, a future macOS without it: an answer, not an error."""
+    torch = pytest.importorskip("torch")
+    if gl_raster._gl() is None:
+        pytest.skip("no OpenGL context here to compare the fallback with")
+    verts, faces = icosphere(subdivisions=3)
+    verts, faces = torch.tensor(verts), torch.tensor(faces)
+    rotation, translation = torch.eye(3), torch.tensor([0.0, 0.0, 3.0])
+    with_gl = gl_raster.rasterize(verts, faces, rotation, translation, (1.7, 1.7, 0.0, 0.0), 0.5, 64)
+    monkeypatch.setattr(gl_raster, "_gl", lambda: None)
+    without = gl_raster.rasterize(verts, faces, rotation, translation, (1.7, 1.7, 0.0, 0.0), 0.5, 64)
+    assert float((with_gl[0] == without[0]).float().mean()) > 0.995
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +82,18 @@ def icosphere(subdivisions=4, seed=0, amplitude=0.2):
     return verts.astype(np.float32), faces.astype(np.int64)
 
 
-@pytest.fixture(scope="module")
-def parity():
-    pytest.importorskip("embreex")
+@pytest.fixture(scope="module", params=["opengl", "pytorch"])
+def parity(request):
     torch = pytest.importorskip("torch")
     renderer = pytest.importorskip("pytorch3d.renderer")
     structures = pytest.importorskip("pytorch3d.structures")
+    patch = pytest.MonkeyPatch()
+    if request.param == "opengl":
+        if gl_raster._gl() is None:
+            pytest.skip("no OpenGL context here (moderngl is a macOS dependency)")
+    else:
+        patch.setattr(gl_raster, "_gl", lambda: None)
+    request.addfinalizer(patch.undo)
 
     verts, faces = icosphere()
     size = 96
@@ -95,7 +101,7 @@ def parity():
     settings = renderer.RasterizationSettings(image_size=size, blur_radius=0, faces_per_pixel=1,
                                               perspective_correct=True)
     reference = renderer.MeshRasterizer(cameras=cameras, raster_settings=settings)
-    embree = embree_raster.rasterizer_class()(cameras=cameras, raster_settings=settings)
+    candidate = gl_raster.rasterizer_class()(cameras=cameras, raster_settings=settings)
     mesh = structures.Meshes(verts=[torch.tensor(verts)], faces=[torch.tensor(faces)])
 
     torch.manual_seed(0)
@@ -108,7 +114,7 @@ def parity():
             rotation = renderer.look_at_rotation(position)
             translation = -torch.bmm(rotation.transpose(1, 2), position[:, :, None])[:, :, 0]
             pairs.append((reference(mesh, R=rotation, T=translation),
-                          embree(mesh, R=rotation, T=translation)))
+                          candidate(mesh, R=rotation, T=translation)))
     return pairs
 
 
@@ -119,27 +125,26 @@ def test_pix_to_face_is_the_same_nearly_everywhere(parity):
 
 
 def test_zbuf_and_barycentrics_agree_where_the_face_agrees(parity):
-    for reference, embree in parity:
-        both = (reference.pix_to_face == embree.pix_to_face) & (reference.pix_to_face >= 0)
-        assert float((reference.zbuf - embree.zbuf).abs()[both].max()) < 1e-4
-        bary = (reference.bary_coords - embree.bary_coords).abs()
+    for reference, candidate in parity:
+        both = (reference.pix_to_face == candidate.pix_to_face) & (reference.pix_to_face >= 0)
+        assert float((reference.zbuf - candidate.zbuf).abs()[both].max()) < 1e-4
+        bary = (reference.bary_coords - candidate.bary_coords).abs()
         assert float(bary[both.unsqueeze(-1).expand_as(bary)].max()) < 1e-3
 
 
 def test_a_miss_is_minus_one_everywhere(parity):
-    assert any(bool((embree.pix_to_face < 0).any()) for _, embree in parity)
-    for _, embree in parity:
-        miss = embree.pix_to_face < 0
-        assert bool((embree.zbuf[miss] == -1).all())
-        assert bool((embree.bary_coords[miss.unsqueeze(-1).expand_as(embree.bary_coords)] == -1).all())
+    assert any(bool((candidate.pix_to_face < 0).any()) for _, candidate in parity)
+    for _, candidate in parity:
+        miss = candidate.pix_to_face < 0
+        assert bool((candidate.zbuf[miss] == -1).all())
+        assert bool((candidate.bary_coords[miss.unsqueeze(-1).expand_as(candidate.bary_coords)] == -1).all())
 
 
 def test_unsupported_settings_are_refused_not_approximated():
     renderer = pytest.importorskip("pytorch3d.renderer")
-    pytest.importorskip("embreex")
     settings = renderer.RasterizationSettings(image_size=8, blur_radius=0.01, faces_per_pixel=3)
     with pytest.raises(NotImplementedError, match="blur_radius"):
-        embree_raster._check_settings(settings, True)
+        gl_raster._check_settings(settings, True)
 
 
 def test_the_mps_background_blend_matches_pytorch3d_on_the_cpu():
@@ -159,7 +164,7 @@ def test_the_mps_background_blend_matches_pytorch3d_on_the_cpu():
     params = blending.BlendParams(background_color=(0.0, 0.0, 0.0))
     expected = blending.hard_rgb_blend(colors, fragments, params)
 
-    replaced = embree_raster._hard_rgb_blend_for_mps(blending.hard_rgb_blend)
+    replaced = gl_raster._hard_rgb_blend_for_mps(blending.hard_rgb_blend)
     # On the CPU the wrapper defers to the original, which is what keeps every
     # other device on pytorch3d's own code.
     assert torch.equal(replaced(colors, fragments, params), expected)

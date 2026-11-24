@@ -3,8 +3,9 @@
 Four layers, from the one that needs nothing to the one that needs pytorch3d:
 
 * the camera maths and the shading, on analytic cases (`torch` only);
-* the rasterizer and the renderer on hand-built geometry (needs `embreex`,
-  which is not a dependency of the Linux deployments: those tests skip);
+* the rasterizer and the renderer on hand-built geometry, each test run twice:
+  through OpenGL (skipped where no OpenGL context can be made, `moderngl`
+  being a macOS dependency) and through the PyTorch fallback (runs anywhere);
 * parity with images pytorch3d produced ONCE and that are stored in
   `data/render_native_reference.npz`, so the test needs neither pytorch3d nor
   a GPU. They come from a synthetic bumpy sphere, so no patient data is stored;
@@ -26,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 
+from sadt_ali_ios import gl_raster
 from sadt_ali_ios import render_native as native
 
 DATA = Path(__file__).parent / "data" / "render_native_reference.npz"
@@ -206,7 +208,7 @@ def test_vertex_normals_are_unit_length_and_area_weighted():
 
 
 @pytest.mark.parametrize("bad", ["faces_out_of_range", "negative_face", "wrong_vertex_shape", "wrong_color_shape"])
-def test_a_malformed_mesh_is_refused_before_it_reaches_embree(bad):
+def test_a_malformed_mesh_is_refused_before_it_reaches_the_rasterizer(bad):
     verts, faces, colors = torch.zeros(4, 3), torch.tensor([[0, 1, 2]]), torch.zeros(4, 3)
     if bad == "faces_out_of_range":
         faces = torch.tensor([[0, 1, 9]])
@@ -300,32 +302,20 @@ def test_a_surface_facing_away_from_the_light_gets_ambient_light_only():
 
 
 # ---------------------------------------------------------------------------
-# Rasterization (needs embreex)
+# Rasterization (OpenGL where it exists, and the PyTorch fallback everywhere)
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def embree():
-    pytest.importorskip("embreex")
+@pytest.fixture(params=["opengl", "pytorch"])
+def engine(request, monkeypatch):
+    if request.param == "opengl":
+        if gl_raster._gl() is None:
+            pytest.skip("no OpenGL context here (moderngl is a macOS dependency)")
+    else:
+        monkeypatch.setattr(gl_raster, "_gl", lambda: None)
+    return request.param
 
 
-def test_a_missing_embreex_says_how_to_install_it(monkeypatch):
-    import builtins
-
-    real_import = builtins.__import__
-
-    def refuse(name, *args, **kwargs):
-        if name.startswith("embreex"):
-            raise ImportError("no embreex", name="embreex")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", refuse)
-    with pytest.raises(native.ToolUnavailableError, match="uv pip install embreex"):
-        native.require_embree()
-    with pytest.raises(native.ToolUnavailableError):
-        native.namespace()
-
-
-def test_a_quad_in_front_of_the_camera_fills_its_footprint_with_the_right_depth(embree):
+def test_a_quad_in_front_of_the_camera_fills_its_footprint_with_the_right_depth(engine):
     p2f, zbuf, bary = native.rasterize(quad(2.0), *IDENTITY, fov=90.0, znear=0.01, size=64)
     # fov 90 at depth 2 sees x, y in [-2, 2]: a half-size-1 quad covers the central half.
     assert int(p2f[32, 32]) >= 0
@@ -366,7 +356,7 @@ class _MpsLike(torch.Tensor):
         return torch.Tensor.cpu(self.as_subclass(torch.Tensor))
 
 
-def test_the_pose_is_cast_to_float64_on_the_cpu_never_on_the_device(embree):
+def test_the_pose_is_cast_to_float64_on_the_cpu_never_on_the_device(engine):
     """`device=mps` answered 500 on a real Mac: the pose went through `.double()`
     while still on MPS. Here the pose is an `_MpsLike` tensor, which raises
     exactly there; and the image must be the one the plain CPU pose gives."""
@@ -380,7 +370,7 @@ def test_the_pose_is_cast_to_float64_on_the_cpu_never_on_the_device(embree):
         assert torch.equal(a, b)
 
 
-def test_plus_x_in_view_space_is_on_the_left_of_the_image(embree):
+def test_plus_x_in_view_space_is_on_the_left_of_the_image(engine):
     """pytorch3d's convention: a quad on the camera's +x side lands on the LEFT columns."""
     verts = np.array([[0.2, -0.5, 2], [1.0, -0.5, 2], [1.0, 0.5, 2], [0.2, 0.5, 2]], np.float32)
     mesh = native.Mesh(verts, np.array([[0, 1, 2], [0, 2, 3]]), np.zeros((4, 3), np.float32))
@@ -389,7 +379,7 @@ def test_plus_x_in_view_space_is_on_the_left_of_the_image(embree):
     assert int(columns.max()) < 16
 
 
-def test_geometry_between_the_camera_and_the_half_near_plane_is_cut(embree):
+def test_geometry_between_the_camera_and_the_half_near_plane_is_cut(engine):
     """pytorch3d clips at z = znear / 2: with znear 1 a quad at 0.4 is gone and one at 0.6 is seen."""
     cut = native.rasterize(quad(0.4, half=5.0), *IDENTITY, fov=60.0, znear=1.0, size=16)
     seen = native.rasterize(quad(0.6, half=5.0), *IDENTITY, fov=60.0, znear=1.0, size=16)
@@ -398,7 +388,7 @@ def test_geometry_between_the_camera_and_the_half_near_plane_is_cut(embree):
     assert float(seen[1][8, 8]) == pytest.approx(0.6, abs=1e-5)
 
 
-def test_faces_are_not_culled_so_a_back_face_is_hit(embree):
+def test_faces_are_not_culled_so_a_back_face_is_hit(engine):
     mesh = quad(2.0)
     flipped = native.Mesh(mesh.v, mesh.f[:, [0, 2, 1]], mesh.c)
     for candidate in (mesh, flipped):
@@ -406,20 +396,20 @@ def test_faces_are_not_culled_so_a_back_face_is_hit(embree):
         assert int(p2f[8, 8]) >= 0
 
 
-def test_a_mesh_with_no_faces_renders_as_background_only(embree):
+def test_a_mesh_with_no_faces_renders_as_background_only(engine):
     mesh = native.Mesh(torch.zeros(3, 3), torch.zeros(0, 3, dtype=torch.int64), torch.zeros(3, 3))
     rgb, zbuf, p2f = native.render(mesh, *IDENTITY, native.AmbientLights(), 60.0, 1.0, 8, (0.25, 0.5, 0.75))
     assert bool((p2f == -1).all()) and bool((zbuf == -1).all())
     assert torch.allclose(rgb, torch.tensor([0.25, 0.5, 0.75]).expand(8, 8, 3))
 
 
-def test_a_camera_looking_away_from_the_mesh_sees_only_the_background(embree):
+def test_a_camera_looking_away_from_the_mesh_sees_only_the_background(engine):
     R, T = native.pose((0.0, 0.0, -3.0), at=(0.0, 0.0, -9.0))
     rgb, _, p2f = native.render(quad(2.0), R, T, native.PointLights(), 60.0, 1.0, 8, (0.0, 0.0, 0.0))
     assert bool((p2f == -1).all()) and float(rgb.abs().max()) == 0.0
 
 
-def test_a_camera_on_the_target_does_not_crash_the_renderer(embree):
+def test_a_camera_on_the_target_does_not_crash_the_renderer(engine):
     """eye == at has no viewing direction; pytorch3d returns a degenerate rotation
     too. What is pinned: no exception, finite output, a fixed-size image."""
     R, T = native.pose((0.0, 0.0, 2.0), at=(0.0, 0.0, 2.0))
@@ -428,7 +418,7 @@ def test_a_camera_on_the_target_does_not_crash_the_renderer(embree):
     assert p2f.shape == (8, 8)
 
 
-def test_the_renderer_returns_rgba_and_fragments_shaped_like_pytorch3d(embree):
+def test_the_renderer_returns_rgba_and_fragments_shaped_like_pytorch3d(engine):
     renderer = native.Renderer(native.AmbientLights(), fov=90, znear=0.01, size=32, background=(1.0, 1.0, 1.0))
     R, T = native.pose((0.0, 0.0, 0.0), at=(0.0, 0.0, 1.0))
     rgba, fragments = renderer(meshes_world=quad(2.0), R=R[None], T=T[None])
@@ -441,13 +431,15 @@ def test_the_renderer_returns_rgba_and_fragments_shaped_like_pytorch3d(embree):
     assert renderer.to("cpu") is renderer
 
 
-def test_the_scene_is_built_once_per_mesh(embree):
+def test_the_geometry_is_uploaded_once_per_mesh(engine):
+    if engine != "opengl":
+        pytest.skip("only OpenGL keeps geometry between views")
     mesh = bumpy_mesh()
-    first = mesh.scene
     render_view(mesh, "ali_outside")
+    first = gl_raster._gl()["mesh"][2]
     render_view(mesh, "areg_inside_0")
-    assert mesh.scene is first
-    assert mesh.clone().scene is first
+    render_view(mesh.clone(), "ali_outside")
+    assert gl_raster._gl()["mesh"][2] is first
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +480,7 @@ def compare(got, name, reference):
 
 
 @pytest.mark.parametrize("name", sorted(VIEWS))
-def test_the_images_match_pytorch3d_to_the_edge_pixels(embree, name):
+def test_the_images_match_pytorch3d_to_the_edge_pixels(engine, name):
     reference = load_reference()
     got = render_view(bumpy_mesh(), name)
     scores = compare(got, name, reference)

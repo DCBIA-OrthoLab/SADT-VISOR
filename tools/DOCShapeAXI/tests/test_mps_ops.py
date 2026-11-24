@@ -1,6 +1,6 @@
 """The two pytorch3d ops replaced on macOS / MPS, checked on the CPU against the originals.
 
-`use_embree_and_cdist` is only reached when `embree_raster.wanted(device)`; these
+`use_gl_and_cdist` is only reached when `gl_raster.wanted(device)`; these
 tests call the replacements directly, with CPU tensors, so they run anywhere
 pytorch3d imports.
 """
@@ -49,5 +49,5 @@ def test_a_module_that_is_not_shapeaxis_renderer_is_left_alone():
     import types
 
     stub = types.ModuleType("shapeaxi.saxi_nets_lightning")
-    pipeline.use_embree_and_cdist(stub)
+    pipeline.use_gl_and_cdist(stub)
     assert not hasattr(stub, "MeshRasterizer")

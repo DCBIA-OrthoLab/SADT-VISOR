@@ -1,13 +1,13 @@
 """On macOS, AREG_IOS's patch network renders without importing pytorch3d, and only there.
 
-The platform is simulated the way `test_embree_raster.py` does it, by setting
+The platform is simulated the way `test_gl_raster.py` does it, by setting
 `sys.platform`; `sys.modules` holds `None` under `pytorch3d` while the tests run,
 so ANY attempt to import it raises, and each test then asserts nothing named
 `pytorch3d` was loaded. The fresh-interpreter test is the same claim with
 nothing else imported first.
 
-The renderer needs `embreex` (not a dependency of the Linux deployments), so
-this file skips without it.
+The rasterization is `gl_raster`'s: OpenGL where a context can be made, the
+PyTorch fallback elsewhere, so these tests run on any machine with torch.
 """
 
 import subprocess
@@ -19,7 +19,6 @@ import torch
 
 from sadt_areg_ios import net, render_native
 
-pytest.importorskip("embreex")
 pytest.importorskip("monai")
 
 
@@ -55,23 +54,6 @@ def darwin(monkeypatch):
 def test_the_dependency_check_passes_without_pytorch3d(darwin):
     net.check_dependencies()
     assert set(net._import_pytorch3d()) == {"Meshes", "TexturesVertex", "look_at_rotation"}
-
-
-def test_a_missing_embreex_is_reported_by_the_dependency_check(darwin, monkeypatch):
-    import builtins
-
-    real_import = builtins.__import__
-
-    def refuse(name, *args, **kwargs):
-        if name.startswith("embreex"):
-            raise ImportError("no embreex", name="embreex")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", refuse)
-    with pytest.raises(render_native.ToolUnavailableError, match="embreex"):
-        net.check_dependencies()
-    with pytest.raises(render_native.ToolUnavailableError, match="embreex"):
-        net.build("cpu")
 
 
 def test_the_native_network_has_the_parameters_the_checkpoint_holds(darwin):

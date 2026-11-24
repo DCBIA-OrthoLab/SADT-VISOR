@@ -163,12 +163,12 @@ def build(device: str):
                     cameras=p3d["FoVPerspectiveCameras"](), lights=p3d["AmbientLights"]()
                 ),
             )
-            from . import embree_raster
+            from . import gl_raster
 
-            if embree_raster.wanted(device):
+            if gl_raster.wanted(device):
                 # macOS / MPS: pytorch3d has no Metal rasterizer. Same cameras and
-                # settings, fragments from Embree; the shader stays pytorch3d's.
-                self.renderer.rasterizer = embree_raster.rasterizer_class()(
+                # settings, fragments from OpenGL; the shader stays pytorch3d's.
+                self.renderer.rasterizer = gl_raster.rasterizer_class()(
                     cameras=self.renderer.rasterizer.cameras,
                     raster_settings=self.renderer.rasterizer.raster_settings,
                 )
@@ -217,8 +217,6 @@ def _build_native(device: str, torch, monai):
     which only stays harmless because `AmbientLights` has no specular term).
     """
     from . import render_native as native
-
-    native.require_embree()
 
     class TimeDistributed(torch.nn.Module):
         """Apply a 2D module to a (batch, views, ...) tensor."""
