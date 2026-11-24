@@ -55,11 +55,14 @@ jobs:
             echo "tools=(first release)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # What a server runs: documentation and tests change nothing in it.
+          # What a server runs, and what a desktop client takes from a release:
+          # documentation and tests change nothing in either. run_tool.py is
+          # the client's half (its supervisor and SUPERVISOR_API), so a change
+          # to it is released even when no tool changed.
           # The data manifest and its engine count too: the server's update
           # agent reads them from this image, so a manifest change released
           # without an image never reached a deployment.
-          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py scripts/data-manifest.yml scripts/fetch_data.py docker/tools.Dockerfile .dockerignore \
+          changed=$(git diff --name-only "$previous" HEAD -- tools naming testkit scripts/describe.py scripts/run_tool.py scripts/data-manifest.yml scripts/fetch_data.py docker/tools.Dockerfile .dockerignore \
                     | grep -vE '(\.md$|(^|/)tests/)' || true)
           if [ -z "$changed" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
