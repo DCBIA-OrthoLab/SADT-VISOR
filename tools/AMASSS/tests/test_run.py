@@ -688,6 +688,20 @@ def test_gpu_resampling_redirects_both_ends_and_drops_the_memoized_value():
     assert manager.resampling_fn_data == "resample_torch_fornnunet"
 
 
+def test_gpu_resampling_runs_on_metal_too():
+    """On a Mac the GPU is mps: the same swap, onto that device."""
+    predictor = _fake_predictor()
+    assert nnunet_runner._enable_gpu_resampling(predictor, "mps") is True
+    kwargs = predictor.configuration_manager.configuration["resampling_fn_data_kwargs"]
+    assert str(kwargs["device"]) == "mps"
+
+
+def test_only_cuda_and_mps_count_as_a_gpu():
+    assert nnunet_runner.on_gpu("cuda") and nnunet_runner.on_gpu("cuda:1")
+    assert nnunet_runner.on_gpu("mps")
+    assert not nnunet_runner.on_gpu("cpu")
+
+
 # ---------------------------------------------------------------------------
 # surfaces
 # ---------------------------------------------------------------------------
@@ -1413,6 +1427,12 @@ def test_without_a_supervisor_it_predicts_one_at_a_time():
     nothing has reserved anything, and opening five nnUNet predictors on an
     unknown card is a way to be killed rather than a way to be fast."""
     assert pipeline._channels_for(None, 5) == 1
+
+
+def test_metal_predicts_one_structure_at_a_time():
+    """Two structures in threads on mps abort the process inside Metal."""
+    assert pipeline._channels_for(_Supervisor(grant=5), 5, declared=5, device="mps") == 1
+    assert pipeline._channels_for(_Supervisor(grant=5), 5, device="cuda") == 5
 
 
 def test_a_supervisor_that_raises_costs_the_width_and_not_the_run():

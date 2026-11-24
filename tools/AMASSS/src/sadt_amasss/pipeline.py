@@ -376,7 +376,7 @@ class _InferenceProgress:
         return False
 
 
-def _channels_for(sup, wanted: int, declared: int = 0) -> int:
+def _channels_for(sup, wanted: int, declared: int = 0, device: str = "") -> int:
     """How many structures to predict at once: what the machine will pay for.
 
     The tool asks for its own count -- the structures it was told to produce --
@@ -402,6 +402,11 @@ def _channels_for(sup, wanted: int, declared: int = 0) -> int:
     nothing has reserved anything, and opening five nnUNet predictors on an
     unknown card is a way to be killed rather than a way to be fast.
     """
+    if device == "mps":
+        # Metal is not thread-safe: two structures predicted side by side on
+        # mps abort the whole process ("commit an already committed command
+        # buffer"), whatever the supervisor would grant.
+        return 1
     wanted = max(1, int(wanted))
     try:
         declared = int(declared or 0)
@@ -601,7 +606,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
     # each and would lose the model sharing that pool exists for.
     predictions = {}
     failed_structures = {}
-    width = _channels_for(sup, len(models), num_workers)
+    width = _channels_for(sup, len(models), num_workers, device=device)
     logger.info("Predicting %d structure(s) %d at a time on %s",
                 len(models), width, device)
 
@@ -735,7 +740,7 @@ def _run(scans, models, missing_structures, output_dir, work_dir, structures, me
         # alongside them. This records what was ASKED for: a model bundle whose
         # plans pin a non-default resampler opts itself out, and says so in the
         # log.
-        "gpu_resampling": bool(gpu_resampling) and device.startswith("cuda"),
+        "gpu_resampling": bool(gpu_resampling) and nnunet_runner.on_gpu(device),
         "tile_step_size": float(tile_step_size),
         "prediction_ID": prediction_ID,
         "merge_modes": list(merge),

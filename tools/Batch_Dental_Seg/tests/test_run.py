@@ -611,6 +611,13 @@ def test_the_swap_declines_on_cpu():
     assert manager.configuration["resampling_fn_data"] == "resample_data_or_seg_to_shape"
 
 
+def test_the_swap_runs_on_metal_too():
+    """On a Mac the GPU is mps: the same swap, onto that device."""
+    manager = _configuration_manager()
+    assert nnunet_runner._enable_gpu_resampling(_PredictorWithPlans(manager), "mps")
+    assert str(manager.configuration["resampling_fn_data_kwargs"]["device"]) == "mps"
+
+
 def test_a_bundle_pinning_its_own_resampler_is_left_alone():
     """A bundle asking for something other than nnUNet's default was configured
     that way deliberately, and its geometry is not ours to reinterpret."""

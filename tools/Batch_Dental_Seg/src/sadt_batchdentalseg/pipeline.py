@@ -527,7 +527,7 @@ def segment(
         # spline order 1 rather than 3, so a result produced this way is not
         # bit-identical to one produced with it off. Whoever reads a
         # segmentation must be able to see which pipeline made it.
-        "gpu_resampling": bool(gpu_resampling) and device.startswith("cuda"),
+        "gpu_resampling": bool(gpu_resampling) and nnunet_runner.on_gpu(device),
         "tile_step_size": float(tile_step_size),
         # Both recorded for the same reason the resampling is: a mesh is a
         # lossy view of the mask it came from, and whoever opens one has to be
