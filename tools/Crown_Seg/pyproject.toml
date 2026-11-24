@@ -13,7 +13,8 @@ dependencies = [
     # STRICTER: an unpinned torch is not reproducible, and the pytorch3d wheel
     # tag (`+pt2110cu128`) names one torch version and one CUDA variant
     # exactly. Bumping torch here means bumping that tag in the same commit.
-    "torch==2.11.0",
+    "torch==2.11.0 ; sys_platform != 'darwin'",
+    "torch==2.14.1 ; sys_platform == 'darwin'",
     "vtk==9.6.2",
     "numpy==2.3.2",
     # Not used directly: torch pulls it in. From 3.30 it installs a process-wide
@@ -48,7 +49,8 @@ segmentation = [
     "ocnn==2.2.1",
     "SimpleITK",
     "pytorch3d==0.7.9+pt2110cu128 ; sys_platform != 'darwin'",
-    # macOS rasterizes with OpenGL in place of pytorch3d (gl_raster.py).
+    "pytorch3d==0.7.9+pt2141cpu ; sys_platform == 'darwin'",
+    # macOS rasterizes with OpenGL rather than pytorch3d's CPU kernel (gl_raster.py).
     "moderngl==5.13.0 ; sys_platform == 'darwin'",
     # Transitive through shapeaxi, listed here for the SAME reason pytorch3d
     # is: sources apply to direct dependencies only. Left transitive it comes
@@ -57,7 +59,8 @@ segmentation = [
     # but the C extension links a different build, so importing it raises
     # `RuntimeError: operator torchvision::nms does not exist`. Measured, not
     # anticipated.
-    "torchvision==0.26.0",
+    "torchvision==0.26.0 ; sys_platform != 'darwin'",
+    "torchvision==0.29.1 ; sys_platform == 'darwin'",
 ]
 
 [dependency-groups]
@@ -90,9 +93,18 @@ url = "https://ImageMindAnalytics.github.io/pytorch3d-wheels/simple/"
 explicit = true
 
 # shapeaxi asks for pytorch3d too. An override replaces every requirement on
-# it, so with this marker macOS gets none: it rasterizes with OpenGL instead.
+# it, so each platform gets exactly its own build.
 [tool.uv]
-override-dependencies = ["pytorch3d==0.7.9+pt2110cu128 ; sys_platform != 'darwin'"]
+override-dependencies = [
+    "pytorch3d==0.7.9+pt2110cu128 ; sys_platform != 'darwin'",
+    "pytorch3d==0.7.9+pt2141cpu ; sys_platform == 'darwin'",
+    # shapeaxi 2.0.3 caps torch below 2.13, a cap set before 2.14 existed. On
+    # macOS the tool runs on 2.14.1 (measured: same segmentation as Linux on
+    # 98.3 % of the vertices, the run-to-run spread there being 99.3 %). The
+    # override replaces EVERY torch requirement, so Linux is restated here.
+    "torch==2.11.0 ; sys_platform != 'darwin'",
+    "torch==2.14.1 ; sys_platform == 'darwin'",
+]
 
 [tool.uv.sources]
 # Development only: lets this tool's tests run ANOTHER tool through that tool's
@@ -111,7 +123,14 @@ torchvision = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
 # pulls it transitively, because `tool.uv.sources` only applies to direct
 # dependencies -- left transitive, uv ignores this source and fails with
 # "no wheels with a matching Python version tag".
-pytorch3d = { index = "pytorch3d-wheels", marker = "sys_platform != 'darwin'" }
+# macOS: torch 2.14.1, the release the pytorch3d wheel below is built for. No
+# public index has a macOS pytorch3d for it, so SADT-VISOR hosts one (release
+# `wheels-pytorch3d-0.7.9-pt2141cpu-macos`); its kernels are CPU only, and the
+# tool runs the network on Metal and rasterizes with OpenGL (gl_raster.py).
+pytorch3d = [
+    { index = "pytorch3d-wheels", marker = "sys_platform != 'darwin'" },
+    { url = "https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/wheels-pytorch3d-0.7.9-pt2141cpu-macos/pytorch3d-0.7.9%2Bpt2141cpu-cp311-cp311-macosx_11_0_arm64.whl", marker = "sys_platform == 'darwin'" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

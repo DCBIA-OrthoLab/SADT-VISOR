@@ -76,7 +76,9 @@ EXTRA_PINS = {
 def test_the_base_dependencies_are_pinned_to_the_documented_version(package, pin):
     """A plain `uv sync` installs these, so the pin and the installed version
     are both checkable and both have to agree with the README."""
-    assert f"{package}=={pin}" in pyproject()["project"]["dependencies"]
+    # The pin, whatever platform marker follows it (macOS takes torch 2.14.1).
+    pins = [requirement.split(";")[0].strip() for requirement in pyproject()["project"]["dependencies"]]
+    assert f"{package}=={pin}" in pins
     assert version(package).split("+")[0] == pin
     assert f"{package} {pin}" in readme()
 
@@ -149,9 +151,22 @@ def test_both_wheel_indexes_are_pinned_sources_not_extra_index_urls(index):
 )
 def test_each_compiled_package_comes_from_the_index_it_was_built_for(package, index):
     """Off macOS, that is: the CUDA indexes have no macOS wheels, and the Mac
-    takes torch from PyPI and has no pytorch3d at all."""
-    assert pyproject()["tool"]["uv"]["sources"][package] == {
-        "index": index, "marker": "sys_platform != 'darwin'"}
+    takes torch from PyPI and pytorch3d from the wheel SADT-VISOR hosts."""
+    sources = pyproject()["tool"]["uv"]["sources"][package]
+    sources = sources if isinstance(sources, list) else [sources]
+    assert {"index": index, "marker": "sys_platform != 'darwin'"} in sources
+
+
+def test_the_mac_pytorch3d_is_the_hosted_build_for_its_torch():
+    """No public index has a macOS pytorch3d for torch 2.14.1: the one built for
+    it is a release asset of SADT-VISOR, and its tag names that torch."""
+    sources = pyproject()["tool"]["uv"]["sources"]["pytorch3d"]
+    mac = [source for source in sources if source.get("marker") == "sys_platform == 'darwin'"]
+    assert len(mac) == 1
+    assert mac[0]["url"].startswith("https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/")
+    assert "pt2141cpu" in mac[0]["url"]
+    pins = pyproject()["project"]["dependencies"]
+    assert "torch==2.14.1 ; sys_platform == 'darwin'" in pins
 
 
 def test_the_interpreter_is_the_one_pytorch3d_is_built_for_here():
