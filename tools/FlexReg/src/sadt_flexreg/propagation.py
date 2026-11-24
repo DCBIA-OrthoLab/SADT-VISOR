@@ -11,21 +11,25 @@ logger = logging.getLogger(__name__)
 
 
 @functools.lru_cache(maxsize=None)
-def require_cuda():
-    """Refuse, by name, to propagate a patch without a CUDA device.
+def gpu():
+    """The GPU the patch propagates on: a CUDA card, or Apple's Metal (mps).
 
-    Upstream calls `.cuda()` unconditionally below, and on a CPU-only server
+    Upstream calls `.to(gpu())` unconditionally, and on a server without a card
     that surfaced as torch's "Torch not compiled with CUDA enabled" or "No CUDA
     GPUs are available" from deep inside the dilation, read as a bug in the
-    tool. Checked once per process: the answer does not change between
+    tool. A Mac has a GPU too, through mps, and the dilation's tensor ops all
+    run there. Checked once per process: the answer does not change between
     surfaces, and every surface of a batch would otherwise fail the same way.
     """
-    if not torch.cuda.is_available():
-        raise ToolUnavailableError(
-            "the palate patch needs a CUDA GPU and torch sees none on this "
-            "server (torch {}, built for CUDA {})".format(
-                torch.__version__, torch.version.cuda or "none")
-        )
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    raise ToolUnavailableError(
+        "the palate patch needs a GPU (CUDA, or Metal on a Mac) and torch sees "
+        "none on this machine (torch {}, built for CUDA {})".format(
+            torch.__version__, torch.version.cuda or "none")
+    )
 
 
 def Difference(t1,t2):
@@ -38,7 +42,7 @@ def Difference(t1,t2):
 
 
 def Neighbours(arg_point,F):
-    neighbours = torch.tensor([]).cuda()
+    neighbours = torch.tensor([]).to(gpu())
     F2 = F.unsqueeze(0).expand(len(arg_point),-1,-1)
     arg_point = arg_point.unsqueeze(1).unsqueeze(2)
     arg = torch.argwhere((F2-arg_point) == 0)
@@ -67,16 +71,16 @@ def GetNeighbors(vtkdata, pids_tensor):
 
     # Rendre unique tous les indices de voisins
     unique_neighbors = np.unique(all_neighbor_pids).tolist()
-    return torch.tensor(unique_neighbors).cuda().to(torch.int64)
+    return torch.tensor(unique_neighbors).to(gpu()).to(torch.int64)
 
 
 
 
 def Dilation(arg_point,F,texture,surf):
-    require_cuda()
-    arg_point = torch.tensor([arg_point]).cuda().to(torch.int64)
-    F = F.cuda()
-    texture = texture.cuda()
+    gpu()
+    arg_point = torch.tensor([arg_point]).to(gpu()).to(torch.int64)
+    F = F.to(gpu())
+    texture = texture.to(gpu())
     neighbour = Neighbours(arg_point,F)
     arg_texture = torch.argwhere(texture == 1).squeeze()
     dif = neighbour.to(torch.int64)

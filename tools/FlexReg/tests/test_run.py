@@ -536,10 +536,25 @@ def test_no_cuda_device_is_a_deployment_fault(monkeypatch):
     from sadt_flexreg import propagation
     from sadt_flexreg.errors import ToolUnavailableError
 
-    propagation.require_cuda.cache_clear()
+    propagation.gpu.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     try:
-        with pytest.raises(ToolUnavailableError, match="CUDA GPU"):
+        with pytest.raises(ToolUnavailableError, match="needs a GPU"):
             propagation.Dilation(0, None, None, None)
     finally:
-        propagation.require_cuda.cache_clear()
+        propagation.gpu.cache_clear()
+
+
+def test_a_mac_propagates_on_metal(monkeypatch):
+    """No CUDA card but Metal present: the patch runs on mps, not refused."""
+    import torch
+    from sadt_flexreg import propagation
+
+    propagation.gpu.cache_clear()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    try:
+        assert propagation.gpu() == torch.device("mps")
+    finally:
+        propagation.gpu.cache_clear()
