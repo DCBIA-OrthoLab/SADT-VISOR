@@ -31,6 +31,21 @@ Stdlib only and Python 3.9 compatible, for the same reason `describe.py` is: it
 has to run inside whichever interpreter a tool pinned. The annotation vocabulary
 is imported FROM describe.py rather than restated, so the CLI can never offer an
 option the schema does not, or refuse one it does.
+
+It is also the supervisor a desktop client embeds -- the 3D Slicer extension
+runs tools through it on the clinician's machine -- so the same code chains
+tools on Linux, macOS and Windows, from a terminal or from a GUI:
+
+- `SADT_TOOLS_DIR` points it at a folder of tools other than this checkout's
+  `tools/` (a client's download cache), with the same layout;
+- `SADT_DATA_DIR` is the DATA root a tool finds its own models under, injected
+  as `data_root` exactly as the server injects it;
+- `start(tool, params, job_dir)` launches a run without blocking and returns a
+  `Job` to poll for progress, read the result from, or cancel -- the whole
+  chain of processes below it at once;
+- a failure is written to the result file as `{"kind": "error", "type": ...,
+  "message": ...}`, the callee's own type and message carried up every level
+  of a chain, so the caller can show the reason rather than "see the log".
 """
 
 import argparse
@@ -39,15 +54,39 @@ import os
 import shutil
 import subprocess
 import sys
+import signal
 import tempfile
 import threading
 import time
+import traceback
 import typing
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS.parent
-TOOLS_DIR = REPO_ROOT / "tools"
+
+# Where the tools live. A client that downloads them on demand keeps them in a
+# cache of its own and names it here; every nested call inherits the variable,
+# so a whole chain resolves its tools in the same place.
+TOOLS_DIR_VARIABLE = "SADT_TOOLS_DIR"
+TOOLS_DIR = (
+    Path(os.environ[TOOLS_DIR_VARIABLE]).resolve()
+    if os.environ.get(TOOLS_DIR_VARIABLE)
+    else REPO_ROOT / "tools"
+)
+
+# The DATA root: `<root>/<tool>/models/...`, the layout `scripts/fetch_data.py`
+# writes and the server reads. A tool that declares `data_root` is handed it, as
+# the server's runner does, to find ITS OWN models -- so a caller never names
+# its neighbour's. Unset, nothing is injected and such a tool asks for its model
+# by name.
+DATA_DIR_VARIABLE = "SADT_DATA_DIR"
+
+# The chain of tools already running above a call, comma-separated, and how
+# deep it may grow. The same variable and the same cap as the server's runner,
+# so a chain refused there is refused here, by name, before it starts a process.
+SUPERVISOR_CHAIN_VARIABLE = "SADT_SUPERVISOR_CHAIN"
+MAX_SUPERVISOR_DEPTH = 10
 
 sys.path.insert(0, str(SCRIPTS))
 import describe  # noqa: E402  -- one annotation vocabulary, not two
@@ -55,6 +94,40 @@ import describe  # noqa: E402  -- one annotation vocabulary, not two
 
 class ToolNotBuilt(Exception):
     """The tool has no venv yet, and the message says how to make one."""
+
+
+class ToolFailed(RuntimeError):
+    """A supervised tool failed. Raised under the CALLEE's own class name.
+
+    The server maps a failure by its class name, and a clinician reads the
+    message: re-raising a nested failure as a generic error would lose both.
+    `failure_class` builds a subclass named after the callee's exception, so
+    `ToolInputError` raised three levels down is still `ToolInputError` here.
+    """
+
+    tool = None
+
+
+def failure_class(type_name):
+    """A `ToolFailed` subclass named `type_name`, the callee's exception class."""
+    name = type_name if str(type_name).isidentifier() else "ToolFailed"
+    return type(name, (ToolFailed,), {})
+
+
+def write_result(path, payload):
+    """Write a result file atomically: serialized first, then moved into place.
+
+    A reader polling for it -- a GUI waiting on a run -- must never see half of one.
+    """
+    path = Path(path)
+    body = json.dumps(payload)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(body, encoding="utf-8")
+    os.replace(str(temporary), str(path))
+
+
+def error_payload(error):
+    return {"kind": "error", "type": type(error).__name__, "message": str(error)}
 
 
 # ---------------------------------------------------------------------------
@@ -168,13 +241,27 @@ def build_parser(run, name):
     return parser
 
 
+def takes_injected(run, argument):
+    """Whether `run()` declares the injected `argument`, by describe.py's own rule.
+
+    By NAME: `describe.is_supervisor` answers for every injected argument, so
+    asking it of each parameter in turn would take a tool that declares only
+    `data_root` for one that wants a supervisor.
+    """
+    parameters = describe.inspect.signature(run).parameters
+    if argument not in parameters:
+        return False
+    return describe.is_supervisor(argument, parameters[argument], typing.get_type_hints(run))
+
+
 def takes_supervisor(run):
-    """Whether `run()` declares a supervisor, by describe.py's own rule."""
-    hints = typing.get_type_hints(run)
-    return any(
-        describe.is_supervisor(name, parameter, hints)
-        for name, parameter in describe.inspect.signature(run).parameters.items()
-    )
+    """Whether `run()` declares a supervisor."""
+    return takes_injected(run, describe.SUPERVISOR)
+
+
+def takes_data_root(run):
+    """Whether `run()` declares the DATA root it finds its own models under."""
+    return takes_injected(run, describe.DATA_ROOT)
 
 
 def coerce(value, annotation):
@@ -210,7 +297,7 @@ PROGRESS_VARIABLE = "SADT_PROGRESS_FILE"
 PROGRESS_POLL_SECONDS = 0.25
 
 
-def append_progress(fraction, message):
+def append_progress(fraction, message, path=None):
     """One event, appended to the file named in the environment. Never raises.
 
     The same few lines every tool carries in its own `progress.py`, restated
@@ -219,7 +306,7 @@ def append_progress(fraction, message):
     tool has been resolved. It is short enough that the duplication costs less
     than the coupling.
     """
-    path = os.environ.get(PROGRESS_VARIABLE)
+    path = path or os.environ.get(PROGRESS_VARIABLE)
     if not path:
         return False
     try:
@@ -236,6 +323,64 @@ def append_progress(fraction, message):
         return True
     except Exception:  # noqa: BLE001 -- telemetry must never fail a run
         return False
+
+
+def fold_fraction(fraction, span):
+    """A callee's own 0..1 placed inside the share of its caller's bar it was given.
+
+    No span, no fraction: the callee's 0..1 says nothing about where the CALLER
+    is, and passing it on unchanged is what made a chain's bar run backwards
+    (0.2 for "predicting landmarks", then 0.0 for ALI's first scan). The message
+    still goes through.
+    """
+    if fraction is None or not span:
+        return None
+    start, end = float(span[0]), float(span[1])
+    return start + (end - start) * min(1.0, max(0.0, float(fraction)))
+
+
+def relay_progress(source, target, span):
+    """Copy the events a callee appends to `source` onto `target`, folded into `span`.
+
+    Returns a callable that relays what is left and stops. Each level of a
+    chain relays its own callees, so a fraction is folded once per level and
+    lands on the top bar where it belongs.
+    """
+    stopping = threading.Event()
+
+    def relay():
+        seen = 0
+        while True:
+            done = stopping.is_set()
+            try:
+                with open(str(source), "r", encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                text = ""
+            lines = text.split("\n")[:-1]
+            for line in lines[seen:]:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                append_progress(
+                    fold_fraction(event.get("fraction"), span),
+                    event.get("message", ""),
+                    path=str(target),
+                )
+            seen = len(lines)
+            if done:
+                return
+            time.sleep(PROGRESS_POLL_SECONDS)
+
+    thread = threading.Thread(target=relay, daemon=True)
+    thread.start()
+
+    def stop():
+        stopping.set()
+        thread.join(timeout=5)
+
+    return stop
 
 
 def format_progress(event):
@@ -320,7 +465,7 @@ class LocalSupervisor:
     supervisor, which is how nesting works without a special case.
     """
 
-    def __init__(self, out, tmp, depth=0):
+    def __init__(self, out, tmp, depth=0, chain=()):
         # Resolved, because `run()` below starts the callee from a NEUTRAL
         # working directory -- which is what makes "writes only under
         # output_dir" testable -- and a relative path handed across that
@@ -328,13 +473,27 @@ class LocalSupervisor:
         self.out = Path(out).resolve()
         self.tmp = Path(tmp).resolve()
         self._depth = depth
+        # The tools running above the callee, this one last.
+        self._chain = list(chain)
 
     def run(self, tool, **params):
         # The caller's span of its own bar (`_progress=(start, end)`). The
-        # server folds the callee's progress into it; there is no server here
-        # to fold anything, and the callee declares no such argument, so it is
-        # dropped exactly as the server's supervisor drops it.
-        params.pop("_progress", None)
+        # callee declares no such argument, so it is taken out here exactly as
+        # the server's supervisor takes it out, and used to fold the callee's
+        # progress into the caller's bar (see `relay_progress`).
+        span = params.pop("_progress", None)
+        if tool in self._chain:
+            raise RecursionError(
+                "{} is already running above this call: {}.".format(
+                    tool, " -> ".join(self._chain + [tool])
+                )
+            )
+        if len(self._chain) >= MAX_SUPERVISOR_DEPTH:
+            raise RecursionError(
+                "Supervised calls are nested deeper than {}: {}.".format(
+                    MAX_SUPERVISOR_DEPTH, " -> ".join(self._chain + [tool])
+                )
+            )
         self._say("running {}".format(tool))
         scratch = Path(tempfile.mkdtemp(prefix="sup_", dir=str(self.tmp)))
         # A callee declares `output_dir` as required, and a caller does not name one: where a supervised
@@ -343,24 +502,46 @@ class LocalSupervisor:
         params_file, result_file = scratch / "params.json", scratch / "result.json"
         params_file.write_text(json.dumps(_jsonable(params)), encoding="utf-8")
 
-        completed = subprocess.run(
-            [
-                sys.executable, str(SCRIPTS / "run_tool.py"), tool,
-                "--params-file", str(params_file),
-                "--result-file", str(result_file),
-                "--depth", str(self._depth + 1),
-            ],
-            # Not captured: a nested tool's progress is the only sign of life
-            # during a run that can take an hour, and swallowing it is how a
-            # chain looks hung. Its result never comes back on stdout anyway.
-            cwd=str(scratch),
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
+        environment = dict(os.environ, **{SUPERVISOR_CHAIN_VARIABLE: ",".join(self._chain)})
+        stop_relay = None
+        if os.environ.get(PROGRESS_VARIABLE):
+            # A file of the callee's own, relayed onto ours folded into its span:
+            # written straight to ours, its 0..1 would move OUR bar backwards.
+            own = scratch / "progress.jsonl"
+            own.write_text("", encoding="utf-8")
+            environment[PROGRESS_VARIABLE] = str(own)
+            stop_relay = relay_progress(own, os.environ[PROGRESS_VARIABLE], span)
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable, str(SCRIPTS / "run_tool.py"), tool,
+                    "--params-file", str(params_file),
+                    "--result-file", str(result_file),
+                    "--depth", str(self._depth + 1),
+                ],
+                # Not captured: a nested tool's progress is the only sign of life
+                # during a run that can take an hour, and swallowing it is how a
+                # chain looks hung. Its result never comes back on stdout anyway.
+                cwd=str(scratch),
+                env=environment,
+                **_QUIET
+            )
+        finally:
+            if stop_relay is not None:
+                stop_relay()
+        result = None
+        if result_file.is_file():
+            result = json.loads(result_file.read_text(encoding="utf-8"))
+        if result is not None and result.get("kind") == "error":
+            # The callee's own class name and message, so the level above (and
+            # the clinician at the top) reads WHY, not that something below failed.
+            error = failure_class(result.get("type", "ToolFailed"))(result.get("message", ""))
+            error.tool = tool
+            raise error
+        if completed.returncode != 0 or result is None:
+            raise ToolFailed(
                 "{} failed (exit {}). Its error is above.".format(tool, completed.returncode)
             )
-
-        result = json.loads(result_file.read_text(encoding="utf-8"))
         if result["kind"] == "path":
             return Path(result["value"])
         return {key: Path(value) for key, value in result["value"].items()}
@@ -411,6 +592,9 @@ def call(name, params, depth):
         key: coerce(value, hints[key]) for key, value in params.items() if key in hints
     }
 
+    if takes_data_root(run) and os.environ.get(DATA_DIR_VARIABLE):
+        arguments[describe.DATA_ROOT] = Path(os.environ[DATA_DIR_VARIABLE]).resolve()
+
     if not takes_supervisor(run):
         return run(**arguments)
 
@@ -422,7 +606,10 @@ def call(name, params, depth):
     # so whatever drives the tool should not undo that from the other side.
     scratch = Path(tempfile.mkdtemp(prefix="sadt_run_tool_"))
     try:
-        arguments["sup"] = LocalSupervisor(out=output_dir, tmp=scratch, depth=depth)
+        above = [item for item in os.environ.get(SUPERVISOR_CHAIN_VARIABLE, "").split(",") if item]
+        arguments["sup"] = LocalSupervisor(
+            out=output_dir, tmp=scratch, depth=depth, chain=above + [name]
+        )
         return run(**arguments)
     finally:
         shutil.rmtree(str(scratch), ignore_errors=True)
@@ -442,11 +629,25 @@ def main(argv=None):
         return 2
 
     name, rest = argv[0], argv[1:]
+
+    # Read in BOTH layers: a failure in either has to reach the result file a
+    # caller is waiting on, or a GUI can only say "it failed, see the log".
+    machine = argparse.ArgumentParser(add_help=False)
+    machine.add_argument("--params-file")
+    machine.add_argument("--result-file")
+    machine.add_argument("--depth", type=int, default=0)
+    known, remaining = machine.parse_known_args(rest)
+
+    def fail(error, code):
+        sys.stderr.write("{}: {}\n".format(name, error))
+        if known.result_file:
+            write_result(known.result_file, error_payload(error))
+        return code
+
     try:
         interpreter = tool_python(name)
     except ToolNotBuilt as error:
-        sys.stderr.write("{}\n".format(error))
-        return 2
+        return fail(error, 2)
 
     # Layer 1 -> layer 2. Compared by VENV, not by interpreter: uv's venvs all
     # symlink `bin/python` to the same underlying CPython, so resolving the
@@ -456,22 +657,15 @@ def main(argv=None):
     # venv root inside a venv, so it is the thing that actually differs.
     if Path(sys.prefix).resolve() != (tool_root(name) / ".venv").resolve():
         return subprocess.run(
-            [str(interpreter), str(Path(__file__).resolve()), name] + rest
+            [str(interpreter), str(Path(__file__).resolve()), name] + rest, **_QUIET
         ).returncode
 
     # -- layer 2, inside the tool's venv ------------------------------------
-    machine = argparse.ArgumentParser(add_help=False)
-    machine.add_argument("--params-file")
-    machine.add_argument("--result-file")
-    machine.add_argument("--depth", type=int, default=0)
-    known, remaining = machine.parse_known_args(rest)
-
     src = tool_root(name) / "src"
     try:
         run = describe.load_run(src, describe.find_package(src))
     except describe.SchemaError as error:
-        sys.stderr.write("{}: {}\n".format(name, error))
-        return 2
+        return fail(error, 2)
 
     if known.params_file:
         # Driven by a supervisor: arguments as JSON, result to a file. Never
@@ -483,27 +677,267 @@ def main(argv=None):
         try:
             params = vars(build_parser(run, name).parse_args(remaining))
         except describe.SchemaError as error:
-            sys.stderr.write("{}: {}\n".format(name, error))
-            return 2
+            return fail(error, 2)
 
     stop_watching = watch_progress()
     try:
         result = call(name, params, known.depth)
+    except Exception as error:  # noqa: BLE001 -- reported, never swallowed
+        traceback.print_exc()
+        return fail(error, 1)
     finally:
         stop_watching()
 
     if known.result_file:
-        Path(known.result_file).write_text(
-            json.dumps(
-                {"kind": "path", "value": str(result)}
-                if isinstance(result, Path)
-                else {"kind": "dict", "value": {k: str(v) for k, v in result.items()}}
-            ),
-            encoding="utf-8",
-        )
+        write_result(known.result_file, result_payload(result))
     else:
-        print(result if isinstance(result, Path) else json.dumps(_jsonable(result), indent=2))
+        print(result if isinstance(result, (str, os.PathLike))
+              else json.dumps(_jsonable(result), indent=2))
     return 0
+
+
+def result_payload(result):
+    """What `run()` returned, as the result file carries it.
+
+    A path may come back as a `Path` or as a plain `str` (AREG_CBCT returns its
+    output folder as text, and the server accepts both): either is a path. A
+    dict maps names to paths. Anything else is refused by name rather than
+    crashing after an hour of work with a run that did finish.
+    """
+    if isinstance(result, (str, os.PathLike)):
+        return {"kind": "path", "value": os.fspath(result)}
+    if isinstance(result, dict):
+        return {"kind": "dict", "value": {str(k): os.fspath(v) if isinstance(v, (str, os.PathLike))
+                                          else str(v) for k, v in result.items()}}
+    raise TypeError(
+        "run() returned {}; a tool returns a path or a dict of paths.".format(type(result).__name__))
+
+
+# ---------------------------------------------------------------------------
+# Driving a run from another program (a GUI)
+# ---------------------------------------------------------------------------
+
+# Variables that point an interpreter at ANOTHER Python's library. A GUI that
+# embeds Python (3D Slicer does) sets them for its own interpreter; inherited by
+# a tool's venv they would load the GUI's standard library into it.
+_FOREIGN_PYTHON_VARIABLES = ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE")
+
+# How long a cancelled run is given to stop on its own before it is killed.
+CANCEL_GRACE_SECONDS = 5.0
+
+
+class Job:
+    """One run started by `start()`: poll it, read its progress and result, cancel it.
+
+    Everything goes through files in `job_dir`, never through pipes, so the
+    caller can poll from a GUI timer with no thread of its own and nothing
+    blocks when a tool prints a lot:
+
+        params.json     what the tool was called with
+        progress.jsonl  one JSON event per line, `{"fraction", "message"}`
+        result.json     `{"kind": "path"|"dict"|"error", ...}`, written atomically
+        run.log         everything the chain printed, stdout and stderr
+    """
+
+    def __init__(self, tool, job_dir, process, log_handle):
+        self.tool = tool
+        self.job_dir = Path(job_dir)
+        self.process = process
+        self._log_handle = log_handle
+        self._read_events = 0
+
+    @property
+    def params_file(self):
+        return self.job_dir / "params.json"
+
+    @property
+    def result_file(self):
+        return self.job_dir / "result.json"
+
+    @property
+    def progress_file(self):
+        return self.job_dir / "progress.jsonl"
+
+    @property
+    def log_file(self):
+        return self.job_dir / "run.log"
+
+    def poll(self):
+        """The exit code once the whole run has ended, None while it runs."""
+        code = self.process.poll()
+        if code is not None:
+            self._close_log()
+        return code
+
+    def wait(self, timeout=None):
+        code = self.process.wait(timeout=timeout)
+        self._close_log()
+        return code
+
+    def new_progress(self):
+        """The progress events appended since the last call, oldest first."""
+        try:
+            text = self.progress_file.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        # Complete lines only: a line still being written is read next time.
+        lines = text.split("\n")[:-1]
+        events = []
+        for line in lines[self._read_events:]:
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+        self._read_events = len(lines)
+        return events
+
+    def result(self):
+        """What `run()` returned -- a `Path` or a `dict` of them -- or raise its failure.
+
+        Call it once `poll()` is not None. A failure is raised under the tool's
+        own exception class name (see `ToolFailed`), with the tool's message.
+        """
+        if not self.result_file.is_file():
+            raise ToolFailed(
+                "{} ended (exit {}) without a result. See {}.".format(
+                    self.tool, self.process.poll(), self.log_file
+                )
+            )
+        payload = json.loads(self.result_file.read_text(encoding="utf-8"))
+        if payload.get("kind") == "error":
+            error = failure_class(payload.get("type", "ToolFailed"))(payload.get("message", ""))
+            error.tool = self.tool
+            raise error
+        if payload["kind"] == "path":
+            return Path(payload["value"])
+        return {key: Path(value) for key, value in payload["value"].items()}
+
+    def cancel(self, grace=CANCEL_GRACE_SECONDS):
+        """Stop the run and EVERY process below it: nested tools included.
+
+        The run was started as the leader of its own process group (POSIX) or
+        process group / tree (Windows), and every nested `sup.run()` is a
+        descendant of it, so one signal reaches the whole chain. It is asked
+        to stop first, then killed after `grace` seconds.
+        """
+        if self.process.poll() is None:
+            if os.name == "nt":
+                _stop_tree_windows(self.process, grace)
+            else:
+                _stop_group_posix(self.process, grace)
+        self._close_log()
+
+    def _close_log(self):
+        if self._log_handle is not None:
+            self._log_handle.close()
+            self._log_handle = None
+
+
+def _stop_group_posix(process, grace):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            continue
+        # The leader is gone; a descendant that ignored SIGTERM may not be.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        return
+
+
+def _stop_tree_windows(process, grace):
+    # CTRL_BREAK reaches the console process group the run leads; taskkill /T
+    # then walks the tree by parent id, which is what reaches nested tools.
+    try:
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        process.wait(timeout=grace)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    subprocess.run(
+        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_QUIET
+    )
+    try:
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+# For every process this script starts on Windows: no console window of its own.
+_QUIET = {"creationflags": _CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+
+def start(tool, params, job_dir, env=None, data_dir=None):
+    """Start `tool` with `params` in the background and return its `Job`.
+
+    The run goes through this same script, in the tool's own venv, so it is
+    exactly the path `run_tool.py <TOOL>` takes -- supervisor, chaining and
+    progress included. `job_dir` is created and holds every file of the run.
+
+    `env` is the environment to start from (default: this process's). A GUI
+    that embeds Python should pass the environment it was launched with, from
+    before it set its own library paths; the variables that would load another
+    Python's standard library are removed either way. `data_dir` is the DATA
+    root (see `SADT_DATA_DIR`), for tools that find their own models.
+    """
+    job_dir = Path(job_dir).resolve()
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job = Job(tool, job_dir, None, None)
+
+    job.params_file.write_text(json.dumps(_jsonable(dict(params))), encoding="utf-8")
+    job.progress_file.write_text("", encoding="utf-8")
+    # A folder used before must not answer for this run.
+    if job.result_file.exists():
+        job.result_file.unlink()
+
+    environment = dict(os.environ if env is None else env)
+    for variable in _FOREIGN_PYTHON_VARIABLES:
+        environment.pop(variable, None)
+    environment[PROGRESS_VARIABLE] = str(job.progress_file)
+    environment[TOOLS_DIR_VARIABLE] = str(TOOLS_DIR)
+    if data_dir is not None:
+        environment[DATA_DIR_VARIABLE] = str(Path(data_dir).resolve())
+    environment.pop(SUPERVISOR_CHAIN_VARIABLE, None)
+
+    # A tool's output goes to a file, and on Windows a file is written in the
+    # locale's code page unless told otherwise: one print() of a path in
+    # another alphabet would then end the run with a UnicodeEncodeError.
+    environment.setdefault("PYTHONUTF8", "1")
+
+    if os.name == "nt":
+        # No console window either: a GUI driver (Slicer) has none to share, so
+        # each run would open one, and closing it would kill the run.
+        group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
+    else:
+        group = {"start_new_session": True}
+
+    log_handle = open(str(job.log_file), "wb")
+    try:
+        job.process = subprocess.Popen(
+            [
+                str(tool_python(tool)), str(Path(__file__).resolve()), tool,
+                "--params-file", str(job.params_file),
+                "--result-file", str(job.result_file),
+            ],
+            cwd=str(job_dir),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            **group
+        )
+    except BaseException:
+        log_handle.close()
+        raise
+    job._log_handle = log_handle
+    return job
 
 
 if __name__ == "__main__":
