@@ -88,6 +88,16 @@ DATA_DIR_VARIABLE = "SADT_DATA_DIR"
 SUPERVISOR_CHAIN_VARIABLE = "SADT_SUPERVISOR_CHAIN"
 MAX_SUPERVISOR_DEPTH = 10
 
+# The interface a desktop client drives this supervisor through: `start()`, the
+# `Job` it returns, the result file and its error record, SADT_TOOLS_DIR and
+# SADT_DATA_DIR. A client reads it from a release before offering that release
+# as an update, and offers only the levels it knows. Raise it in the commit that
+# changes that interface in a way an existing client cannot follow; adding
+# something a client may ignore does not need it.
+#   1  the command line only (before `start()`)
+#   2  start() / Job, structured errors, SADT_TOOLS_DIR, SADT_DATA_DIR
+SUPERVISOR_API = 2
+
 sys.path.insert(0, str(SCRIPTS))
 import describe  # noqa: E402  -- one annotation vocabulary, not two
 

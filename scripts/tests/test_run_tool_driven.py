@@ -388,3 +388,14 @@ def test_a_tool_runs_in_utf8_mode_and_may_print_any_alphabet(tools, tmp_path):
     assert job.poll() == 0, job.log_file.read_text(encoding="utf-8")
     assert (tmp_path / "out" / "utf8.txt").read_text(encoding="utf-8") == "1"
     assert "\u0141\u00f3d\u017a" in job.log_file.read_text(encoding="utf-8")
+
+
+def test_the_interface_level_a_client_reads_is_declared():
+    """A desktop client reads this number from a release, as text, before it
+    offers that release: it has to be a plain integer assignment."""
+    import re
+
+    source = (Path(run_tool.__file__)).read_text(encoding="utf-8")
+    found = re.findall(r"^SUPERVISOR_API = (\d+)$", source, re.M)
+    assert found == [str(run_tool.SUPERVISOR_API)]
+    assert run_tool.SUPERVISOR_API >= 2
