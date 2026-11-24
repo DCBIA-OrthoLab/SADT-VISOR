@@ -128,12 +128,24 @@ def _import_dental_model_seg():
 
 
 def resolve_device(requested: str = None) -> str:
-    """The device string shapeaxi accepts: exactly "cpu" or "cuda:0"."""
+    """The device string shapeaxi accepts: "cpu", "cuda:0", or "mps" on a Mac.
+
+    "mps" used to fall through to the CPU without a word, so a Mac asked for
+    its GPU segmented on the CPU and reported it.
+    """
     import torch
 
     wanted = (requested or "cpu").strip().lower()
     if wanted.startswith("cuda") and torch.cuda.is_available():
         return "cuda:0"
+    if wanted == "mps":
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
+        progress.log("the Apple GPU was requested but is not available; segmenting on the CPU",
+                     "warning")
+        return "cpu"
     if wanted.startswith("cuda"):
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
         progress.log(
