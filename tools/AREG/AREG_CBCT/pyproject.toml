@@ -43,7 +43,7 @@ explicit = true
 [tool.uv.sources]
 sadt-areg-common = { path = "../common" }
 sadt-testkit = { path = "../../../testkit", editable = true }
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

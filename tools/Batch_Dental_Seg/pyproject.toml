@@ -16,7 +16,10 @@ dependencies = [
     # markers, jaw and timepoint tokens. A DIRECT dependency, not merely a `tool.uv.sources` entry:
     # a source only applies to a package that is actually depended on.
     "sadt-naming",
-    "torch==2.8.0",
+    "torch==2.8.0 ; sys_platform != 'darwin'",
+    # macOS: PyPI's 2.14.1. Its MPS 3D convolutions run the sliding window in
+    # 24 s where 2.8.0 takes 55 s (one CBCT structure, M4 Max).
+    "torch==2.14.1 ; sys_platform == 'darwin'",
     "nnunetv2==2.8.1",
     "SimpleITK==2.5.6",
     "numpy==2.3.2",
@@ -69,7 +72,7 @@ sadt-naming = { path = "../../naming" }
 # its own, so it cannot perturb the resolution above. Never move it into
 # [project] dependencies -- see testkit/README.md.
 sadt-testkit = { path = "../../testkit", editable = true }
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

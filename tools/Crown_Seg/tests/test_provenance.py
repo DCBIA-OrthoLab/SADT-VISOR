@@ -87,7 +87,8 @@ def test_the_engine_extra_pins_the_documented_versions(package, pin):
     always checkable. `pytorch3d==0.7.9+pt2110cu128` names one torch version
     and one CUDA variant exactly."""
     extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
-    assert f"{package}=={pin}" in extra
+    # The pin, whatever platform marker follows it (pytorch3d is not installed on macOS).
+    assert f"{package}=={pin}" in [requirement.split(";")[0].strip() for requirement in extra]
 
 
 def test_the_pytorch3d_wheel_tag_names_the_torch_that_is_pinned():
@@ -147,7 +148,10 @@ def test_both_wheel_indexes_are_pinned_sources_not_extra_index_urls(index):
      ("pytorch3d", "pytorch3d-wheels")],
 )
 def test_each_compiled_package_comes_from_the_index_it_was_built_for(package, index):
-    assert pyproject()["tool"]["uv"]["sources"][package] == {"index": index}
+    """Off macOS, that is: the CUDA indexes have no macOS wheels, and the Mac
+    takes torch from PyPI and has no pytorch3d at all."""
+    assert pyproject()["tool"]["uv"]["sources"][package] == {
+        "index": index, "marker": "sys_platform != 'darwin'"}
 
 
 def test_the_interpreter_is_the_one_pytorch3d_is_built_for_here():

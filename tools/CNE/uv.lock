@@ -1,6 +1,10 @@
 version = 1
 revision = 3
 requires-python = "==3.11.*"
+resolution-markers = [
+    "sys_platform != 'darwin'",
+    "sys_platform == 'darwin'",
+]
 
 [[package]]
 name = "colorama"
@@ -45,6 +49,9 @@ wheels = [
 name = "llama-cpp-python"
 version = "0.3.35"
 source = { registry = "https://abetlen.github.io/llama-cpp-python/whl/cpu" }
+resolution-markers = [
+    "sys_platform != 'darwin'",
+]
 dependencies = [
     { name = "diskcache" },
     { name = "jinja2" },
@@ -52,14 +59,30 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-linux_riscv64.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-macosx_11_0_arm64.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-musllinux_1_2_aarch64.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-musllinux_1_2_x86_64.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-pyemscripten_2026_0_wasm32.whl" },
-    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-win_amd64.whl" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-linux_riscv64.whl", hash = "sha256:9bbbffd9638b62e53af0a211209c0c97ebbf868f15661368fae4c34b84ac5f24" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:b5a4abd4d1d506d6f06b997c21d0532670a3f5350c9e6cfb3e54c33bf1322584" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d172f3d3c8cdd194c3c47c71cb077ed6e61354a2d0f939ceeac0c8fd29999596" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:a024ca666cbc9137387edf6630e6939bc6d380758082db58f62f530cef78a781" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:fb99983674286e418696ff18edddc790332c2e0745eab4b793510d07b3b5dc51" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-pyemscripten_2026_0_wasm32.whl", hash = "sha256:d1b9d58bde200c9d821b9a03cc2ae42801be9f5b4013e08c309185eb7832ba2d" },
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-win_amd64.whl", hash = "sha256:31590ea000d5aff6f05f1e428048e72318a83709288159a5bd4dabec530080bb" },
+]
+
+[[package]]
+name = "llama-cpp-python"
+version = "0.3.38"
+source = { registry = "https://abetlen.github.io/llama-cpp-python/whl/metal" }
+resolution-markers = [
+    "sys_platform == 'darwin'",
+]
+dependencies = [
+    { name = "diskcache" },
+    { name = "jinja2" },
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+wheels = [
+    { url = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.38-metal/llama_cpp_python-0.3.38-py3-none-macosx_11_0_arm64.whl", hash = "sha256:268bc30ee8eac4f8256b2702654436d968807529225d8c64f55e63a96208e62b" },
 ]
 
 [[package]]
@@ -225,9 +248,10 @@ name = "sadt-cne"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "llama-cpp-python" },
-    { name = "nvidia-cublas-cu12" },
-    { name = "nvidia-cuda-runtime-cu12" },
+    { name = "llama-cpp-python", version = "0.3.35", source = { registry = "https://abetlen.github.io/llama-cpp-python/whl/cpu" }, marker = "sys_platform != 'darwin'" },
+    { name = "llama-cpp-python", version = "0.3.38", source = { registry = "https://abetlen.github.io/llama-cpp-python/whl/metal" }, marker = "sys_platform == 'darwin'" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform != 'darwin'" },
+    { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform != 'darwin'" },
     { name = "pymupdf" },
     { name = "python-docx" },
 ]
@@ -240,9 +264,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "llama-cpp-python", specifier = "==0.3.35", index = "https://abetlen.github.io/llama-cpp-python/whl/cpu" },
-    { name = "nvidia-cublas-cu12", specifier = "==12.8.4.1" },
-    { name = "nvidia-cuda-runtime-cu12", specifier = "==12.8.90" },
+    { name = "llama-cpp-python", marker = "sys_platform != 'darwin'", specifier = "==0.3.35", index = "https://abetlen.github.io/llama-cpp-python/whl/cpu" },
+    { name = "llama-cpp-python", marker = "sys_platform == 'darwin'", specifier = "==0.3.38", index = "https://abetlen.github.io/llama-cpp-python/whl/metal" },
+    { name = "nvidia-cublas-cu12", marker = "sys_platform != 'darwin'", specifier = "==12.8.4.1" },
+    { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform != 'darwin'", specifier = "==12.8.90" },
     { name = "pymupdf", specifier = "==1.28.2" },
     { name = "python-docx", specifier = "==1.2.0" },
 ]
