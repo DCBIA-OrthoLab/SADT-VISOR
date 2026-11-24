@@ -962,3 +962,22 @@ tools:
         size: 1121
         extract: true
         sha256: eb5e90e2146f3be46e24d8879583781b5c8be89b506e0560b18bbb0fc4ab51a5
+
+  # =========================================================================
+  # TMJ_Crop -- crop both temporomandibular joints of a CBCT.
+  #
+  # No models of its own: it calls ASO (which calls ALI_CBCT) and AMASSS,
+  # whose models those tools install.
+  # =========================================================================
+  TMJ_Crop:
+    testfiles:
+      # The scan the upstream TMJ_Crop module offers as its test file: ASO's
+      # fully-automatic CBCT set, the same archive as ASO's CBCT_FullyAuto.
+      # A folder of one scan, so the tool's batch path is what is tried.
+      - name: FullyAuto.zip
+        dest: CBCT_FullyAuto
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile002_CBCT.zip
+        release_name: TestFile002_CBCT.zip
+        size: 98233200
+        extract: true
+        sha256: 8c15a7752122f86e5bc82800be175d3c045801ff31ec47d6d8998c80e80e3fe2
