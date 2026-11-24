@@ -10,8 +10,11 @@ dependencies = [
     # the pair has to match, and pinned to the same version the other tools
     # here use so uv can hardlink one copy across every virtualenv rather than
     # unpacking a second CUDA stack.
-    "torch==2.11.0",
-    "torchvision==0.26.0",
+    "torch==2.11.0 ; sys_platform != 'darwin'",
+    "torchvision==0.26.0 ; sys_platform != 'darwin'",
+    # macOS: PyPI's 2.14.1 and its torchvision; MPS is markedly faster than in 2.11.
+    "torch==2.14.1 ; sys_platform == 'darwin'",
+    "torchvision==0.29.1 ; sys_platform == 'darwin'",
     # Reading and writing the volume. Upstream uses nibabel rather than
     # SimpleITK, and the affine and header are copied from the input to the
     # segmentation, so the two open aligned in a viewer.
@@ -52,8 +55,8 @@ explicit = true
 
 [tool.uv.sources]
 sadt-testkit = { path = "../../testkit", editable = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
+torchvision = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,6 +5,7 @@ import numpy as np
 from .propagation import Dilation
 
 import logging
+from .propagation import gpu
 
 logger = logging.getLogger(__name__)
 
@@ -12,11 +13,11 @@ def drawPatch(outlinePoints: list,polydata,mid,index:int):
     step = 0.2
     radius = 0.5
     radius = 1.1
-    P0 = torch.tensor(np.array(outlinePoints)).unsqueeze(0).cuda()
-    P1 = torch.tensor(np.array(outlinePoints[1:] + [outlinePoints[0]])).unsqueeze(0).cuda()
+    P0 = torch.tensor(np.array(outlinePoints)).unsqueeze(0).to(gpu())
+    P1 = torch.tensor(np.array(outlinePoints[1:] + [outlinePoints[0]])).unsqueeze(0).to(gpu())
 
 
-    T = torch.arange(0,1+step,step).unsqueeze(0).unsqueeze(0).permute(2,1,0).cuda()
+    T = torch.arange(0,1+step,step).unsqueeze(0).unsqueeze(0).permute(2,1,0).to(gpu())
 
     P = (1-T)*P0 + T*P1
 
@@ -26,15 +27,15 @@ def drawPatch(outlinePoints: list,polydata,mid,index:int):
 
          
 
-    V = torch.tensor(vtk_to_numpy(polydata.GetPoints().GetData())).to(torch.float32).cuda()
-    F = torch.tensor(vtk_to_numpy(polydata.GetPolys().GetData()).reshape(-1, 4)[:,1:]).to(torch.int64).cuda()
+    V = torch.tensor(vtk_to_numpy(polydata.GetPoints().GetData())).to(torch.float32).to(gpu())
+    F = torch.tensor(vtk_to_numpy(polydata.GetPolys().GetData()).reshape(-1, 4)[:,1:]).to(torch.int64).to(gpu())
 
     dist = torch.cdist(P,V)
     arg_outline = torch.argwhere(dist < radius)[:,1]
-    V_label = torch.zeros((V.shape[0])).cuda()
+    V_label = torch.zeros((V.shape[0])).to(gpu())
     V_label[arg_outline] = 1
 
-    mid = torch.tensor(mid).unsqueeze(0).cuda()
+    mid = torch.tensor(mid).unsqueeze(0).to(gpu())
     dist_mid_vertex = torch.cdist(mid,V)
     arg_midpoint_min = torch.argmin(dist_mid_vertex)
     V_label = Dilation(arg_midpoint_min,F,V_label,polydata)

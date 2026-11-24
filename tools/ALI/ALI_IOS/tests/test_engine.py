@@ -633,6 +633,24 @@ def test_cuda_falls_back_to_cpu_when_no_card_is_visible(monkeypatch, caplog):
     assert "CUDA is unavailable" in caplog.text
 
 
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):
+    """`mps` is only published on macOS, but a direct call can still name it
+    anywhere: it must run on the CPU and say why, not die inside torch."""
+    from sadt_ali_ios import torch_helpers
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with caplog.at_level("WARNING"):
+        assert torch_helpers.resolve_device("mps") == "cpu"
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    from sadt_ali_ios import torch_helpers
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert torch_helpers.resolve_device("mps") == "mps"
+
+
 def test_an_omitted_device_is_cpu_rather_than_whatever_is_plugged_in(monkeypatch):
     """`run()` always passes one, so this is the direct-API path -- and
     defaulting to a card there would make a library call grab the GPU."""

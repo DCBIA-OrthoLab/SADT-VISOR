@@ -22,6 +22,7 @@ needs none of this.
 import argparse
 import logging
 import os
+import sys
 
 from sadt_areg_common.errors import ToolUnavailableError
 
@@ -79,6 +80,11 @@ def _import_monai():
 
 
 def _import_pytorch3d():
+    if sys.platform == "darwin":
+        # macOS: no pytorch3d at all; see `_build_native` and `render_native`.
+        from . import render_native
+
+        return render_native.namespace()
     try:
         from pytorch3d.renderer import (
             AmbientLights,
@@ -110,6 +116,8 @@ def build(device: str):
     """The network, on `device`, with no weights loaded yet."""
     torch = _import_torch()
     monai = _import_monai()
+    if sys.platform == "darwin":
+        return _build_native(device, torch, monai)
     p3d = _import_pytorch3d()
 
     class TimeDistributed(torch.nn.Module):
@@ -155,6 +163,15 @@ def build(device: str):
                     cameras=p3d["FoVPerspectiveCameras"](), lights=p3d["AmbientLights"]()
                 ),
             )
+            from . import gl_raster
+
+            if gl_raster.wanted(device):
+                # macOS / MPS: pytorch3d has no Metal rasterizer. Same cameras and
+                # settings, fragments from OpenGL; the shader stays pytorch3d's.
+                self.renderer.rasterizer = gl_raster.rasterizer_class()(
+                    cameras=self.renderer.rasterizer.cameras,
+                    raster_settings=self.renderer.rasterizer.raster_settings,
+                )
 
         def to(self, *args, **kwargs):
             self.renderer = self.renderer.to(*args, **kwargs)
@@ -173,6 +190,78 @@ def build(device: str):
                 rendered = self.renderer(meshes_world=meshes.clone(), R=rotation, T=translation)
                 fragments = self.renderer.rasterizer(meshes.clone())
 
+                view = torch.cat([rendered[:, :, :, 0:3], fragments.zbuf], dim=-1)
+                images.append(view.permute(0, 3, 1, 2).unsqueeze(1))
+                pixel_to_face.append(fragments.pix_to_face.permute(0, 3, 1, 2).unsqueeze(1))
+
+            return torch.cat(images, dim=1), torch.cat(pixel_to_face, dim=1)
+
+        def forward(self, batch):
+            vertices, faces, colors = batch
+            views, pixel_to_face = self.render(vertices, faces, colors)
+            return self.model(views), views, pixel_to_face
+
+    return MultiViewUNet().to(device)
+
+
+def _build_native(device: str, torch, monai):
+    """The same network as `build`, rendered without pytorch3d (macOS).
+
+    Same layers and the same parameter and buffer names, so the checkpoint
+    loads unchanged; only `render` differs. Camera (fov 60, near plane 1),
+    image size, `AmbientLights` and the white background are the ones
+    `build` gives pytorch3d. Each view is rasterized ONCE, with its pose passed
+    in the call, and the image and `pix_to_face` come out of that one pass: no
+    pose is stored in a camera object, so there are no two camera objects that
+    could disagree about it (`build` makes two `FoVPerspectiveCameras()`,
+    which only stays harmless because `AmbientLights` has no specular term).
+    """
+    from . import render_native as native
+
+    class TimeDistributed(torch.nn.Module):
+        """Apply a 2D module to a (batch, views, ...) tensor."""
+
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, sequence):
+            size = sequence.size()
+            flat = sequence.contiguous().view(size[0] * size[1], *size[2:])
+            output = self.module(flat)
+            return output.contiguous().view(size[0], size[1], *output.size()[1:])
+
+    class MultiViewUNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            unet = monai.networks.nets.UNet(
+                spatial_dims=2,
+                in_channels=4,
+                out_channels=OUT_CHANNELS,
+                channels=(16, 32, 64, 128, 256),
+                strides=(2, 2, 2, 2),
+                num_res_units=2,
+            )
+            self.model = TimeDistributed(unet)
+            self.register_buffer(
+                "ico_verts", torch.tensor(_CAMERA_POSITIONS, dtype=torch.float32)
+            )
+            self.renderer = native.Renderer(
+                native.AmbientLights(), fov=60, znear=1, size=IMAGE_SIZE, zfar=100,
+                background=(1.0, 1.0, 1.0),
+            )
+
+        def render(self, vertices, faces, colors):
+            mesh = native.Meshes(
+                verts=vertices, faces=faces, textures=native.TexturesVertex(verts_features=colors)
+            )
+            images, pixel_to_face = [], []
+            for position in self.ico_verts:
+                position = position.unsqueeze(0).to(vertices.device)
+                rotation = native.look_at_rotation(position, device=vertices.device)
+                translation = -torch.bmm(rotation.transpose(1, 2), position[:, :, None])[:, :, 0]
+
+                rendered, fragments = self.renderer(meshes_world=mesh, R=rotation, T=translation)
                 view = torch.cat([rendered[:, :, :, 0:3], fragments.zbuf], dim=-1)
                 images.append(view.permute(0, 3, 1, 2).unsqueeze(1))
                 pixel_to_face.append(fragments.pix_to_face.permute(0, 3, 1, 2).unsqueeze(1))

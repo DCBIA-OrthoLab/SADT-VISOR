@@ -4,12 +4,20 @@ One nnUNet v2 model per anatomical structure, run over one scan or a whole
 folder of them. The pipeline is in pipeline.py; only `run` is public.
 """
 
+import sys
 from pathlib import Path
 from typing import Literal
 
 from .catalog import merge_modes, structure_codes
 from .errors import ToolInputError
 from .pipeline import segment
+
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+# What a caller that names no device gets. Not only the published default: a
+# tool another tool runs through `sup.run` is sent none, and `cuda` on a Mac is
+# a request the CPU answers, many times slower than the Apple GPU it could use.
+_DEFAULT_DEVICE = "mps" if sys.platform == "darwin" else "cuda"
 
 
 # The DATA folder this tool's weights live in, and the one bundle inside it.
@@ -69,7 +77,7 @@ def run(
     generate_surface: bool = False,
     surface_smoothing: int = 5,
     surface_decimation: int = 90,
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = _DEFAULT_DEVICE,
     tile_step_size: float = 0.5,
     gpu_resampling: bool = True,
     num_workers: int = 0,

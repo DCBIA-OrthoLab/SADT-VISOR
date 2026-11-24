@@ -141,10 +141,15 @@ def binarise_mask(source: str, destination: str) -> None:
 # figure, which still frees a slot from a pair that will not converge.
 CASE_TIMEOUT_SECONDS = 1800
 
+# `execute()` takes ONE string and splits it on spaces, so a path with a space
+# in it (every macOS install: ~/Library/Application Support) arrives in pieces.
+# Its tokenizer honours double quotes; a double quote cannot occur in a Windows
+# path and is vanishingly rare elsewhere.
 _CHILD = """
 import sys
 from picsl_greedy import Greedy3D
-Greedy3D().execute(" ".join(sys.argv[1:]), out=sys.stdout)
+quoted = [f'"{part}"' if any(c.isspace() for c in part) else part for part in sys.argv[1:]]
+Greedy3D().execute(" ".join(quoted), out=sys.stdout)
 """
 
 

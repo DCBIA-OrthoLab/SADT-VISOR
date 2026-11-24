@@ -7,6 +7,7 @@ Ported from SlicerAutomatedDentalTools' `DOCShapeAXI` module and
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -19,13 +20,21 @@ __all__ = ["run"]
 PREDICTION_SHARE = 0.25
 
 
+# "mps" is published on macOS only: every other platform keeps the options it always had.
+_DEVICES = Literal["cuda", "cpu", "mps"] if sys.platform == "darwin" else Literal["cuda", "cpu"]
+# The default is what a caller gets when it names no device (a tool calling
+# this one sends none): on macOS that is the Metal GPU, never a request for
+# a card the machine cannot have.
+_DEFAULT_DEVICE = "mps" if sys.platform == "darwin" else "cuda"
+
+
 def run(
     surfaces: Path,
     model: Path,
     output_dir: Path,
     explain: bool = True,
     output_suffix: str = "_pred",
-    device: Literal["cuda", "cpu"] = "cuda",
+    device: _DEVICES = _DEFAULT_DEVICE,
 ) -> Path:
     """Classify each 3D surface, and paint the reason for it onto the mesh.
 

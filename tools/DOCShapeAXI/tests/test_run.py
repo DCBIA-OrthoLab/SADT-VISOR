@@ -528,6 +528,18 @@ def test_cuda_is_kept_when_a_device_is_visible(monkeypatch):
     assert pipeline.resolve_device("cuda") == "cuda"
 
 
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    assert pipeline.resolve_device("mps") == "cpu"
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert pipeline.resolve_device("mps") == "mps"
+
+
 def test_the_device_actually_used_is_the_one_recorded(tmp_path, stubbed):
     write_surface(tmp_path / "in" / "a.vtk")
     checkpoint = tmp_path / "airways_2_class.ckpt"

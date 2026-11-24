@@ -729,3 +729,34 @@ def test_a_partial_run_closes_with_a_warning_summary(tmp_path, monkeypatch, mode
          "1 of 2 meshes labelled, 1 failed (1 segmented here, 0 already labelled)"),
     ]
     assert "mesh 2 of 2: segmentation failed" in caplog.text
+
+
+def test_a_mac_asking_for_its_gpu_gets_it(monkeypatch):
+    """"mps" fell through to the CPU without a word, so a Mac segmented on its
+    CPU while its GPU sat idle."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    assert pipeline.resolve_device("mps") == "mps"
+
+
+def test_a_mac_without_metal_says_it_falls_back(monkeypatch, caplog):
+    import torch
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    with caplog.at_level("WARNING"):
+        assert pipeline.resolve_device("mps") == "cpu"
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_linux_devices_are_resolved_as_before(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert pipeline.resolve_device("cuda") == "cuda:0"
+    assert pipeline.resolve_device("cpu") == "cpu"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert pipeline.resolve_device("cuda") == "cpu"

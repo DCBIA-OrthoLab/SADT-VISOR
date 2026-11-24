@@ -54,8 +54,22 @@ def resolve_device(requested: str) -> str:
             "warning",
         )
         return "cpu"
+    if wanted == "mps" and not torch.backends.mps.is_available():
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
+        return "cpu"
     return wanted
 
+
+
+def on_gpu(device: str) -> bool:
+    """Whether `device` is a GPU: a CUDA card, or Apple's Metal (mps).
+
+    nnUNet itself only treats cuda as a GPU, so on a Mac it would keep the
+    sliding-window logits and the resampling on the CPU. Measured on one CBCT
+    (M4 Max, torch 2.14.1, MAND): 51 s with nnUNet's choice, 31.5 s with both
+    on mps, Dice 0.99999 against the CUDA result.
+    """
+    return device.startswith("cuda") or device == "mps"
 
 def find_model_folder(model_root: str, structure_code: str):
     """Locate the trained nnUNet folder for one structure, or None.
@@ -216,6 +230,10 @@ def _build_predictor(device: str, tile_step_size: float):
             break
 
     predictor = nnUNetPredictor(**{k: v for k, v in options.items() if k in accepted})
+    if device == "mps":
+        # nnUNet's constructor turns this off for anything but cuda; on Metal
+        # it works and saves a round trip to the CPU per tile.
+        predictor.perform_everything_on_device = True
     # AFTER the constructor, which is what sets it: `nnUNetPredictor.__init__`
     # turns cuDNN autotuning ON, and autotuning picks a convolution by TIMING
     # candidates -- so the algorithm, and with it the rounding, depends on how
@@ -257,7 +275,7 @@ def _enable_gpu_resampling(predictor, device: str) -> bool:
     `torch.device` put in here never reaches the `plans.json` nnUNet writes
     beside its output (which `json.dump` could not serialize).
     """
-    if not device.startswith("cuda"):
+    if not on_gpu(device):
         return False
 
     try:

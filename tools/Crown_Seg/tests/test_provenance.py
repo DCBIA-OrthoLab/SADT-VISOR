@@ -76,7 +76,9 @@ EXTRA_PINS = {
 def test_the_base_dependencies_are_pinned_to_the_documented_version(package, pin):
     """A plain `uv sync` installs these, so the pin and the installed version
     are both checkable and both have to agree with the README."""
-    assert f"{package}=={pin}" in pyproject()["project"]["dependencies"]
+    # The pin, whatever platform marker follows it (macOS takes torch 2.14.1).
+    pins = [requirement.split(";")[0].strip() for requirement in pyproject()["project"]["dependencies"]]
+    assert f"{package}=={pin}" in pins
     assert version(package).split("+")[0] == pin
     assert f"{package} {pin}" in readme()
 
@@ -87,7 +89,8 @@ def test_the_engine_extra_pins_the_documented_versions(package, pin):
     always checkable. `pytorch3d==0.7.9+pt2110cu128` names one torch version
     and one CUDA variant exactly."""
     extra = pyproject()["project"]["optional-dependencies"]["segmentation"]
-    assert f"{package}=={pin}" in extra
+    # The pin, whatever platform marker follows it (pytorch3d is not installed on macOS).
+    assert f"{package}=={pin}" in [requirement.split(";")[0].strip() for requirement in extra]
 
 
 def test_the_pytorch3d_wheel_tag_names_the_torch_that_is_pinned():
@@ -147,7 +150,23 @@ def test_both_wheel_indexes_are_pinned_sources_not_extra_index_urls(index):
      ("pytorch3d", "pytorch3d-wheels")],
 )
 def test_each_compiled_package_comes_from_the_index_it_was_built_for(package, index):
-    assert pyproject()["tool"]["uv"]["sources"][package] == {"index": index}
+    """Off macOS, that is: the CUDA indexes have no macOS wheels, and the Mac
+    takes torch from PyPI and pytorch3d from the wheel SADT-VISOR hosts."""
+    sources = pyproject()["tool"]["uv"]["sources"][package]
+    sources = sources if isinstance(sources, list) else [sources]
+    assert {"index": index, "marker": "sys_platform != 'darwin'"} in sources
+
+
+def test_the_mac_pytorch3d_is_the_hosted_build_for_its_torch():
+    """No public index has a macOS pytorch3d for torch 2.14.1: the one built for
+    it is a release asset of SADT-VISOR, and its tag names that torch."""
+    sources = pyproject()["tool"]["uv"]["sources"]["pytorch3d"]
+    mac = [source for source in sources if source.get("marker") == "sys_platform == 'darwin'"]
+    assert len(mac) == 1
+    assert mac[0]["url"].startswith("https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/")
+    assert "pt2141cpu" in mac[0]["url"]
+    pins = pyproject()["project"]["dependencies"]
+    assert "torch==2.14.1 ; sys_platform == 'darwin'" in pins
 
 
 def test_the_interpreter_is_the_one_pytorch3d_is_built_for_here():
@@ -308,7 +327,9 @@ def test_describe_publishes_the_schema_this_tool_promises():
         "output_dir", "skip_segmented", "suffix",
     ]
     assert schema["arguments"]["numbering"]["choices"] == ["Universal", "FDI"]
-    assert schema["arguments"]["device"]["choices"] == ["cuda", "cpu"]
+    assert schema["arguments"]["device"]["choices"] == (
+        ["cuda", "cpu", "mps"] if sys.platform == "darwin" else ["cuda", "cpu"]
+    )
     assert schema["arguments"]["skip_segmented"]["default"] is True
     assert schema["arguments"]["num_workers"]["default"] == 2
 
@@ -326,7 +347,8 @@ def test_importing_the_package_pulls_in_no_engine():
 
     # `errors` is this package's own ToolInputError, not an engine: it is what
     # lets the module refuse a request without the segmentation stack loaded.
-    assert top_level == {"pathlib", "typing", "pipeline", "errors"}
+    # `sys` is the standard library, read only to publish `mps` on macOS.
+    assert top_level == {"pathlib", "typing", "pipeline", "errors", "sys"}
 
 
 def test_the_pipeline_defers_every_heavy_import():

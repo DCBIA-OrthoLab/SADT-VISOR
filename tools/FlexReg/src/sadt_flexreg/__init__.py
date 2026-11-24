@@ -19,7 +19,8 @@ What upstream had that this does not, and why:
 Both stay in the Slicer module. What moved here is what needs a GPU or takes
 real time: the butterfly patch, and the registration.
 
-The GPU is not optional for the patch. Upstream's propagation calls `.cuda()`
+The GPU is not optional for the patch (CUDA, or Metal on a Mac: see
+`propagation.gpu`). Upstream's propagation called `.cuda()`
 with no availability test and no device argument, which is why the module ships
 191 lines of `install_pytorch.py` to get torch into Slicer on a clinician's
 laptop. Running it here is the point: the server has the card.

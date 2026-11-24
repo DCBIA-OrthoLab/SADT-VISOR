@@ -128,12 +128,24 @@ def _import_dental_model_seg():
 
 
 def resolve_device(requested: str = None) -> str:
-    """The device string shapeaxi accepts: exactly "cpu" or "cuda:0"."""
+    """The device string shapeaxi accepts: "cpu", "cuda:0", or "mps" on a Mac.
+
+    "mps" used to fall through to the CPU without a word, so a Mac asked for
+    its GPU segmented on the CPU and reported it.
+    """
     import torch
 
     wanted = (requested or "cpu").strip().lower()
     if wanted.startswith("cuda") and torch.cuda.is_available():
         return "cuda:0"
+    if wanted == "mps":
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
+        progress.log("the Apple GPU was requested but is not available; segmenting on the CPU",
+                     "warning")
+        return "cpu"
     if wanted.startswith("cuda"):
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
         progress.log(
@@ -297,6 +309,34 @@ def _input_root(input_path: str, meshes: list) -> str:
 # Segmentation
 # ---------------------------------------------------------------------------
 
+_LOADER_MARK = "_sadt_crownseg_loader"
+
+
+def _install_checkpoint_loader():
+    """Wrap `torch.load` once per process: CPU `map_location` and
+    `weights_only=True` unless the caller says otherwise. Idempotent (a second
+    call finds the mark and does nothing, so wrappers never stack); the original
+    stays reachable as `torch.load.__wrapped__`. macOS-only, called from the
+    darwin block of `_run_shapeaxi`."""
+    import functools
+
+    import torch
+
+    current = torch.load
+    if getattr(current, _LOADER_MARK, False):
+        return current
+
+    @functools.wraps(current)
+    def _load_safely(*args, **kwargs):
+        kwargs.setdefault("map_location", "cpu")
+        kwargs.setdefault("weights_only", True)
+        return current(*args, **kwargs)
+
+    setattr(_load_safely, _LOADER_MARK, True)
+    torch.load = _load_safely
+    return _load_safely
+
+
 def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: str,
                   array_name: str, suffix: str, device: str, fdi: bool,
                   num_workers: int) -> None:
@@ -308,6 +348,32 @@ def _run_shapeaxi(csv_path: str, output_dir: str, model_path: str, input_root: s
     untouched.
     """
     dental_model_seg = _import_dental_model_seg()
+
+    from . import gl_raster
+
+    if gl_raster.wanted(device):
+        # macOS / MPS: pytorch3d has no Metal rasterizer. DentalModelSeg builds
+        # its renderer from the module-level `MeshRasterizer` name, so pointing
+        # that name at the OpenGL subclass is enough; `render` and the shader
+        # are shapeaxi's, unchanged. Only this process is affected.
+        from shapeaxi import saxi_nets_lightning
+
+        saxi_nets_lightning.MeshRasterizer = gl_raster.rasterizer_class()
+        logger.info("Rasterizing with OpenGL instead of pytorch3d (device=%s)", device)
+
+        # shapeaxi 2.0.2 reads the checkpoint with `torch.load(path)` and no
+        # `map_location` (saxi_nets_lightning.py, `dental_model_seg_args`). The
+        # published `07-21-22_val-loss0.169.pth` was saved from a CUDA device,
+        # so on a machine with no CUDA (every Mac) it fails with "Attempting to
+        # deserialize object on a CUDA device but torch.cuda.is_available() is
+        # False". Inside this macOS-only block, so Linux is untouched.
+        #
+        # The wrapper also pins `weights_only=True` by default (never relaxed
+        # here): torch >= 2.6 already defaults to it, but the pin does not
+        # depend on the torch version, and passing it explicitly keeps
+        # TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 from turning the call back into a
+        # full pickle load. A trapped checkpoint is refused, not executed.
+        _install_checkpoint_loader()
 
     args = Namespace(
         surf=None,

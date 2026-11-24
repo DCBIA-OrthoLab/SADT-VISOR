@@ -81,13 +81,35 @@ BATCH_SAMPLES = 1 << 20
 SLAB_BYTES = 256 << 20
 
 
-def available() -> bool:
-    """Is there a CUDA device this process can use?"""
+def _device():
+    """The accelerator this process can use, or None: CUDA first, then Apple's
+    GPU (MPS). Chosen on what is available, never on the platform; the
+    algorithm below is the same whichever one it runs on."""
     try:
         import torch
     except ImportError:
-        return False
-    return torch.cuda.is_available()
+        return None
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return None
+
+
+def _empty_cache(device) -> None:
+    """Give back to the system what this run's allocator still holds."""
+    import torch
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+
+def available() -> bool:
+    """Is there a GPU (CUDA, or MPS on a Mac) this process can use?"""
+    return _device() is not None
 
 
 def register(fixed: sitk.Image, moving: sitk.Image, cost: list = None) -> sitk.Euler3DTransform:
@@ -99,6 +121,9 @@ def register(fixed: sitk.Image, moving: sitk.Image, cost: list = None) -> sitk.E
     """
     import torch
 
+    device = _device()
+    if device is None:
+        raise RuntimeError("no GPU (CUDA or MPS) is available")
     torch.use_deterministic_algorithms(True)
     logger.info(
         "GPU rigid registration: fixed %s voxels at %s mm, moving %s voxels at %s mm "
@@ -110,11 +135,11 @@ def register(fixed: sitk.Image, moving: sitk.Image, cost: list = None) -> sitk.E
         BINS, _levels(fixed.GetSize()),
     )
     try:
-        return _Registration(fixed, moving, torch.device("cuda")).run(cost)
+        return _Registration(fixed, moving, device).run(cost)
     finally:
         # The card is shared: what this run held goes back the moment it ends,
         # not when the process does.
-        torch.cuda.empty_cache()
+        _empty_cache(device)
 
 
 def _levels(size) -> list:
@@ -149,13 +174,22 @@ def _gaussian(factor: int, device):
 def _blur_axis(volume, axis: int, factor: int, kernel, radius: int):
     """Blur a (z, y, x) tensor along `axis`, edges replicated, then keep every
     factor-th voxel along it."""
+    import torch
     import torch.nn.functional as F
 
     shape = [1, 1, 1, 1, 1]
     shape[2 + axis] = kernel.numel()
-    pad = [0] * 6
-    pad[2 * (2 - axis)] = pad[2 * (2 - axis) + 1] = radius
-    v = F.conv3d(F.pad(volume[None, None], pad, mode="replicate"), kernel.view(shape))
+    # The edges replicated by concatenating copies of the first and last
+    # planes, which is what `F.pad(mode="replicate")` computes -- copies, so
+    # the same values to the bit. MPS's own replicate pad returns garbage
+    # along the depth axis of a large volume (measured: planes of 1000 where
+    # the volume holds 0..1000 noise).
+    v = volume[None, None]
+    ends = list(v.shape)
+    ends[2 + axis] = radius
+    first = v.narrow(2 + axis, 0, 1).expand(ends)
+    last = v.narrow(2 + axis, v.shape[2 + axis] - 1, 1).expand(ends)
+    v = F.conv3d(torch.cat([first, v, last], dim=2 + axis), kernel.view(shape))
     index = [slice(None)] * 5
     index[2 + axis] = slice(None, None, factor)
     return v[tuple(index)][0, 0]
@@ -347,7 +381,11 @@ class _Registration:
         joint = joint / joint.sum()
         marginal = joint.sum(1, keepdim=True) @ joint.sum(0, keepdim=True)
         present = joint > 0
-        return -(joint[present] * (joint[present] / marginal[present]).log()).sum()
+        # masked_select, not `joint[present]`: the same elements in the same
+        # order, but its gradient is no index_put with accumulation, which
+        # `use_deterministic_algorithms` refuses on MPS.
+        seen = joint.masked_select(present)
+        return -(seen * (seen / marginal.masked_select(present)).log()).sum()
 
     def _gradient(self, level: _Level, params) -> float:
         """Set `params.grad` to the exact gradient of the negative MI; return the MI's value.

@@ -10,7 +10,12 @@ dependencies = [
     # Slicer on a clinician's laptop. This is a server with a 48 GB card, and a
     # 7B model at q4_k_m is 4.4 GB of weights -- measured at 9.6x faster per
     # note on this card, and the answers are identical (see README).
-    "llama-cpp-python==0.3.35",
+    "llama-cpp-python==0.3.35 ; sys_platform != 'darwin'",
+    # macOS: the Metal build, on the Apple GPU. 0.3.38 because the macOS wheels
+    # of 0.3.34 to 0.3.36 on both the cpu and metal indexes are corrupt archives
+    # (a size in the zip directory that does not match the file), which uv
+    # refuses to extract.
+    "llama-cpp-python==0.3.38 ; sys_platform == 'darwin'",
     # What that wheel LINKS and does not SHIP. auditwheel excludes the CUDA
     # runtime by policy, so `import llama_cpp` dies on `libcudart.so.12:
     # cannot open shared object file` in the deployment image, which is
@@ -21,8 +26,8 @@ dependencies = [
     # 12.4 that matches the wheel's build: CUDA 12 is minor-version compatible
     # in this direction, and identical files are what the image hardlinks
     # instead of storing a second 600 MB copy of cuBLAS per tool.
-    "nvidia-cuda-runtime-cu12==12.8.90",
-    "nvidia-cublas-cu12==12.8.4.1",
+    "nvidia-cuda-runtime-cu12==12.8.90 ; sys_platform != 'darwin'",
+    "nvidia-cublas-cu12==12.8.4.1 ; sys_platform != 'darwin'",
     # Reading the notes. Neither is heavy and neither is optional in practice,
     # but both are imported only when a note of that format is actually read:
     # a batch of .txt must not fail because a PDF reader is absent.
@@ -62,9 +67,17 @@ name = "llama-cpp-cpu"
 url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "llama-cpp-metal"
+url = "https://abetlen.github.io/llama-cpp-python/whl/metal"
+explicit = true
+
 [tool.uv.sources]
 sadt-testkit = { path = "../../testkit", editable = true }
-llama-cpp-python = { index = "llama-cpp-cpu" }
+llama-cpp-python = [
+    { index = "llama-cpp-cpu", marker = "sys_platform != 'darwin'" },
+    { index = "llama-cpp-metal", marker = "sys_platform == 'darwin'" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

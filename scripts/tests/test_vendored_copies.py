@@ -26,7 +26,13 @@ TOOLS = Path(__file__).resolve().parents[2] / "tools"
 
 # Vendored by copy, and required to stay identical. Keyed by file name, since
 # that is how each lands in its own tool's package.
-VENDORED = ("progress.py", "scans.py", "metrics_table.py")
+#
+# `gl_raster.py` (the OpenGL rasterizer, one copy in each of the four tools
+# that render) and `render_native.py` (the macOS renderer without pytorch3d,
+# ALI_IOS and AREG_IOS) are implementations rather than formats, but the
+# arithmetic is the same: a fix to the pixel grid or the near-plane cut that
+# reached one copy would leave the others rendering something else.
+VENDORED = ("progress.py", "scans.py", "metrics_table.py", "gl_raster.py", "render_native.py")
 
 
 def copies(name):

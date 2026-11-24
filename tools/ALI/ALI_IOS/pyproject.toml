@@ -21,7 +21,9 @@ dependencies = [
     # one -- the version pairing is right and it still fails at runtime with
     # `operator torchvision::nms does not exist`.
     "torchvision==0.26.0",
-    "pytorch3d==0.7.9+pt2110cu128",
+    "pytorch3d==0.7.9+pt2110cu128 ; sys_platform != 'darwin'",
+    # macOS rasterizes with OpenGL in place of pytorch3d (gl_raster.py).
+    "moderngl==5.13.0 ; sys_platform == 'darwin'",
     # The 2D UNet that predicts the per-view masks. A different network from the
     # CBCT engine's DenseNet, from the same library -- which is why the split
     # does NOT let this tool drop monai.
@@ -82,9 +84,9 @@ sadt-ali-common = { path = "../common" }
 # Development only: lets this tool's tests run ANOTHER tool through that tool's
 # own venv, as a subprocess, the way the server does.
 sadt-testkit = { path = "../../../testkit", editable = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-pytorch3d = { index = "pytorch3d-wheels" }
+torch = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
+torchvision = { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" }
+pytorch3d = { index = "pytorch3d-wheels", marker = "sys_platform != 'darwin'" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

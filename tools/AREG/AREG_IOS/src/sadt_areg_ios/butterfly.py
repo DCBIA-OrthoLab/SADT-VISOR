@@ -24,6 +24,7 @@ Corrections, all of which were silent:
 """
 
 import logging
+import sys
 import os
 
 import numpy as np
@@ -38,8 +39,12 @@ logger = logging.getLogger(__name__)
 
 PATCH_ARRAY_NAME = "Butterfly"
 
-def resolve_device(requested: str = "cuda") -> str:
-    """"cuda" only when a card is actually there, "cpu" otherwise.
+def resolve_device(requested: str = "") -> str:
+    """The GPU this machine has (cuda, or mps on a Mac) when one is there, else "cpu".
+
+    Unnamed, it is the platform's GPU: AREG's run() takes no device, so a Mac
+    asking for "cuda" here would have registered on the CPU with its own Metal
+    GPU idle.
 
     The GPU semaphore this module held is gone with the shared server process:
     a tool is now its own process, so an in-process limit caps nothing. Capping
@@ -47,9 +52,12 @@ def resolve_device(requested: str = "cuda") -> str:
     tools -- an AREG run and an AMASSS run compete for the same card.
     """
     torch = net._import_torch()
-    wanted = (requested or "cpu").strip().lower()
+    wanted = (requested or ("mps" if sys.platform == "darwin" else "cuda")).strip().lower()
     if wanted.startswith("cuda") and not torch.cuda.is_available():
         logger.warning("device=%s requested but CUDA is unavailable; falling back to CPU", wanted)
+        return "cpu"
+    if wanted == "mps" and not torch.backends.mps.is_available():
+        logger.warning("device=mps requested but MPS is unavailable; falling back to CPU")
         return "cpu"
     return wanted
 

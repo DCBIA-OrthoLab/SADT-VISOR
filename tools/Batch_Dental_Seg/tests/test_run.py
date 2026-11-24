@@ -611,6 +611,13 @@ def test_the_swap_declines_on_cpu():
     assert manager.configuration["resampling_fn_data"] == "resample_data_or_seg_to_shape"
 
 
+def test_the_swap_runs_on_metal_too():
+    """On a Mac the GPU is mps: the same swap, onto that device."""
+    manager = _configuration_manager()
+    assert nnunet_runner._enable_gpu_resampling(_PredictorWithPlans(manager), "mps")
+    assert str(manager.configuration["resampling_fn_data_kwargs"]["device"]) == "mps"
+
+
 def test_a_bundle_pinning_its_own_resampler_is_left_alone():
     """A bundle asking for something other than nnUNet's default was configured
     that way deliberately, and its geometry is not ours to reinterpret."""
@@ -1463,3 +1470,19 @@ def test_no_label_for_a_surface_is_logged_with_the_scan_position(tmp_path, caplo
 
     messages = [r.getMessage() for r in caplog.records]
     assert "scan 3 of 4: no label in this scan, so no surface was written" in messages, messages
+
+
+def test_mps_falls_back_to_cpu_when_metal_is_absent(monkeypatch, caplog):
+    """`mps` is only published on macOS, but a direct call can still name it
+    anywhere: it must run on the CPU and say why, not die inside torch."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with caplog.at_level("WARNING"):
+        assert nnunet_runner.resolve_device("mps") == "cpu"
+    assert "MPS is unavailable" in caplog.text
+
+
+def test_mps_is_kept_when_metal_is_present(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert nnunet_runner.resolve_device("mps") == "mps"
