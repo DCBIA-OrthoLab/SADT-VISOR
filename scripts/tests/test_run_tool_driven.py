@@ -321,9 +321,12 @@ def _alive(pid):
         return True
     # A zombie still answers signal 0 until it is reaped; it is not running.
     stat = Path("/proc/{}/stat".format(pid))
-    if stat.is_file():
+    try:
         return stat.read_text().rsplit(")", 1)[-1].split()[0] != "Z"
-    return True
+    except FileNotFoundError:
+        # Reaped between the signal and the read: gone, which is the point.
+        # Without /proc at all (macOS) the signal's answer has to do.
+        return not Path("/proc").is_dir()
 
 
 def _wait_for(path, timeout=30):
