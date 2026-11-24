@@ -200,6 +200,20 @@ def test_the_arguments_reach_the_child_as_strings(monkeypatch):
     assert answered == ["-d", "3", "/scans/A1_T1.nii.gz"]
 
 
+def test_a_path_with_a_space_reaches_greedy_whole(monkeypatch, tmp_path):
+    """`execute()` splits its one string on spaces: a macOS install lives under
+    ~/Library/Application Support, so an unquoted path arrived in two pieces."""
+    (tmp_path / "picsl_greedy.py").write_text(
+        "class Greedy3D:\n"
+        "    def execute(self, command, out=None):\n"
+        "        print(command, end='')\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+    said = pipeline.run_greedy(["-i", Path("/Users/a/Application Support/T1.nii.gz"), "-d", 3])
+
+    assert said == '-i "/Users/a/Application Support/T1.nii.gz" -d 3'
+
+
 def test_the_whole_command_reaches_the_child_in_order(monkeypatch):
     monkeypatch.setattr(pipeline, "_CHILD", ECHO_ARGV)
     command = pipeline.registration_command("f", "m", "o.mat", "i.mat", "NCC", "Affine")
@@ -297,12 +311,6 @@ def test_the_child_script_is_valid_python_and_calls_greedy():
     compile(pipeline._CHILD, "<child>", "exec")
     assert "from picsl_greedy import Greedy3D" in pipeline._CHILD
     assert "Greedy3D().execute(" in pipeline._CHILD
-
-
-def test_the_child_hands_greedy_one_joined_argument_string():
-    """`Greedy3D.execute` takes the command line as a single string, which is
-    what lets upstream's argument list survive the port unchanged."""
-    assert '" ".join(sys.argv[1:])' in pipeline._CHILD
 
 
 def test_the_output_of_greedy_is_captured_rather_than_inherited(monkeypatch):
