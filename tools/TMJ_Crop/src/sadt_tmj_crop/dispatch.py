@@ -73,6 +73,24 @@ def _scan_end(name: str, suffix: str) -> str:
     return ""
 
 
+def _place(scan, destination) -> None:
+    """Put `scan` at `destination` for a callee, without copying it if we can.
+
+    A symbolic link first; on Windows it needs the administrator's or Developer
+    Mode's privilege, which a clinician's account does not hold (WinError 1314),
+    so a hard link next -- no privilege, but one volume -- and a copy last.
+    """
+    try:
+        os.symlink(scan, destination)
+        return
+    except OSError:
+        pass
+    try:
+        os.link(scan, destination)
+    except OSError:
+        shutil.copyfile(scan, destination)
+
+
 def _as_nifti(cases, suffix: str, sup, output_dir: Path) -> list:
     """The same cases with every oriented scan a NIfTI file, converted by Convert.
 
@@ -88,7 +106,7 @@ def _as_nifti(cases, suffix: str, sup, output_dir: Path) -> list:
     try:
         for i, scan in wanted:
             extension = _scan_end(scan.name, suffix)[len(f"_{suffix}"):]
-            os.symlink(scan, stage / f"{i}_{suffix}{extension}")
+            _place(scan, stage / f"{i}_{suffix}{extension}")
         try:
             converted = Path(tools.convert(sup, str(stage)))
         except Exception as error:  # noqa: BLE001 - the NIfTI scans are still good
@@ -273,7 +291,7 @@ def crop_scans(scans, output_dir, scale_by, scale, sup, sides="Left and Right",
     stage = Path(tempfile.mkdtemp(prefix=".tmj_", dir=output_dir))
     try:
         for name, _, scan, _, _ in ready:
-            os.symlink(scan, stage / f"{name}_{suffix}.nii.gz")
+            _place(scan, stage / f"{name}_{suffix}.nii.gz")
         mask_dir = Path(tools.segment_mandible(sup, str(stage), span=SEGMENT_SPAN))
         # Looked up by exact name, never as a glob pattern: a scan called `scan[1]`
         # must not be read as a character class.

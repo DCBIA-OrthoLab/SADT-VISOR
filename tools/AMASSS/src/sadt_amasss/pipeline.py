@@ -257,10 +257,28 @@ def _convert_to_nifti(scan_path: str, destination: str) -> None:
         reader = sitk.ImageFileReader()
         reader.SetFileName(scan_path)
         reader.ReadImageInformation()
-        os.symlink(os.path.abspath(scan_path), destination)
+        _place(scan_path, destination)
         return
     image = sitk.ReadImage(scan_path)
     sitk.WriteImage(image, destination)
+
+
+def _place(source: str, destination: str) -> None:
+    """Put `source` at `destination` without rewriting it.
+
+    A symbolic link first; on Windows it needs the administrator's or Developer
+    Mode's privilege, which a clinician's account does not hold (WinError 1314),
+    so a hard link next -- no privilege, but one volume -- and a copy last.
+    """
+    try:
+        os.symlink(os.path.abspath(source), destination)
+        return
+    except OSError:
+        pass
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copyfile(source, destination)
 
 
 def _match_reference_geometry(mask_image, reference):
